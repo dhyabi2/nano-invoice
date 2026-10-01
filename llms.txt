@@ -1,0 +1,22 @@
+# nano-invoice
+
+> Bind a Nano (XNO) payment to the order it pays for. For agents that sell in XNO. Python 3.10+, stdlib only, non-custodial (never holds a key, never sends).
+
+Nano blocks carry no memo. nano-invoice gives each order a unique exact amount: pay_raw = amount_raw + tag, where amount_raw is a multiple of 10**6 raw and the tag (1..999999, under 1e-24 XNO) is unique among the merchant's open invoices. A confirmed send of exactly pay_raw to the merchant, sent between creation and expiry, settles the invoice. One block settles at most one invoice. The payer is the send block's account read from the ledger, never a claimed payer.
+
+## Use
+- create_invoice(merchant, amount_raw:int, order_key, expires_s, store=Store(path)) -> Invoice; idempotent per order_key; floats/bools refused; xno_to_raw("0.25") converts exactly.
+- check_invoice(invoice, store=..., rpc="https://rpc.nano.to", own_accounts=[...], not_income={account: reason}) -> {invoice, observations, refunds}
+- States: open -> paid | underpaid | overpaid | expired (all final). Faucet/own-account blocks are reported as not_income and never pay.
+- refund_instruction(...) / refund_hints(store, id) -> {to (chain sender), amount_raw, reason, source_block}; instructions only.
+- receipt(invoice, store) -> JSON with the block_info calls that reproduce it; verify_receipt(receipt, rpc) re-checks from the public ledger alone.
+- CLI: nano-invoice create|check|receipt|verify|refund-hint|show (JSON output).
+
+## Limits
+- The payer must send the exact raw amount; wallets that round lose the tag.
+- At most 999,999 open invoices per receiving account; tags quarantined 7 days after close.
+- Timing uses the node's local_timestamp of the send (120 s tolerance).
+
+## Links
+- Source: https://github.com/dhyabi2/nano-invoice
+- License: MIT
