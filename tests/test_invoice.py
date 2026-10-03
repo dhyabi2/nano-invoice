@@ -436,6 +436,37 @@ class TestWitness(Base):
         self.assertEqual(r["witness_at"], T0 + 5)
         self.assertEqual(int(r["sent_at"]), T0 + 10)
 
+    def test_forged_sent_at_fails_ordering_against_the_world(self):
+        # Reticuli's sharpened repair: the ordering must be checked against the
+        # node's local_timestamp, not against the receipt's own sent_at field,
+        # because the receipt is a document the merchant controls. A receipt
+        # that misstates its send time must fail even when it also supplies a
+        # convenient witness time.
+        inv, r = self.paid_receipt(witness_at=T0 + 5)
+        forged = dict(r)
+        # merchant writes a later send time so the witness (T0+5) "proves" the
+        # binding preceded payment -- but the ledger block is really at T0+10
+        forged["sent_at"] = T0 + 100
+        res = ni.verify_receipt(forged, rpc=self.ledger, witness_at=T0 + 5)
+        # the ledger re-reads the send time and disagrees with the forged field
+        self.assertFalse(res["ok"], res)
+        self.assertFalse([c for c in res["checks"]
+                          if c["check"] == "sent_at_matches_ledger"][0]["ok"])
+
+    def test_witness_compared_to_node_time_not_receipt_time(self):
+        # The witness check must use the ledger's local_timestamp as the send
+        # time. Here the receipt claims an early send (T0+1) which would put
+        # witness T0+5 AFTER it; the node's real time (T0+10) is what matters,
+        # and the true ordering (witness before send) must pass.
+        inv, r = self.paid_receipt(witness_at=T0 + 5)
+        edited = dict(r)
+        edited["sent_at"] = T0 + 1  # lies about the send time
+        res = ni.verify_receipt(edited, rpc=self.ledger, witness_at=T0 + 5)
+        # sent_at mismatch is caught, but the true world ordering still holds
+        self.assertFalse(res["ok"], res)  # fails on the liar, not on ordering
+        check = [c for c in res["checks"] if c["check"] == "witness_before_send"][0]
+        self.assertTrue(check["ok"], check)  # node time (T0+10) > witness (T0+5)
+
     def test_create_invoice_rejects_witness_outside_its_lifetime(self):
         with self.assertRaises(ni.InvoiceError):
             self.invoice(witness_at=T0 - 1)         # before creation

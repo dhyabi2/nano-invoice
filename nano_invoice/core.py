@@ -690,7 +690,29 @@ def verify_receipt(rcpt, rpc=None, witness_at=None):
     expected_state = "paid" if received == pay else "overpaid" if received > pay else "underpaid"
     check("state_matches_amount", rcpt.get("state") == expected_state, f"expected {expected_state}")
     created_at = int(rcpt.get("created_at") or 0)
-    send_time = int(rcpt.get("sent_at") or 0)
+    receipt_sent_at = int(rcpt.get("sent_at") or 0)
+    # Reticuli's repair, sharpened: the before-payment ordering must be checked
+    # against the world (the settling block's node-reported time), not against
+    # the merchant-written document. We fetch the send block from the ledger
+    # first, read its local_timestamp, and treat THAT as the authoritative send
+    # time for witness_before_send. The receipt's sent_at is re-checked against
+    # the node's own number, so a receipt that misstates its send time is caught
+    # rather than trusted.
+    try:
+        s = rpc.call("block_info", json_block="true", hash=send_block)
+    except Exception:
+        s = None
+    node_send_time = None
+    if s is not None:
+        try:
+            node_send_time = int(s.get("local_timestamp") or 0) or None
+        except (TypeError, ValueError):
+            node_send_time = None
+    if node_send_time and receipt_sent_at and node_send_time != receipt_sent_at:
+        check("sent_at_matches_ledger", False,
+              f"receipt says send {receipt_sent_at}, ledger block says {node_send_time}")
+    send_time = node_send_time or receipt_sent_at
+    send_time_source = "ledger local_timestamp" if node_send_time else "receipt (no node time reported)"
     # The before-payment ordering (Reticuli's repair): the binding must be
     # witnessed after it exists and before the block that settled it. When a
     # witness is supplied it is a hard check; when omitted the gap is reported
@@ -705,11 +727,14 @@ def verify_receipt(rcpt, rpc=None, witness_at=None):
               f"witness {witness_at} vs creation {created_at}")
         if send_time:
             check("witness_before_send", witness_at < send_time,
-                  f"witness {witness_at} vs send {send_time}")
+                  f"witness {witness_at} vs send {send_time} (from {send_time_source})")
         else:
             check("witness_before_send", False, "send block carries no time a stranger can check")
+    if s is None:
+        check("ledger_reachable", False, "block_info for send block failed")
+        ok = all(c["ok"] for c in checks if not (witness_gap and c["check"] == "witness_before_send"))
+        return {"ok": ok, "witness_gap": witness_gap, "checks": checks}
     try:
-        s = rpc.call("block_info", json_block="true", hash=send_block)
         contents = s.get("contents") or {}
         dest = contents.get("link_as_account") or contents.get("destination")
         check("send.block_account == sender", acct.normalise(s["block_account"]) == sender, s["block_account"])
