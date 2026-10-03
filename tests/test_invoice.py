@@ -9,6 +9,7 @@ from unittest import mock
 import nano_invoice as ni
 from nano_invoice import account as acct
 from nano_invoice import cli
+from nano_invoice import core
 from tests.fake_ledger import FakeLedger, account
 
 XNO = 10 ** 30
@@ -366,6 +367,65 @@ class TestReceipt(Base):
                              ("order_key_sha256", "0" * 64)):
             bad = dict(r, **{field: value})
             self.assertFalse(ni.verify_receipt(bad, rpc=self.ledger)["ok"], field)
+
+    def test_an_untagged_receipt_binds_no_order_and_is_refused(self):
+        """A receipt is only evidence that a payment was for THIS order because
+        the amount carries the order's tag - Nano blocks have no memo. With
+        `tag = 0` every amount check below is vacuous, so an unrelated
+        round-amount payment to the merchant satisfies all of them.
+
+        `create_invoice` cannot issue tag 0 (the invoices table CHECKs
+        `tag > 0`, and the README and llms.txt both document 1..999999), so this
+        only arrives in a receipt written by hand - which is the case
+        `verify_receipt` exists to judge. It used to pass `tag_in_range` with a
+        parenthetical note and report `ok: True`, and `nano-invoice verify`
+        exited 0 on it.
+        """
+        ONE = 10 ** 30
+        send, receive = self.ledger.send(OTHER, MERCHANT, 5 * ONE, T0 + 10)
+        okh = ni.order_key_hash("order-never-invoiced")
+        forged = {
+            "schema": core.RECEIPT_SCHEMA,
+            "invoice_id": ni.invoice_id_for(MERCHANT, okh),
+            "order_key_sha256": okh,
+            "merchant": MERCHANT, "sender": OTHER,
+            "amount_raw": str(5 * ONE), "tag": 0, "pay_raw": str(5 * ONE),
+            "received_raw": str(5 * ONE), "state": "paid",
+            "send_block": send, "receive_block": receive,
+            "created_at": T0, "expires_at": T0 + 3600, "sent_at": T0 + 10,
+        }
+        res = ni.verify_receipt(forged, rpc=self.ledger, witness_at=T0 + 1)
+        self.assertFalse(res["ok"], "an untagged receipt must not verify")
+        self.assertIn({"tag_in_range"},
+                      [{c["check"]} for c in res["checks"] if not c["ok"]],
+                      "the failing check must be the tag, not something incidental")
+
+        # Every OTHER check in that receipt passes: the tag is the only thing
+        # standing between an unrelated payment and an arbitrary order key.
+        failed = [c["check"] for c in res["checks"] if not c["ok"]]
+        self.assertEqual(failed, ["tag_in_range"], failed)
+
+    def test_an_untagged_receipt_is_refused_by_the_cli_exit_code(self):
+        ONE = 10 ** 30
+        send, receive = self.ledger.send(OTHER, MERCHANT, 5 * ONE, T0 + 10)
+        okh = ni.order_key_hash("order-never-invoiced")
+        forged = {
+            "schema": core.RECEIPT_SCHEMA,
+            "invoice_id": ni.invoice_id_for(MERCHANT, okh),
+            "order_key_sha256": okh,
+            "merchant": MERCHANT, "sender": OTHER,
+            "amount_raw": str(5 * ONE), "tag": 0, "pay_raw": str(5 * ONE),
+            "received_raw": str(5 * ONE), "state": "paid",
+            "send_block": send, "receive_block": receive,
+            "created_at": T0, "expires_at": T0 + 3600, "sent_at": T0 + 10,
+        }
+        path = os.path.join(self.tmp.name, "forged.json")
+        with open(path, "w") as fh:
+            json.dump(forged, fh)
+        with mock.patch.object(cli, "Rpc", lambda url: self.ledger):
+            with mock.patch("sys.stdout", new_callable=__import__("io").StringIO):
+                rc = cli.main(["verify", "--receipt", path])
+        self.assertEqual(rc, 1, "`verify` documents exit 0 only if every check passes")
 
     def test_unconfirmed_on_ledger_fails_verification(self):
         r = self.paid()
