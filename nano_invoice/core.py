@@ -697,7 +697,20 @@ def verify_receipt(rcpt, rpc=None, witness_at=None):
         return {"ok": False, "checks": checks}
     check("schema", rcpt.get("schema") == RECEIPT_SCHEMA, rcpt.get("schema", ""))
     check("invoice_id_rederives", invoice_id_for(merchant, rcpt["order_key_sha256"]) == rcpt["invoice_id"])
-    check("tag_in_range", 0 <= tag < TAG_MODULUS, f"tag={tag}" + (" (0 = untagged, binds no order)" if tag == 0 else ""))
+    # The tag is the ONLY thing binding an amount to an order - Nano blocks carry
+    # no memo - so a tag of 0 makes every arithmetic check below vacuous: any
+    # confirmed send of a round amount to this merchant then satisfies
+    # `pay == amount + tag` and `received % TAG_MODULUS == tag`. A receipt
+    # claiming an unrelated payment settled an arbitrary order verified as fully
+    # ok, so `nano-invoice verify` exited 0 on it. `create_invoice` can never
+    # issue tag 0 (the allocator draws from 1..999999 and the invoices table
+    # CHECKs `tag > 0`), and the README and llms.txt both document the range as
+    # 1..999999 - so a tag of 0 only ever arrives in a receipt written by hand,
+    # which is exactly the case this function exists to judge. Refused, not noted.
+    check("tag_in_range", 0 < tag < TAG_MODULUS,
+          f"tag={tag}" + (" (0 binds no order: any round-amount payment would satisfy the"
+                          " amount checks, so the receipt proves nothing about which order"
+                          " was paid)" if tag == 0 else ""))
     check("amount_leaves_room_for_tag", amount % TAG_MODULUS == 0)
     check("pay_raw_is_amount_plus_tag", pay == amount + tag)
     check("received_ends_in_tag", received % TAG_MODULUS == tag)
