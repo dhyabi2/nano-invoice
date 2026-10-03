@@ -189,6 +189,20 @@ class Store:
             self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    # Columns added after the first release. CREATE TABLE IF NOT EXISTS leaves an
+    # existing file untouched, so a database written before a column existed keeps
+    # the old shape and every INSERT naming the new column fails with
+    # "table invoices has no column named ...". Each entry must stay additive and
+    # nullable: adding it to an old file then cannot lose or rewrite a row.
+    ADDED_COLUMNS = (("invoices", "witness_at", "INTEGER"),)
+
+    def _migrate(self):
+        for table, column, decl in self.ADDED_COLUMNS:
+            have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            if column not in have:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def close(self):
         self.conn.close()

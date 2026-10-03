@@ -387,6 +387,61 @@ class TestReceipt(Base):
             ni.receipt(self.invoice(), store=self.store)
 
 
+class TestUpgradeAnOlderDatabase(Base):
+    """A merchant's database file outlives the release that wrote it. SCHEMA is
+    applied with CREATE TABLE IF NOT EXISTS, which leaves an existing file
+    exactly as it was, so a column added later never appears in it. Before the
+    migration this made create_invoice raise OperationalError("table invoices
+    has no column named witness_at") on every existing merchant's database - the
+    invoices already in it still read back fine, so nothing warned until the
+    next invoice was issued."""
+
+    def _strip_column(self, column):
+        """Rebuild `invoices` without `column`, i.e. the shape an older release wrote."""
+        self.store.conn.execute("PRAGMA foreign_keys = OFF")
+        cols = [r["name"] for r in self.store.conn.execute("PRAGMA table_info(invoices)")
+                if r["name"] != column]
+        kept = ", ".join(cols)
+        self.store.conn.execute("ALTER TABLE invoices RENAME TO invoices_old")
+        self.store.conn.execute(f"CREATE TABLE invoices({kept})")
+        self.store.conn.execute(f"INSERT INTO invoices({kept}) SELECT {kept} FROM invoices_old")
+        self.store.conn.execute("DROP TABLE invoices_old")
+        self.store.conn.execute("PRAGMA foreign_keys = ON")
+
+    def test_a_database_written_before_witness_at_still_takes_new_invoices(self):
+        old = self.invoice("order-before-upgrade")
+        self._strip_column("witness_at")
+        self.store.close()
+
+        store = ni.Store(self.db)                      # the upgraded release opens it
+        self.addCleanup(store.close)
+        self.assertIn("witness_at", {r["name"] for r in
+                                     store.conn.execute("PRAGMA table_info(invoices)")})
+
+        # the invoice issued by the older release is unchanged, with no witness
+        carried = store.get(old.id)
+        self.assertEqual(carried.id, old.id)
+        self.assertEqual(carried.tag, old.tag)
+        self.assertEqual(carried.pay_raw, old.pay_raw)
+        self.assertEqual(carried.state, "open")
+        self.assertIsNone(carried.witness_at)
+
+        # and the merchant can issue invoices again, witnessed or not
+        plain = ni.create_invoice(MERCHANT, XNO // 4, "order-after-upgrade",
+                                  store=store, now=T0)
+        self.assertIsNone(plain.witness_at)
+        witnessed = ni.create_invoice(MERCHANT, XNO // 4, "order-witnessed",
+                                      store=store, now=T0, witness_at=T0 + 30)
+        self.assertEqual(witnessed.witness_at, T0 + 30)
+
+    def test_migrating_twice_is_a_no_op(self):
+        inv = self.invoice("order-1")
+        for _ in range(3):
+            store = ni.Store(self.db)
+            self.assertEqual(store.get(inv.id).id, inv.id)
+            store.close()
+
+
 class TestWitness(Base):
     """Reticuli's ordering rule (a block settles 'something', not 'this order'):
     a binding is 'published before payment' only if a witness the issuer does
