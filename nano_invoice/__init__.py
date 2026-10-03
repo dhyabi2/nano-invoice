@@ -7,7 +7,7 @@ from .core import (
     CLOCK_SKEW_S, RAW_PER_XNO, TAG_MODULUS, TAG_QUARANTINE_S,
     AmountError, BlockAlreadyBound, IllegalTransition, Invoice, InvoiceError, NotFound, OrderConflict,
     Store, TagsExhausted, check_invoice, create_invoice, invoice_id_for, order_key_hash, receipt,
-    refund_hints, refund_instruction, require_raw, scan, verify_receipt, xno_to_raw,
+    refund_hints, refund_instruction, require_raw, scan, verify_receipt, witness_payload, xno_to_raw,
 )
 from .rpc import DEFAULT_RPC, Rpc, RpcError
 
