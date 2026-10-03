@@ -387,6 +387,158 @@ class TestReceipt(Base):
             ni.receipt(self.invoice(), store=self.store)
 
 
+class TestUpgradeAnOlderDatabase(Base):
+    """A merchant's database file outlives the release that wrote it. SCHEMA is
+    applied with CREATE TABLE IF NOT EXISTS, which leaves an existing file
+    exactly as it was, so a column added later never appears in it. Before the
+    migration this made create_invoice raise OperationalError("table invoices
+    has no column named witness_at") on every existing merchant's database - the
+    invoices already in it still read back fine, so nothing warned until the
+    next invoice was issued."""
+
+    def _strip_column(self, column):
+        """Rebuild `invoices` without `column`, i.e. the shape an older release wrote."""
+        self.store.conn.execute("PRAGMA foreign_keys = OFF")
+        cols = [r["name"] for r in self.store.conn.execute("PRAGMA table_info(invoices)")
+                if r["name"] != column]
+        kept = ", ".join(cols)
+        self.store.conn.execute("ALTER TABLE invoices RENAME TO invoices_old")
+        self.store.conn.execute(f"CREATE TABLE invoices({kept})")
+        self.store.conn.execute(f"INSERT INTO invoices({kept}) SELECT {kept} FROM invoices_old")
+        self.store.conn.execute("DROP TABLE invoices_old")
+        self.store.conn.execute("PRAGMA foreign_keys = ON")
+
+    def test_a_database_written_before_witness_at_still_takes_new_invoices(self):
+        old = self.invoice("order-before-upgrade")
+        self._strip_column("witness_at")
+        self.store.close()
+
+        store = ni.Store(self.db)                      # the upgraded release opens it
+        self.addCleanup(store.close)
+        self.assertIn("witness_at", {r["name"] for r in
+                                     store.conn.execute("PRAGMA table_info(invoices)")})
+
+        # the invoice issued by the older release is unchanged, with no witness
+        carried = store.get(old.id)
+        self.assertEqual(carried.id, old.id)
+        self.assertEqual(carried.tag, old.tag)
+        self.assertEqual(carried.pay_raw, old.pay_raw)
+        self.assertEqual(carried.state, "open")
+        self.assertIsNone(carried.witness_at)
+
+        # and the merchant can issue invoices again, witnessed or not
+        plain = ni.create_invoice(MERCHANT, XNO // 4, "order-after-upgrade",
+                                  store=store, now=T0)
+        self.assertIsNone(plain.witness_at)
+        witnessed = ni.create_invoice(MERCHANT, XNO // 4, "order-witnessed",
+                                      store=store, now=T0, witness_at=T0 + 30)
+        self.assertEqual(witnessed.witness_at, T0 + 30)
+
+    def test_migrating_twice_is_a_no_op(self):
+        inv = self.invoice("order-1")
+        for _ in range(3):
+            store = ni.Store(self.db)
+            self.assertEqual(store.get(inv.id).id, inv.id)
+            store.close()
+
+
+class TestWitness(Base):
+    """Reticuli's ordering rule (a block settles 'something', not 'this order'):
+    a binding is 'published before payment' only if a witness the issuer does
+    not control timed it before the settling block. verify_receipt must surface
+    the gap when no witness exists and enforce the ordering when one is given."""
+
+    def paid_receipt(self, witness_at=None):
+        inv = self.invoice(witness_at=witness_at)
+        self.ledger.send(BUYER, MERCHANT, inv.pay_raw, T0 + 10)  # sent_at == T0 + 10
+        self.check(inv)
+        return inv, ni.receipt(inv, store=self.store)
+
+    def test_no_witness_surfaces_the_gap_not_a_clean_pass(self):
+        inv, r = self.paid_receipt()
+        res = ni.verify_receipt(r, rpc=self.ledger)
+        # the ledger claims still verify, but the before-payment ordering is
+        # openly a gap -- it must never read as a full, silent pass
+        self.assertTrue(res["ok"], res)
+        self.assertTrue(res["witness_gap"])
+        self.assertFalse([c for c in res["checks"] if c["check"] == "witness_before_send"][0]["ok"])
+
+    def test_witness_before_send_passes_and_closes_the_gap(self):
+        inv, r = self.paid_receipt(witness_at=T0 + 5)  # announced after creation (T0), before send (T0+10)
+        res = ni.verify_receipt(r, rpc=self.ledger, witness_at=T0 + 5)
+        self.assertTrue(res["ok"], res)
+        self.assertFalse(res["witness_gap"])
+        for c in res["checks"]:
+            if c["check"] in ("witness_before_send", "witness_after_creation"):
+                self.assertTrue(c["ok"], c)
+
+    def test_witness_after_send_is_rejected(self):
+        inv, r = self.paid_receipt(witness_at=T0 + 5)
+        # witness claims the binding was announced AFTER the settling block --
+        # the exact ordering fraud Reticuli's repair exists to catch
+        res = ni.verify_receipt(r, rpc=self.ledger, witness_at=T0 + 20)
+        self.assertFalse(res["ok"], res)
+        self.assertFalse([c for c in res["checks"] if c["check"] == "witness_before_send"][0]["ok"])
+
+    def test_witness_before_creation_is_rejected(self):
+        inv, r = self.paid_receipt(witness_at=T0 + 5)
+        res = ni.verify_receipt(r, rpc=self.ledger, witness_at=T0 - 100)
+        self.assertFalse(res["ok"], res)
+        self.assertFalse([c for c in res["checks"] if c["check"] == "witness_after_creation"][0]["ok"])
+
+    def test_receipt_carries_the_witness_time(self):
+        _, r = self.paid_receipt(witness_at=T0 + 5)
+        self.assertEqual(r["witness_at"], T0 + 5)
+        self.assertEqual(int(r["sent_at"]), T0 + 10)
+
+    def test_forged_sent_at_fails_ordering_against_the_world(self):
+        # Reticuli's sharpened repair: the ordering must be checked against the
+        # node's local_timestamp, not against the receipt's own sent_at field,
+        # because the receipt is a document the merchant controls. A receipt
+        # that misstates its send time must fail even when it also supplies a
+        # convenient witness time.
+        inv, r = self.paid_receipt(witness_at=T0 + 5)
+        forged = dict(r)
+        # merchant writes a later send time so the witness (T0+5) "proves" the
+        # binding preceded payment -- but the ledger block is really at T0+10
+        forged["sent_at"] = T0 + 100
+        res = ni.verify_receipt(forged, rpc=self.ledger, witness_at=T0 + 5)
+        # the ledger re-reads the send time and disagrees with the forged field
+        self.assertFalse(res["ok"], res)
+        self.assertFalse([c for c in res["checks"]
+                          if c["check"] == "sent_at_matches_ledger"][0]["ok"])
+
+    def test_witness_compared_to_node_time_not_receipt_time(self):
+        # The witness check must use the ledger's local_timestamp as the send
+        # time. Here the receipt claims an early send (T0+1) which would put
+        # witness T0+5 AFTER it; the node's real time (T0+10) is what matters,
+        # and the true ordering (witness before send) must pass.
+        inv, r = self.paid_receipt(witness_at=T0 + 5)
+        edited = dict(r)
+        edited["sent_at"] = T0 + 1  # lies about the send time
+        res = ni.verify_receipt(edited, rpc=self.ledger, witness_at=T0 + 5)
+        # sent_at mismatch is caught, but the true world ordering still holds
+        self.assertFalse(res["ok"], res)  # fails on the liar, not on ordering
+        check = [c for c in res["checks"] if c["check"] == "witness_before_send"][0]
+        self.assertTrue(check["ok"], check)  # node time (T0+10) > witness (T0+5)
+
+    def test_create_invoice_rejects_witness_outside_its_lifetime(self):
+        with self.assertRaises(ni.InvoiceError):
+            self.invoice(witness_at=T0 - 1)         # before creation
+        with self.assertRaises(ni.InvoiceError):
+            self.invoice(witness_at=T0 + 3600 + 1)  # after expiry
+
+    def test_witness_payload_is_rederivable(self):
+        inv = self.invoice(witness_at=T0 + 5)
+        payload = ni.witness_payload(inv, store=self.store)
+        self.assertEqual(payload["binding"]["invoice_id"], inv.id)
+        self.assertEqual(payload["binding"]["merchant"], inv.merchant)
+        self.assertEqual(payload["binding"]["pay_raw"], str(inv.pay_raw))
+        self.assertTrue(payload["announce_before_payment"])
+        # a stranger re-derives the same id from merchant + order key hash
+        self.assertEqual(ni.invoice_id_for(inv.merchant, inv.order_key_sha256), inv.id)
+
+
 class TestRpcAndCli(unittest.TestCase):
     def test_rpc_sends_user_agent_and_refuses_writes(self):
         seen = {}

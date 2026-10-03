@@ -118,6 +118,7 @@ class Invoice:
     created_at: int
     expires_at: int
     state: str
+    witness_at: int = None
     closed_at: int = None
     send_block: str = None
     receive_block: str = None
@@ -142,6 +143,7 @@ CREATE TABLE IF NOT EXISTS invoices(
   pay_raw TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL,
+  witness_at INTEGER,
   state TEXT NOT NULL DEFAULT 'open'
     CHECK (state IN ('open','paid','underpaid','overpaid','expired')),
   closed_at INTEGER,
@@ -187,6 +189,20 @@ class Store:
             self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    # Columns added after the first release. CREATE TABLE IF NOT EXISTS leaves an
+    # existing file untouched, so a database written before a column existed keeps
+    # the old shape and every INSERT naming the new column fails with
+    # "table invoices has no column named ...". Each entry must stay additive and
+    # nullable: adding it to an old file then cannot lose or rewrite a row.
+    ADDED_COLUMNS = (("invoices", "witness_at", "INTEGER"),)
+
+    def _migrate(self):
+        for table, column, decl in self.ADDED_COLUMNS:
+            have = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            if column not in have:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def close(self):
         self.conn.close()
@@ -289,9 +305,14 @@ def _require_store(store):
 
 
 def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, store=None, now=None,
-                   _rand=secrets.randbelow):
+                   witness_at=None, _rand=secrets.randbelow):
     """Idempotent: the same (merchant, order_key) always returns the same invoice.
-    The same order key with a different amount raises OrderConflict."""
+    The same order key with a different amount raises OrderConflict.
+
+    `witness_at` is the unix time the merchant announced this invoice's binding
+    (id + tagged amount) to a channel it does not control, before any payment.
+    A receipt can be re-checked for the before-payment ordering only when the
+    merchant supplies this witness; see verify_receipt(witness_at=...)."""
     store = _require_store(store)
     merchant = acct.normalise(merchant_account)
     require_raw(amount_raw, "amount_raw", minimum=TAG_MODULUS)
@@ -302,6 +323,12 @@ def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, stor
     if isinstance(expires_s, bool) or not isinstance(expires_s, int) or expires_s <= 0:
         raise InvoiceError("expires_s must be a positive int (seconds)")
     now = int(time.time()) if now is None else now
+    if witness_at is not None:
+        witness_at = int(witness_at)
+        if not (now <= witness_at <= now + expires_s):
+            raise InvoiceError(
+                f"witness_at {witness_at} must be between creation {now} and expiry {now + expires_s}: "
+                "the binding is announced after it exists and before it lapses")
     okh = order_key_hash(order_key)
     inv_id = invoice_id_for(merchant, okh)
     with store.tx() as c:
@@ -321,8 +348,8 @@ def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, stor
         require_raw(pay_raw, "pay_raw")
         c.execute(
             "INSERT INTO invoices(id, merchant, order_key_sha256, amount_raw, tag, pay_raw, created_at,"
-            " expires_at, state) VALUES (?,?,?,?,?,?,?,?, 'open')",
-            (inv_id, merchant, okh, str(amount_raw), tag, str(pay_raw), now, now + expires_s))
+            " expires_at, witness_at, state) VALUES (?,?,?,?,?,?,?,?,?, 'open')",
+            (inv_id, merchant, okh, str(amount_raw), tag, str(pay_raw), now, now + expires_s, witness_at))
     return store.get(inv_id)
 
 
@@ -567,6 +594,37 @@ def refund_hints(store, invoice_id):
 
 # ---------------------------------------------------------------- receipts
 
+def witness_payload(invoice, store=None, witness_channel=None):
+    """What a merchant publishes to a channel it does not control so a stranger
+    can re-derive the binding (address -> order) *before* the payment exists.
+
+    Nano has no memo field and a block settles 'something', not 'this order'.
+    The before-payment word of the payee is only checkable if the binding is
+    announced to a witness the issuer cannot rewrite, at a time a stranger can
+    verify. This returns the exact fields to announce: the invoice id, the
+    merchant, the order key's hash, the unique tagged amount, and the expiry.
+    `witness_channel` is metadata the merchant fills in (a public feed id, a
+    Nostr note, a timestampt service) so the witness is addressable."""
+    store = _require_store(store)
+    inv = store.get(invoice)
+    return {
+        "binding": {
+            "invoice_id": inv.id,
+            "merchant": inv.merchant,
+            "order_key_sha256": inv.order_key_sha256,
+            "tag": inv.tag,
+            "pay_raw": str(inv.pay_raw),
+            "expires_at": inv.expires_at,
+        },
+        "rule": "this invoice binds this merchant to this order-key for this "
+                "tagged amount; one block may settle it and no other.",
+        "witness_channel": witness_channel,
+        "announce_before_payment": True,
+        "recheck": "verify_receipt(receipt, witness_at=<this announcement's time>)",
+        "reason": "a block proves an address paid something, not that it paid for this order",
+    }
+
+
 def receipt(invoice, store=None):
     store = _require_store(store)
     inv = store.get(invoice)
@@ -605,14 +663,22 @@ def receipt(invoice, store=None):
         "confirmed": True,
         "created_at": inv.created_at,
         "expires_at": inv.expires_at,
+        "witness_at": inv.witness_at,
         "sent_at": pay["block_ts"] if pay else None,
         "reproduce": reproduce,
         "claims": claims,
     }
 
 
-def verify_receipt(rcpt, rpc=None):
-    """Re-check a receipt from its own fields and the public ledger alone."""
+def verify_receipt(rcpt, rpc=None, witness_at=None):
+    """Re-check a receipt from its own fields and the public ledger alone.
+
+    `witness_at` (optional) is the unix time the binding was announced to a
+    witness the issuer does not control. Reticuli's ordering rule: the witness
+    must precede the send block's time for the receipt to claim the binding was
+    published before payment. When it is supplied it is enforced as a hard
+    check; when it is omitted the result reports `witness_gap: true` so the
+    open question is visible instead of silently claimed away."""
     rpc = as_rpc(rpc)
     checks = []
 
@@ -637,8 +703,52 @@ def verify_receipt(rcpt, rpc=None):
     check("received_ends_in_tag", received % TAG_MODULUS == tag)
     expected_state = "paid" if received == pay else "overpaid" if received > pay else "underpaid"
     check("state_matches_amount", rcpt.get("state") == expected_state, f"expected {expected_state}")
+    created_at = int(rcpt.get("created_at") or 0)
+    receipt_sent_at = int(rcpt.get("sent_at") or 0)
+    # Reticuli's repair, sharpened: the before-payment ordering must be checked
+    # against the world (the settling block's node-reported time), not against
+    # the merchant-written document. We fetch the send block from the ledger
+    # first, read its local_timestamp, and treat THAT as the authoritative send
+    # time for witness_before_send. The receipt's sent_at is re-checked against
+    # the node's own number, so a receipt that misstates its send time is caught
+    # rather than trusted.
     try:
         s = rpc.call("block_info", json_block="true", hash=send_block)
+    except Exception:
+        s = None
+    node_send_time = None
+    if s is not None:
+        try:
+            node_send_time = int(s.get("local_timestamp") or 0) or None
+        except (TypeError, ValueError):
+            node_send_time = None
+    if node_send_time and receipt_sent_at and node_send_time != receipt_sent_at:
+        check("sent_at_matches_ledger", False,
+              f"receipt says send {receipt_sent_at}, ledger block says {node_send_time}")
+    send_time = node_send_time or receipt_sent_at
+    send_time_source = "ledger local_timestamp" if node_send_time else "receipt (no node time reported)"
+    # The before-payment ordering (Reticuli's repair): the binding must be
+    # witnessed after it exists and before the block that settled it. When a
+    # witness is supplied it is a hard check; when omitted the gap is reported
+    # plainly (witness_gap) instead of being silently claimed away.
+    witness_gap = witness_at is None
+    if witness_gap:
+        checks.append({"check": "witness_before_send", "ok": False,
+                       "detail": "no witness time supplied: 'published before payment' is the payee's word, not a check"})
+    else:
+        witness_at = int(witness_at)
+        check("witness_after_creation", witness_at >= created_at,
+              f"witness {witness_at} vs creation {created_at}")
+        if send_time:
+            check("witness_before_send", witness_at < send_time,
+                  f"witness {witness_at} vs send {send_time} (from {send_time_source})")
+        else:
+            check("witness_before_send", False, "send block carries no time a stranger can check")
+    if s is None:
+        check("ledger_reachable", False, "block_info for send block failed")
+        ok = all(c["ok"] for c in checks if not (witness_gap and c["check"] == "witness_before_send"))
+        return {"ok": ok, "witness_gap": witness_gap, "checks": checks}
+    try:
         contents = s.get("contents") or {}
         dest = contents.get("link_as_account") or contents.get("destination")
         check("send.block_account == sender", acct.normalise(s["block_account"]) == sender, s["block_account"])
@@ -656,4 +766,5 @@ def verify_receipt(rcpt, rpc=None):
             check("receive.confirmed", str(r.get("confirmed")).lower() == "true", str(r.get("confirmed")))
     except Exception as e:  # an unreachable or lying node must never read as verified
         check("ledger_reachable", False, f"{type(e).__name__}: {e}")
-    return {"ok": all(c["ok"] for c in checks), "checks": checks}
+    ok = all(c["ok"] for c in checks if not (witness_gap and c["check"] == "witness_before_send"))
+    return {"ok": ok, "witness_gap": witness_gap, "checks": checks}
