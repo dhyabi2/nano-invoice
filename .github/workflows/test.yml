@@ -1,0 +1,83 @@
+name: test
+
+# This repository had no `.github/` at all, so its 53 unit tests had never once
+# run on a runner, on any commit, in any pull request - while three pull requests
+# were merged into `main` on the strength of a test count quoted in their bodies.
+# A count of passing tests cannot tell "not run" from "not there", so the merge
+# rule this project works under ("merge when its suite passes") had nothing to
+# read. That is what this file is for.
+#
+# The matrix is 3.10-3.13, which is exactly what `pyproject.toml` declares
+# (`requires-python = ">=3.10"`) - no floor is left as a claim, and none is
+# proven that the declaration does not make.
+#
+# The command is the one README's own Tests section documents, `-t .` included,
+# so a green tick means the command a contributor runs is the command that ran.
+# (`-t .` is not load-bearing here - `tests/__init__.py` makes discover walk up
+# to the repository root by itself, measured both ways - but a CI file that runs
+# something other than the documented command is how the two drift apart.)
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -t . -v
+
+  installed:
+    # The suite runs from the checkout, so it proves the source and not the
+    # package. `pyproject.toml` declares a `nano-invoice` console script that
+    # nothing has ever executed from an install, and `[tool.setuptools]` lists
+    # its packages by hand - a module added without being listed there imports
+    # fine in the checkout and is missing from the wheel.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the package itself
+        run: python3 -m pip install .
+      - name: Every shipped module imports from the installed package
+        # From a directory that is not the checkout, so the checkout's own
+        # `nano_invoice/` cannot satisfy the import and hide a packaging gap.
+        working-directory: ${{ runner.temp }}
+        run: python3 -c "import nano_invoice, nano_invoice.cli, nano_invoice.core, nano_invoice.account, nano_invoice.rpc"
+      - name: The declared console script runs
+        working-directory: ${{ runner.temp }}
+        run: nano-invoice --help
+      - name: An invoice can be created end to end, offline
+        # `create` touches no network: it is the one subcommand that proves the
+        # installed package does its job without a node. The amount is checked
+        # in raw, as an exact integer - 0.25 XNO is 25 followed by 28 zeros,
+        # plus the tag - because a float here would lose real money.
+        working-directory: ${{ runner.temp }}
+        run: |
+          nano-invoice --db ci.db create \
+            --merchant nano_3m8cz87zwxb1y16ob4bzp1eyek78qaig8ktohk7d45b18sh6u9exbowbnekr \
+            --amount-xno 0.25 --order-key ci-smoke > out.json
+          python3 - <<'PY'
+          import json
+          inv = json.load(open("out.json"))
+          assert inv["amount_raw"] == "250000000000000000000000000000", inv["amount_raw"]
+          tag = inv["tag"]
+          assert inv["pay_raw"] == str(250 * 10 ** 27 + tag), (inv["pay_raw"], tag)
+          assert inv["state"] == "open", inv["state"]
+          print("created", inv["id"], "pay_raw", inv["pay_raw"])
+          PY
