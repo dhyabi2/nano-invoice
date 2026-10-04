@@ -113,6 +113,38 @@ assert ni.verify_log(rcpt["log"])["ok"]                # the chain, offline
 
 creditclaw put the remaining gap most exactly (2026-10-04): *"It still does not establish invoice purpose, payer identity, or whether the buyer's delivery mark was honest rather than collusive."* That is right, and nothing here closes it. The binding fixes **what the issuer committed to, before the payment**, and the chain fixes **that the money moved**; neither makes the issuer or the buyer honest. Concretely: `intent_hash` proves a quote was referenced, not that the quote was fair or that the work matched it. `policy_version` proves which terms were cited, not that the operator ever agreed to them — the authority root is the operator's own origin. The payer is the send block's `block_account` and nothing more: an address is not an identity. A `delivered` verdict is one party's assertion with a name and a time on it, which is what makes it disputable; it is not an adjudication, and a buyer and a seller who agree to lie will produce a receipt that verifies. And the digests are self-referential by construction — an issuer who rewrites the binding *and* its digest produces a self-consistent document, which is exactly why the before-payment announcement (`witness_payload`, `verify_receipt(witness_at=...)`) and the hash chain exist: they move the claim somewhere the issuer does not control. Where no witness time is supplied, `verify_receipt` reports `witness_gap: true` rather than claiming the ordering away.
 
+## Proving it on mainnet
+
+Everything above is checked against an in-memory ledger. A catalogue or a buyer who asks for
+*observed* behaviour wants the other thing: one real payment, read back off the public ledger.
+`tools/live_proof.py` produces that transcript in one command.
+
+```bash
+python3 tools/live_proof.py \
+    --merchant nano_3yourmerchantaccount... \
+    --amount-xno 0.000001 \
+    --order-key proof-2026-10-04 \
+    --rpc https://your-node.example/proxy
+```
+
+It creates the invoice, prints the exact raw amount to send, then polls the ledger until the
+payment confirms and prints, in order: the invoice, every ledger observation behind the
+settlement, the receipt, that same receipt re-checked **from the public ledger alone**, and the
+refund route. Add `--refund-demo` to pay a second time, which the invoice must not keep, so the
+transcript also shows a refund owed to the account the ledger says sent it.
+
+Two things this script cannot do, by design and by limitation:
+
+- **It never pays.** Nothing here signs, publishes or holds a key, so the payment itself comes
+  from a wallet you control. That is the one part of the transcript a machine cannot produce.
+- **An exactly-paid invoice owes nothing back**, so step 5 is an empty list unless you pass
+  `--refund-demo`. A transcript that printed a refund route for an exact payment would be
+  inventing one.
+
+The harness itself is tested (`tests/test_live_proof.py`): the polling, the settle, the
+independent re-check, the refund route, the unpaid timeout and the refusal to call an
+unconfirmed block settled. Only the payment is missing from a run here.
+
 ## Limits, stated plainly
 
 - **The payer must send the exact amount.** A wallet that rounds to a few decimals drops the tag and the payment matches nothing. Give the buyer `pay_raw` in raw (or as a full-precision `nano:` URI); a payment that matches no tag is not recorded by nano-invoice at all and needs a human or a manual refund.
