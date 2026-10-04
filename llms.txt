@@ -10,7 +10,21 @@ Nano blocks carry no memo. nano-invoice gives each order a unique exact amount: 
 - States: open -> paid | underpaid | overpaid | expired (all final). Faucet/own-account blocks are reported as not_income and never pay.
 - refund_instruction(...) / refund_hints(store, id) -> {to (chain sender), amount_raw, reason, source_block}; instructions only.
 - receipt(invoice, store) -> JSON with the block_info calls that reproduce it; verify_receipt(receipt, rpc) re-checks from the public ledger alone.
-- CLI: nano-invoice create|check|receipt|verify|refund-hint|show (JSON output).
+- CLI: nano-invoice create|check|receipt|verify|verify-log|verdict|tombstone|refund-hint|show (JSON output).
+
+## Receipt v2 - what the payment was FOR (schema nano-invoice/receipt/v2)
+- create_invoice(..., terms={policy_version, not_before, not_after, max_raw_per_payment, allowed_payees?, revocation?, note?}, intent_hash=<sha256 of the quote>, idempotency_key=<str>) -> a bound invoice. Without terms= nothing changes and the receipt is v1.
+- The binding is one document whose sha256 anchors the receipt. Inside the hashed bytes: order_key_sha256, amount_raw, tag, pay_raw, created_at, expires_at, intent_hash, policy_version, idempotency_key, and the terms in full plus their digest.
+- asset ("XNO") and scale (30) are DERIVED from RAW_PER_XNO. Restating either in the terms is refused (asset_restated / scale_restated).
+- Amounts cross every boundary as decimal integer strings and are compared as int. A JSON number in an amount field is refused (amount_not_integer_string), never coerced: 1 XNO is 10**30 raw and a double loses digits that are money.
+- append_verdict(invoice, "delivered"|"failed"|"indeterminate", output_commitment=<sha256>, asserted_by=<str>, asserted_at=<int>, accept_token=None, store=...) - appended AFTER settlement, never a rewrite. asserted_by and asserted_at are required.
+- append_tombstone(invoice, reason, superseded_by=None, asserted_by=<str>, asserted_at=<int>, store=...) - same attribution requirement.
+- verify_log(records) -> {ok, break_at, reason, length, checks}: each record carries the sha256 of the previous one, so a removed, reordered or edited record is reported at its index. SQLite triggers refuse UPDATE and DELETE on the log.
+- Idempotency: one set of terms per key, ever. Same key + same terms -> the same invoice; same key + anything bound differently -> IdempotencyConflict, compared by the binding digest.
+- Offline: the terms are embedded, so a verifier with no network answers "was this authorised when issued" (window, cap, payee list). revocation is a pointer that is REPORTED and never fetched, so "revoked since" stays an open question.
+- accept_token is a dispute handle only. No decision in the package reads it; the suite pins that every verification decision is identical with it present, absent or garbage.
+- A v1 receipt verifies unchanged, and a database written by 0.1.0 upgrades with additive nullable columns.
+- What it still does not prove (creditclaw, 2026-10-04): invoice purpose, payer identity, or whether the buyer's delivery mark was honest rather than collusive. A verdict is one named party's assertion, which makes it disputable, not adjudicated.
 
 ## Limits
 - The payer must send the exact raw amount; wallets that round lose the tag.

@@ -67,3 +67,22 @@ def is_valid(account):
         return True
     except InvalidAccount:
         return False
+
+
+def same_account(left, right):
+    """Whether two addresses name ONE account, however each is spelled.
+
+    `xrb_` and `nano_` carry the same 60 characters encoding the same public
+    key, so comparing addresses as text refuses a payment that did arrive -
+    the defect `paid-work-queue/canonical.py` records and fixes with exactly
+    this function. None on either side never matches, so a missing value is
+    refused rather than quietly matching another missing one.
+    """
+    try:
+        left_key = public_key(left)
+    except InvalidAccount:
+        return False
+    try:
+        return left_key == public_key(right)
+    except InvalidAccount:
+        return False

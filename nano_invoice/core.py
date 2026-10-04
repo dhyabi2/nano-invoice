@@ -16,11 +16,13 @@ sends. Refunds come out as instructions for the merchant's own wallet.
 import contextlib
 import dataclasses
 import hashlib
+import json
 import secrets
 import sqlite3
 import time
 
 from . import account as acct
+from . import receipt_v2 as v2
 from .rpc import as_rpc
 
 RAW_PER_XNO = 10 ** 30
@@ -30,6 +32,8 @@ CLOCK_SKEW_S = 120
 MAX_RAW = 2 ** 128 - 1
 ID_PREFIX = "nano-invoice/v1"
 RECEIPT_SCHEMA = "nano-invoice/receipt/v1"
+RECEIPT_SCHEMA_V2 = v2.RECEIPT_SCHEMA_V2
+RECEIPT_SCHEMAS = (RECEIPT_SCHEMA, RECEIPT_SCHEMA_V2)
 
 STATES = ("open", "paid", "underpaid", "overpaid", "expired")
 TRANSITIONS = {"open": frozenset({"paid", "underpaid", "overpaid", "expired"})}
@@ -63,6 +67,10 @@ class TagsExhausted(InvoiceError):
 
 class NotFound(InvoiceError, KeyError):
     pass
+
+
+class IdempotencyConflict(InvoiceError):
+    """The same idempotency_key was re-used for different terms."""
 
 
 def require_raw(value, name="amount_raw", minimum=1):
@@ -124,13 +132,28 @@ class Invoice:
     receive_block: str = None
     sender: str = None
     received_raw: int = None
+    # Receipt v2 (2026-10-04). All nullable: a v1 invoice carries none of them
+    # and its receipt is unchanged.
+    intent_hash: str = None
+    idempotency_key: str = None
+    policy_version: int = None
+    terms_json: str = None
+    terms_sha256: str = None
+    binding_sha256: str = None
 
     def to_dict(self):
         d = dataclasses.asdict(self)
         for k in ("amount_raw", "pay_raw", "received_raw"):
             if d[k] is not None:
                 d[k] = str(d[k])
+        d.pop("terms_json", None)
+        if self.terms_json:
+            d["terms"] = json.loads(self.terms_json)
         return d
+
+    @property
+    def terms(self):
+        return json.loads(self.terms_json) if self.terms_json else None
 
 
 SCHEMA = """
@@ -174,6 +197,32 @@ CREATE UNIQUE INDEX IF NOT EXISTS payments_one_settlement ON payments(invoice_id
   WHERE kind IN ('payment','underpaid','overpaid');
 """
 
+# Applied AFTER _migrate(), because the idempotency index names a column that
+# an older file only acquires during the migration. Running it inside SCHEMA
+# would raise "no such column: idempotency_key" on every pre-v2 database.
+SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS invoice_log(
+  invoice_id TEXT NOT NULL REFERENCES invoices(id),
+  seq INTEGER NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('issued','verdict','tombstone')),
+  record_json TEXT NOT NULL,
+  prev_sha256 TEXT,
+  record_sha256 TEXT NOT NULL UNIQUE,
+  asserted_by TEXT,
+  asserted_at INTEGER,
+  PRIMARY KEY (invoice_id, seq)
+);
+-- Append-only in the storage engine, not merely in the code that writes it:
+-- dc34eb1c's point is that a log the publisher can rewrite proves nothing, and
+-- "our functions never UPDATE it" is a promise, while a trigger is a refusal.
+CREATE TRIGGER IF NOT EXISTS invoice_log_no_update BEFORE UPDATE ON invoice_log
+  BEGIN SELECT RAISE(ABORT, 'invoice_log is append-only: a record cannot be rewritten'); END;
+CREATE TRIGGER IF NOT EXISTS invoice_log_no_delete BEFORE DELETE ON invoice_log
+  BEGIN SELECT RAISE(ABORT, 'invoice_log is append-only: a record cannot be removed'); END;
+CREATE UNIQUE INDEX IF NOT EXISTS invoices_idempotency
+  ON invoices(merchant, idempotency_key) WHERE idempotency_key IS NOT NULL;
+"""
+
 
 class Store:
     """A single SQLite file. Every write runs inside BEGIN IMMEDIATE, so two
@@ -190,13 +239,26 @@ class Store:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
         self._migrate()
+        self.conn.executescript(SCHEMA_V2)
 
     # Columns added after the first release. CREATE TABLE IF NOT EXISTS leaves an
     # existing file untouched, so a database written before a column existed keeps
     # the old shape and every INSERT naming the new column fails with
     # "table invoices has no column named ...". Each entry must stay additive and
     # nullable: adding it to an old file then cannot lose or rewrite a row.
-    ADDED_COLUMNS = (("invoices", "witness_at", "INTEGER"),)
+    ADDED_COLUMNS = (
+        ("invoices", "witness_at", "INTEGER"),
+        # Receipt v2, 2026-10-04. Every one is nullable and additive, so a file
+        # written by an earlier release keeps every row it has and simply has
+        # no v2 binding - which is what makes "a v1 receipt verifies unchanged"
+        # true of real merchant databases and not only of fresh ones.
+        ("invoices", "intent_hash", "TEXT"),
+        ("invoices", "idempotency_key", "TEXT"),
+        ("invoices", "policy_version", "INTEGER"),
+        ("invoices", "terms_json", "TEXT"),
+        ("invoices", "terms_sha256", "TEXT"),
+        ("invoices", "binding_sha256", "TEXT"),
+    )
 
     def _migrate(self):
         for table, column, decl in self.ADDED_COLUMNS:
@@ -266,6 +328,35 @@ class Store:
                 raise BlockAlreadyBound(str(e)) from e
         return self.payment(observed["send_block"])
 
+    # ------------------------------------------------------- the record log
+
+    def log(self, invoice):
+        """Every record for this invoice, oldest first, as `verify_log` reads them."""
+        inv_id = invoice.id if isinstance(invoice, Invoice) else invoice
+        rows = self.conn.execute(
+            "SELECT record_json FROM invoice_log WHERE invoice_id = ? ORDER BY seq", (inv_id,)).fetchall()
+        return [json.loads(r["record_json"]) for r in rows]
+
+    def append(self, invoice_id, kind, body, asserted_by=None, asserted_at=None):
+        """Append one chained record. The seq and the previous digest are read
+        inside the same transaction that writes, so two processes cannot both
+        claim seq n."""
+        with self.tx() as c:
+            row = c.execute(
+                "SELECT seq, record_sha256 FROM invoice_log WHERE invoice_id = ?"
+                " ORDER BY seq DESC LIMIT 1", (invoice_id,)).fetchone()
+            seq = 0 if row is None else row["seq"] + 1
+            prev = None if row is None else row["record_sha256"]
+            rec = v2.record(kind, seq=seq, prev_sha256=prev, body=body,
+                            asserted_by=asserted_by, asserted_at=asserted_at)
+            c.execute(
+                "INSERT INTO invoice_log(invoice_id, seq, kind, record_json, prev_sha256,"
+                " record_sha256, asserted_by, asserted_at) VALUES (?,?,?,?,?,?,?,?)",
+                (invoice_id, seq, kind, json.dumps(rec, sort_keys=True, separators=(",", ":"),
+                                                   ensure_ascii=False),
+                 prev, rec["record_sha256"], asserted_by, asserted_at))
+        return rec
+
     def expire(self, invoice_id, now=None):
         now = int(time.time()) if now is None else now
         with self.tx() as c:
@@ -305,14 +396,24 @@ def _require_store(store):
 
 
 def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, store=None, now=None,
-                   witness_at=None, _rand=secrets.randbelow):
+                   witness_at=None, terms=None, intent_hash=None, idempotency_key=None,
+                   _rand=secrets.randbelow):
     """Idempotent: the same (merchant, order_key) always returns the same invoice.
     The same order key with a different amount raises OrderConflict.
 
     `witness_at` is the unix time the merchant announced this invoice's binding
     (id + tagged amount) to a channel it does not control, before any payment.
     A receipt can be re-checked for the before-payment ordering only when the
-    merchant supplies this witness; see verify_receipt(witness_at=...)."""
+    merchant supplies this witness; see verify_receipt(witness_at=...).
+
+    `terms` makes this a RECEIPT V2 invoice: the authorisation terms are
+    embedded in full and hashed into the binding, and `intent_hash` (the sha256
+    of the quote or request this invoice answers) and `idempotency_key` are
+    bound with them. Passing any of the three without `terms` is refused -
+    `policy_version` lives in the terms, and a binding missing it would claim
+    to bind an authorisation version it does not carry. Without `terms` nothing
+    changes: the invoice has no binding and `receipt()` emits v1 exactly as
+    before."""
     store = _require_store(store)
     merchant = acct.normalise(merchant_account)
     require_raw(amount_raw, "amount_raw", minimum=TAG_MODULUS)
@@ -329,8 +430,33 @@ def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, stor
             raise InvoiceError(
                 f"witness_at {witness_at} must be between creation {now} and expiry {now + expires_s}: "
                 "the binding is announced after it exists and before it lapses")
+    if terms is None and (intent_hash is not None or idempotency_key is not None):
+        raise InvoiceError(
+            "intent_hash and idempotency_key are bound fields of a receipt v2 invoice and need "
+            "terms=: policy_version comes from the terms, and a binding that omits it would claim "
+            "to bind an authorisation version it does not carry")
+    normalised_terms = None
+    if terms is not None:
+        try:
+            normalised_terms = v2.normalise_terms(terms)
+        except v2.TermsError as e:
+            raise InvoiceError(f"{e.reason}: {e.detail}") from e
+        problems = v2.authorised_at_issue(normalised_terms, now, merchant, amount_raw)
+        if problems:
+            raise InvoiceError("; ".join(f"{r}: {d}" for r, d in problems))
     okh = order_key_hash(order_key)
     inv_id = invoice_id_for(merchant, okh)
+
+    def binding_for(inv_id_, tag_, pay_raw_, created_at_, expires_at_):
+        try:
+            return v2.bound_document(
+                invoice_id=inv_id_, merchant=merchant, order_key_sha256=okh,
+                amount_raw=amount_raw, tag=tag_, pay_raw=pay_raw_, created_at=created_at_,
+                expires_at=expires_at_, intent_hash=intent_hash,
+                idempotency_key=idempotency_key, terms=normalised_terms)
+        except v2.TermsError as e:
+            raise InvoiceError(f"{e.reason}: {e.detail}") from e
+
     with store.tx() as c:
         row = c.execute("SELECT * FROM invoices WHERE id = ?", (inv_id,)).fetchone()
         if row is not None:
@@ -339,18 +465,74 @@ def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, stor
                 raise OrderConflict(
                     f"order already invoiced as {existing.id} for {existing.amount_raw} raw; "
                     f"refusing a second invoice for {amount_raw} raw")
+            _same_binding(existing, normalised_terms, binding_for)
             return existing
+        if idempotency_key is not None:
+            prior = c.execute(
+                "SELECT * FROM invoices WHERE merchant = ? AND idempotency_key = ?",
+                (merchant, idempotency_key)).fetchone()
+            if prior is not None:
+                # Same key, and it is NOT this order: by definition different
+                # terms, because order_key_sha256 is inside the hashed bytes.
+                _same_binding(Store._invoice(prior), normalised_terms, binding_for)
         busy = {r[0] for r in c.execute(
             "SELECT tag FROM invoices WHERE merchant = ? AND (state = 'open' OR closed_at > ?)",
             (merchant, now - TAG_QUARANTINE_S))}
         tag = _allocate_tag(busy, _rand)
         pay_raw = amount_raw + tag
         require_raw(pay_raw, "pay_raw")
+        binding = (binding_for(inv_id, tag, pay_raw, now, now + expires_s)
+                   if normalised_terms is not None else None)
         c.execute(
             "INSERT INTO invoices(id, merchant, order_key_sha256, amount_raw, tag, pay_raw, created_at,"
-            " expires_at, witness_at, state) VALUES (?,?,?,?,?,?,?,?,?, 'open')",
-            (inv_id, merchant, okh, str(amount_raw), tag, str(pay_raw), now, now + expires_s, witness_at))
+            " expires_at, witness_at, state, intent_hash, idempotency_key, policy_version, terms_json,"
+            " terms_sha256, binding_sha256) VALUES (?,?,?,?,?,?,?,?,?, 'open',?,?,?,?,?,?)",
+            (inv_id, merchant, okh, str(amount_raw), tag, str(pay_raw), now, now + expires_s, witness_at,
+             intent_hash, idempotency_key,
+             None if normalised_terms is None else normalised_terms["policy_version"],
+             None if binding is None else json.dumps(
+                 normalised_terms, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
+             None if binding is None else binding["terms_sha256"],
+             None if binding is None else v2.digest(binding)))
+    if normalised_terms is not None:
+        # Record 0 of the append-only log. Written outside the invoice INSERT's
+        # transaction on purpose: `Store.append` opens its own BEGIN IMMEDIATE
+        # to read the chain head, and nesting would deadlock. If it fails the
+        # invoice exists with no log, which `verify_log` reports as `log_empty`
+        # rather than reading as a sound receipt.
+        store.append(inv_id, "issued", {
+            "invoice_id": inv_id,
+            "binding_sha256": v2.digest(binding),
+            "terms_sha256": binding["terms_sha256"],
+        })
     return store.get(inv_id)
+
+
+def _same_binding(existing, normalised_terms, binding_for):
+    """Refuse a re-issue whose bound terms differ from the ones already issued.
+
+    An idempotency key is only worth something if re-using it with different
+    terms is a REFUSAL rather than a second invoice or a silent overwrite. The
+    comparison is the binding digest, so it covers every bound field - amount,
+    intent, policy version, the terms themselves - and not a hand-kept subset
+    that drifts.
+    """
+    if normalised_terms is None and existing.binding_sha256 is None:
+        return
+    if normalised_terms is None or existing.binding_sha256 is None:
+        raise IdempotencyConflict(
+            f"{existing.id} was issued "
+            + ("with bound terms" if existing.binding_sha256 else "without bound terms")
+            + ", and this request "
+            + ("supplies none" if normalised_terms is None else "supplies terms")
+            + ": a v1 and a v2 invoice are not the same invoice")
+    want = v2.digest(binding_for(existing.id, existing.tag, existing.pay_raw,
+                                 existing.created_at, existing.expires_at))
+    if want != existing.binding_sha256:
+        raise IdempotencyConflict(
+            f"{existing.id} is already bound to different terms "
+            f"(binding {existing.binding_sha256}, this request binds {want}); "
+            "an idempotency key names one set of terms and never a second")
 
 
 def _allocate_tag(busy, rand):
@@ -625,6 +807,47 @@ def witness_payload(invoice, store=None, witness_channel=None):
     }
 
 
+def append_verdict(invoice, verdict, output_commitment=None, asserted_by=None, asserted_at=None,
+                   accept_token=None, note=None, store=None):
+    """Append a delivery verdict AFTER settlement. The receipt is not rewritten.
+
+    heysaladcommerceprobe asked for the verdict and the output commitment;
+    dc34eb1c's correction supplies the rest - `asserted_by` and `asserted_at`
+    are required, because an unattributed verdict is the issuer grading its own
+    homework. `accept_token` rides along as wickthefamiliar's dispute handle and
+    is read by no decision in this package.
+    """
+    store = _require_store(store)
+    inv = store.get(invoice)
+    if inv.binding_sha256 is None:
+        raise InvoiceError(f"{inv.id} has no bound terms: a delivery verdict belongs to a v2 invoice")
+    if inv.state == "open":
+        raise InvoiceError(
+            f"{inv.id} is open: a delivery verdict is appended after settlement, not before it")
+    try:
+        body = v2.verdict_body(verdict, output_commitment=output_commitment,
+                               accept_token=accept_token, note=note)
+        return store.append(inv.id, "verdict", body,
+                            asserted_by=asserted_by, asserted_at=asserted_at)
+    except v2.LedgerBroken as e:
+        raise InvoiceError(f"{e.reason}: {e.detail}") from e
+
+
+def append_tombstone(invoice, reason, superseded_by=None, asserted_by=None, asserted_at=None,
+                     note=None, store=None):
+    """Retire or supersede a receipt without rewriting it. Attribution required."""
+    store = _require_store(store)
+    inv = store.get(invoice)
+    if inv.binding_sha256 is None:
+        raise InvoiceError(f"{inv.id} has no bound terms: a tombstone belongs to a v2 invoice")
+    try:
+        body = v2.tombstone_body(reason, superseded_by=superseded_by, note=note)
+        return store.append(inv.id, "tombstone", body,
+                            asserted_by=asserted_by, asserted_at=asserted_at)
+    except v2.LedgerBroken as e:
+        raise InvoiceError(f"{e.reason}: {e.detail}") from e
+
+
 def receipt(invoice, store=None):
     store = _require_store(store)
     inv = store.get(invoice)
@@ -646,7 +869,7 @@ def receipt(invoice, store=None):
             "block_info(receive_block).contents.link == send_block",
             "block_info(receive_block).confirmed == 'true'",
         ]
-    return {
+    out = {
         "schema": RECEIPT_SCHEMA,
         "invoice_id": inv.id,
         "id_rule": f"'inv_' + sha256('{ID_PREFIX}|' + merchant + '|' + order_key_sha256).hexdigest()[:32]",
@@ -668,6 +891,48 @@ def receipt(invoice, store=None):
         "reproduce": reproduce,
         "claims": claims,
     }
+    if inv.binding_sha256 is None:
+        return out  # a v1 invoice: byte-for-byte the receipt it emitted before v2 existed
+    binding = v2.bound_document(
+        invoice_id=inv.id, merchant=inv.merchant, order_key_sha256=inv.order_key_sha256,
+        amount_raw=inv.amount_raw, tag=inv.tag, pay_raw=inv.pay_raw, created_at=inv.created_at,
+        expires_at=inv.expires_at, intent_hash=inv.intent_hash,
+        idempotency_key=inv.idempotency_key, terms=inv.terms)
+    records = store.log(inv)
+    out.update({
+        "schema": RECEIPT_SCHEMA_V2,
+        "asset": v2.ASSET,
+        "scale": v2.SCALE,
+        "intent_hash": inv.intent_hash,
+        "idempotency_key": inv.idempotency_key,
+        "policy_version": inv.policy_version,
+        "binding": binding,
+        "binding_sha256": v2.digest(binding),
+        "terms_sha256": binding["terms_sha256"],
+        "log": records,
+        "log_head_sha256": records[-1]["record_sha256"] if records else None,
+    })
+    out["claims"] = claims + [
+        "sha256(canonical_json(binding)) == binding_sha256",
+        "sha256(canonical_json(binding.terms)) == binding.terms_sha256",
+        "every record in log: prev_sha256 == the previous record's record_sha256",
+        "binding.created_at is inside binding.terms' not_before..not_after window",
+    ]
+    out["reproduce"] = reproduce + [
+        {"action": "local", "call": "nano_invoice.verify_receipt(receipt)"},
+        {"action": "local", "call": "nano_invoice.verify_log(receipt['log'])"},
+    ]
+    return out
+
+
+def receipt_schema_of(invoice):
+    """Which receipt schema this invoice emits: v2 once it carries bound terms."""
+    return RECEIPT_SCHEMA_V2 if getattr(invoice, "binding_sha256", None) else RECEIPT_SCHEMA
+
+
+def verify_log(records):
+    """Re-derive the append-only record log. Reports the FIRST break by index."""
+    return v2.verify_log(records)
 
 
 def verify_receipt(rcpt, rpc=None, witness_at=None):
@@ -695,7 +960,25 @@ def verify_receipt(rcpt, rpc=None, witness_at=None):
     except (KeyError, ValueError, TypeError, acct.InvalidAccount) as e:
         check("receipt_well_formed", False, str(e))
         return {"ok": False, "checks": checks}
-    check("schema", rcpt.get("schema") == RECEIPT_SCHEMA, rcpt.get("schema", ""))
+    is_v2 = rcpt.get("schema") == RECEIPT_SCHEMA_V2
+    check("schema", rcpt.get("schema") in RECEIPT_SCHEMAS, rcpt.get("schema", ""))
+    if is_v2:
+        # The bound half: what the payment was FOR. Checked from the receipt's
+        # own bytes, so it answers with no network at all - and then the ledger
+        # checks below answer the other half, that the money moved.
+        checks.extend(v2.verify_binding(rcpt))
+        log = rcpt.get("log")
+        if log is None:
+            check("log_present", False, "a v2 receipt carries its append-only record log")
+        else:
+            verdict = v2.verify_log(log)
+            check("log_append_only", verdict["ok"],
+                  "chain holds" if verdict["ok"]
+                  else f"{verdict['reason']} at record {verdict['break_at']} of {verdict['length']}")
+            head = log[-1]["record_sha256"] if (verdict["ok"] and log) else None
+            if head is not None:
+                check("log_head_sha256", rcpt.get("log_head_sha256") == head,
+                      f"receipt says {rcpt.get('log_head_sha256')!r}, the log ends at {head}")
     check("invoice_id_rederives", invoice_id_for(merchant, rcpt["order_key_sha256"]) == rcpt["invoice_id"])
     # The tag is the ONLY thing binding an amount to an order - Nano blocks carry
     # no memo - so a tag of 0 makes every arithmetic check below vacuous: any

@@ -1,8 +1,12 @@
-"""nano-invoice create|check|receipt|verify|refund-hint|show -- JSON on stdout."""
+"""nano-invoice create|check|receipt|verify|verify-log|verdict|tombstone|refund-hint|show.
+
+JSON on stdout. Exit 0 on a sound answer, 1 on a receipt or log that does not
+verify, 2 on a usage or document error, 3 on an RPC failure."""
 import argparse
 import json
 import os
 import sys
+import time
 
 from . import account as acct
 from . import core
@@ -40,6 +44,33 @@ def build_parser():
     amt.add_argument("--amount-xno", help="price in XNO as an exact decimal string, e.g. 0.25")
     c.add_argument("--order-key", required=True)
     c.add_argument("--expires-s", type=int, default=3600)
+    # Receipt v2. Supplying --terms-file makes this a bound invoice; without it
+    # the invoice and its receipt are exactly what they were before v2.
+    c.add_argument("--terms-file", help="authorisation terms as JSON, embedded in full and hashed "
+                                        "into the binding (receipt v2); - for stdin")
+    c.add_argument("--intent-hash", help="sha256 of the quote or request this invoice answers "
+                                         "(needs --terms-file)")
+    c.add_argument("--idempotency-key", help="one set of terms per key, ever (needs --terms-file)")
+
+    vd = sub.add_parser("verdict", help="append a delivery verdict after settlement")
+    vd.add_argument("--invoice", required=True)
+    vd.add_argument("--verdict", required=True, choices=list(core.v2.VERDICTS))
+    vd.add_argument("--output-commitment", help="sha256 of what was delivered")
+    vd.add_argument("--asserted-by", required=True, help="who says so")
+    vd.add_argument("--asserted-at", type=int, help="unix seconds (default: now)")
+    vd.add_argument("--accept-token", help="a dispute handle only; no payment path reads it")
+    vd.add_argument("--note")
+
+    tb = sub.add_parser("tombstone", help="retire or supersede a receipt without rewriting it")
+    tb.add_argument("--invoice", required=True)
+    tb.add_argument("--reason", required=True)
+    tb.add_argument("--superseded-by")
+    tb.add_argument("--asserted-by", required=True)
+    tb.add_argument("--asserted-at", type=int)
+    tb.add_argument("--note")
+
+    vl = sub.add_parser("verify-log", help="re-derive a receipt's append-only record log")
+    vl.add_argument("--receipt", required=True, help="receipt JSON file, or - for stdin")
 
     k = sub.add_parser("check", help="read the ledger and settle the invoice")
     k.add_argument("--invoice", required=True)
@@ -68,17 +99,40 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     rpc = Rpc(args.rpc)
     try:
-        if args.cmd == "verify":
+        if args.cmd in ("verify", "verify-log"):
             src = sys.stdin if args.receipt == "-" else open(args.receipt)
             with src:
-                result = core.verify_receipt(json.load(src), rpc=rpc)
+                doc = json.load(src)
+            if args.cmd == "verify-log":
+                result = core.verify_log(doc.get("log") if isinstance(doc, dict) else doc)
+            else:
+                result = core.verify_receipt(doc, rpc=rpc)
             _out(result)
             return 0 if result["ok"] else 1
         store = core.Store(args.db)
         if args.cmd == "create":
             raw = int(args.amount_raw) if args.amount_raw is not None else core.xno_to_raw(args.amount_xno)
-            inv = core.create_invoice(args.merchant, raw, args.order_key, args.expires_s, store=store)
+            terms = None
+            if args.terms_file:
+                tsrc = sys.stdin if args.terms_file == "-" else open(args.terms_file)
+                with tsrc:
+                    terms = json.load(tsrc)
+            inv = core.create_invoice(args.merchant, raw, args.order_key, args.expires_s, store=store,
+                                      terms=terms, intent_hash=args.intent_hash,
+                                      idempotency_key=args.idempotency_key)
             _out(dict(inv.to_dict(), instruction=f"send exactly {inv.pay_raw} raw to {inv.merchant}"))
+        elif args.cmd == "verdict":
+            _out(core.append_verdict(
+                args.invoice, args.verdict, output_commitment=args.output_commitment,
+                asserted_by=args.asserted_by,
+                asserted_at=args.asserted_at if args.asserted_at is not None else int(time.time()),
+                accept_token=args.accept_token, note=args.note, store=store))
+        elif args.cmd == "tombstone":
+            _out(core.append_tombstone(
+                args.invoice, args.reason, superseded_by=args.superseded_by,
+                asserted_by=args.asserted_by,
+                asserted_at=args.asserted_at if args.asserted_at is not None else int(time.time()),
+                note=args.note, store=store))
         elif args.cmd == "check":
             _out(core.check_invoice(args.invoice, rpc=rpc, store=store, own_accounts=args.own or (),
                                     not_income=_not_income(args), max_blocks=args.max_blocks))
