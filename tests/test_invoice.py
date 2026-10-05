@@ -360,6 +360,70 @@ class TestReceipt(Base):
         self.assertTrue(result["ok"], result)
         self.assertEqual([c["action"] for c in r["reproduce"]], ["block_info", "block_info"])
 
+    def test_a_malformed_receipt_refuses_rather_than_raising(self):
+        """A receipt is written by the party being checked, so a shape
+        `verify_receipt` cannot read is a refusal - never an exception for its
+        caller to absorb.
+
+        `receipt_well_formed` exists for exactly this, but two REQUIRED fields
+        (`order_key_sha256`, `invoice_id`) were read outside its guard and
+        `AttributeError` was missing from the tuple, so four ordinary malformed
+        shapes raised straight out of the function.
+        """
+        r = json.loads(json.dumps(self.paid()))
+        cases = {
+            "order_key_sha256 missing": lambda d: d.pop("order_key_sha256"),
+            "invoice_id missing": lambda d: d.pop("invoice_id"),
+            "send_block is a JSON number": lambda d: d.__setitem__("send_block", 123),
+            "send_block is null": lambda d: d.__setitem__("send_block", None),
+            "merchant missing": lambda d: d.pop("merchant"),
+            "the whole receipt is a list": lambda d: None,
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name):
+                bad = json.loads(json.dumps(r))
+                if name == "the whole receipt is a list":
+                    bad = [r]
+                else:
+                    mutate(bad)
+                try:
+                    result = ni.verify_receipt(bad, rpc=self.ledger)
+                except Exception as e:  # noqa: BLE001 - the point of the test
+                    self.fail(f"{name}: verify_receipt raised {type(e).__name__}: {e} "
+                              "instead of refusing")
+                self.assertFalse(result["ok"], result)
+                failed = [c["check"] for c in result["checks"] if not c["ok"]]
+                self.assertIn("receipt_well_formed", failed, result)
+
+    def test_a_malformed_receipt_is_a_verify_failure_not_an_rpc_failure(self):
+        """The CLI documents `1 on a receipt or log that does not verify, ...
+        3 on an RPC failure`. While `verify_receipt` raised, its exception was
+        reported as exit 3 - telling an integrator to retry a node that is fine.
+        """
+        r = json.loads(json.dumps(self.paid()))
+        del r["order_key_sha256"]
+        path = os.path.join(self.tmp.name, "malformed.json")
+        with open(path, "w") as fh:
+            json.dump(r, fh)
+        with mock.patch.object(core, "as_rpc", lambda _: self.ledger):
+            code = cli.main(["verify", "--receipt", path])
+        self.assertEqual(code, 1, "a malformed receipt is a verify failure, not an RPC failure")
+
+    def test_a_well_formed_receipt_is_untouched_by_the_refusal(self):
+        """Control: the guard must not cost a receipt that is simply correct."""
+        r = json.loads(json.dumps(self.paid()))
+        result = ni.verify_receipt(r, rpc=self.ledger)
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("receipt_well_formed",
+                         [c["check"] for c in result["checks"]])
+
+    def test_an_xrb_spelled_send_block_hash_still_verifies(self):
+        """Control: `send_block` is upper-cased, not type-coerced - a lowercase
+        hash from another tool is still the same block."""
+        r = json.loads(json.dumps(self.paid()))
+        r["send_block"] = r["send_block"].lower()
+        self.assertTrue(ni.verify_receipt(r, rpc=self.ledger)["ok"])
+
     def test_tampered_receipts_fail(self):
         r = self.paid()
         for field, value in (("sender", OTHER), ("pay_raw", str(int(r["pay_raw"]) + 1)),

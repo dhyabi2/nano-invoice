@@ -956,9 +956,24 @@ def verify_receipt(rcpt, rpc=None, witness_at=None):
         sender = acct.normalise(rcpt["sender"])
         amount, tag, pay = int(rcpt["amount_raw"]), int(rcpt["tag"]), int(rcpt["pay_raw"])
         received = int(rcpt["received_raw"])
+        # `.upper()` on a non-string raises AttributeError, which was not in the
+        # tuple below: a receipt whose send_block was a JSON number or null
+        # raised out of this function instead of refusing. Refused as malformed
+        # here rather than coerced with str(), so garbage is named for what it is
+        # and no node is called on it.
+        if not isinstance(rcpt["send_block"], str):
+            raise TypeError("send_block must be a string, not "
+                            + type(rcpt["send_block"]).__name__)
         send_block = rcpt["send_block"].upper()
-    except (KeyError, ValueError, TypeError, acct.InvalidAccount) as e:
-        check("receipt_well_formed", False, str(e))
+        # Both of these are REQUIRED fields and both were read further down,
+        # OUTSIDE this guard - so a receipt missing either one raised KeyError out
+        # of verify_receipt rather than refusing. A receipt is written by the
+        # party being checked, so a shape this function cannot read is a refusal,
+        # never an exception for its caller to absorb.
+        order_key_sha256 = rcpt["order_key_sha256"]
+        claimed_invoice_id = rcpt["invoice_id"]
+    except (AttributeError, KeyError, ValueError, TypeError, acct.InvalidAccount) as e:
+        check("receipt_well_formed", False, f"{type(e).__name__}: {e}")
         return {"ok": False, "checks": checks}
     is_v2 = rcpt.get("schema") == RECEIPT_SCHEMA_V2
     check("schema", rcpt.get("schema") in RECEIPT_SCHEMAS, rcpt.get("schema", ""))
@@ -979,7 +994,7 @@ def verify_receipt(rcpt, rpc=None, witness_at=None):
             if head is not None:
                 check("log_head_sha256", rcpt.get("log_head_sha256") == head,
                       f"receipt says {rcpt.get('log_head_sha256')!r}, the log ends at {head}")
-    check("invoice_id_rederives", invoice_id_for(merchant, rcpt["order_key_sha256"]) == rcpt["invoice_id"])
+    check("invoice_id_rederives", invoice_id_for(merchant, order_key_sha256) == claimed_invoice_id)
     # The tag is the ONLY thing binding an amount to an order - Nano blocks carry
     # no memo - so a tag of 0 makes every arithmetic check below vacuous: any
     # confirmed send of a round amount to this merchant then satisfies
