@@ -8,13 +8,15 @@ from .core import (
     TAG_MODULUS, TAG_QUARANTINE_S,
     AmountError, BlockAlreadyBound, IdempotencyConflict, IllegalTransition, Invoice, InvoiceError,
     NotFound, OrderConflict,
-    Store, TagsExhausted, append_tombstone, append_verdict, check_invoice, create_invoice,
+    Store, TagsExhausted, append_tombstone, append_verdict, check_counterparty_role, check_invoice,
+    create_invoice,
     invoice_id_for, order_key_hash, receipt, receipt_schema_of,
     refund_hints, refund_instruction, require_raw, scan, verify_log, verify_receipt, witness_payload,
     xno_to_raw,
 )
 from .receipt_v2 import (
-    ASSET, SCALE, VERDICTS, LedgerBroken, TermsError, canonical_json, digest, normalise_terms,
+    ASSET, COUNTERPARTY_ROLES, SCALE, VERDICTS, LedgerBroken, TermsError, canonical_json,
+    counterparty_role_check, digest, funded_accounts, normalise_terms,
 )
 from .rpc import DEFAULT_RPC, Rpc, RpcError
 

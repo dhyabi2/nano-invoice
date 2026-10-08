@@ -81,10 +81,16 @@ RECORD_KINDS = ("issued", "verdict", "tombstone")
 # a field this verifier does not understand may be the one the operator thinks
 # is limiting the payment.
 TERMS_REQUIRED = ("policy_version", "not_before", "not_after", "max_raw_per_payment")
-TERMS_OPTIONAL = ("allowed_payees", "revocation", "note")
+TERMS_OPTIONAL = ("allowed_payees", "revocation", "note", "counterparty_role")
 TERMS_FIELDS = TERMS_REQUIRED + TERMS_OPTIONAL
 # Written by this module from RAW_PER_XNO; a caller who states them is refused.
 TERMS_DERIVED = ("asset", "scale")
+
+# Who the receiver is to the payer, declared before payment (moltbookrevenueagent,
+# 2026-10-08). `self`: the payer's own account. `operator`: an account the payer
+# has funded. `external`: neither. The declaration is a claim; the funded set is
+# the query that checks it - see `counterparty_role_check`.
+COUNTERPARTY_ROLES = ("external", "operator", "self")
 
 REASONS = (
     "terms_not_an_object",
@@ -115,6 +121,10 @@ REASONS = (
     "log_prev_hash_mismatch",
     "log_record_digest_mismatch",
     "log_record_unknown_kind",
+    "counterparty_role_unknown",
+    "role_mismatch",
+    "history_not_the_payers",
+    "history_malformed",
 )
 
 
@@ -269,6 +279,15 @@ def normalise_terms(terms):
         if not isinstance(terms["note"], str):
             raise TermsError("terms_unknown_field", "note must be a string")
         out["note"] = terms["note"]
+
+    role = terms.get("counterparty_role")
+    if role is not None:
+        # Exact strings only: a bool or a differently-cased word is a field this
+        # verifier would be guessing at, and the check below reads it literally.
+        if not isinstance(role, str) or role not in COUNTERPARTY_ROLES:
+            raise TermsError("counterparty_role_unknown",
+                             f"{role!r}: expected one of {', '.join(COUNTERPARTY_ROLES)}")
+        out["counterparty_role"] = role
     return out
 
 
@@ -292,6 +311,78 @@ def authorised_at_issue(terms, created_at, merchant, amount_raw):
     if allowed and not any(acct.same_account(merchant, a) for a in allowed):
         problems.append(("payee_not_allowed", merchant))
     return problems
+
+
+# -------------------------------------------------------- counterparty role
+
+def funded_accounts(payer, history, before=None, exclude_blocks=()):
+    """The set of accounts `payer` has sent to, read from an account_history
+    response the CALLER supplies. Pure: nothing is fetched.
+
+    `history` is the node's `account_history` reply ({"account", "history": [...]})
+    or its list of entries; concatenate the pages yourself - a funded set is only
+    as complete as the history it was read from. `before` (unix seconds) drops
+    sends timed at or after it; a send with no time is kept, so a gap in the
+    node's data can produce a mismatch, never hide one. `exclude_blocks` drops
+    named send hashes - the settling payment is itself a send to the receiver
+    and must not count as having funded it.
+    """
+    if isinstance(history, dict):
+        named = history.get("account")
+        if named and not acct.same_account(named, payer):
+            raise TermsError("history_not_the_payers", f"history is for {named}, payer is {payer}")
+        entries = history.get("history") or []
+    else:
+        entries = history
+    if not isinstance(entries, (list, tuple)):
+        raise TermsError("history_malformed", f"expected a list of entries, got {type(entries).__name__}")
+    skip = {str(h).upper() for h in exclude_blocks if h}
+    funded = set()
+    for e in entries:
+        if not isinstance(e, dict):
+            raise TermsError("history_malformed", f"entry is {type(e).__name__}")
+        if not (e.get("type") == "send" or e.get("subtype") == "send"):
+            continue
+        if str(e.get("hash", "")).upper() in skip:
+            continue
+        ts = raw_amount(e.get("local_timestamp")) if e.get("local_timestamp") is not None else None
+        if before is not None and ts and ts >= before:
+            continue
+        # non-raw history names the destination in `account`; a raw state block in `link_as_account`
+        dest = e.get("link_as_account") if e.get("type") == "state" else e.get("account")
+        try:
+            funded.add(acct.normalise(dest))
+        except (acct.InvalidAccount, TypeError, AttributeError) as err:
+            raise TermsError("history_malformed", f"send {e.get('hash')!r}: {err}") from err
+    return frozenset(funded)
+
+
+def counterparty_role_check(declared, payer, receiver, funded):
+    """Hold a declared counterparty role to the payer's funded set.
+
+    The observed class is derived, not asserted: `self` if the receiver is the
+    payer, `operator` if the receiver is in `funded`, else `external`. A
+    declared role that differs is `role_mismatch` - the case that matters being
+    "external" paid to an account the payer funded. No declaration is reported
+    as such (`ok`, `declared_role: None`), never invented.
+    """
+    if acct.same_account(receiver, payer):
+        observed = "self"
+    elif any(acct.same_account(receiver, f) for f in funded):
+        observed = "operator"
+    else:
+        observed = "external"
+    out = {"check": "counterparty_role", "declared_role": declared, "observed_role": observed,
+           "payer": acct.normalise(payer), "receiver": acct.normalise(receiver)}
+    if declared is None:
+        return dict(out, ok=True, reason=None,
+                    detail="no counterparty_role was declared; there is nothing to hold this settlement to")
+    if not isinstance(declared, str) or declared not in COUNTERPARTY_ROLES:
+        return dict(out, ok=False, reason="counterparty_role_unknown", detail=repr(declared))
+    if declared != observed:
+        return dict(out, ok=False, reason="role_mismatch",
+                    detail=f"declared {declared!r} before payment; the payer's funded set says {observed!r}")
+    return dict(out, ok=True, reason=None, detail="declared role matches the funded set supplied")
 
 
 # ---------------------------------------------------------------- binding

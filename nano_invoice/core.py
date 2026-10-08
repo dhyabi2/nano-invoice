@@ -927,6 +927,43 @@ def receipt(invoice, store=None):
     return out
 
 
+def check_counterparty_role(rcpt, funded=None, history=None):
+    """Hold a receipt's declared `counterparty_role` to the payer's funded set.
+
+    The role is read from the receipt's binding (the terms, hashed at issue -
+    before any transfer hash existed), and only if the binding still digests to
+    `binding_sha256`: a role read out of a binding that moved is refused, not
+    believed. The payer is the receipt's `sender` (the send block's account),
+    the receiver its `merchant`.
+
+    Supply the payer's funded set either as `funded` (accounts) or as `history`
+    (an account_history reply for the payer, which this function reads and never
+    fetches); from a history, the settling send itself and anything sent at or
+    after it are left out. A v1 receipt, or terms with no role, report
+    `declared_role: None` and `ok: True` - nothing was declared, so nothing is
+    contradicted.
+    """
+    if (funded is None) == (history is None):
+        raise InvoiceError("pass exactly one of funded= (accounts) or history= (account_history)")
+    payer, receiver = rcpt.get("sender"), rcpt.get("merchant")
+    declared = None
+    if rcpt.get("schema") == RECEIPT_SCHEMA_V2:
+        binding = rcpt.get("binding")
+        if not isinstance(binding, dict) or v2.digest(binding) != rcpt.get("binding_sha256"):
+            return {"check": "counterparty_role", "ok": False, "reason": "binding_digest_mismatch",
+                    "declared_role": None, "observed_role": None, "payer": payer, "receiver": receiver,
+                    "detail": "the binding does not digest to binding_sha256; its role is not read"}
+        terms = binding.get("terms")
+        declared = terms.get("counterparty_role") if isinstance(terms, dict) else None
+    if history is not None:
+        try:
+            funded = v2.funded_accounts(payer, history, before=rcpt.get("sent_at"),
+                                        exclude_blocks=(rcpt.get("send_block"),))
+        except v2.TermsError as e:
+            raise InvoiceError(f"{e.reason}: {e.detail}") from e
+    return v2.counterparty_role_check(declared, payer, receiver, funded)
+
+
 def receipt_schema_of(invoice):
     """Which receipt schema this invoice emits: v2 once it carries bound terms."""
     return RECEIPT_SCHEMA_V2 if getattr(invoice, "binding_sha256", None) else RECEIPT_SCHEMA
