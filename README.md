@@ -62,7 +62,7 @@ pay_raw = amount_raw + tag        (1 XNO = 10**30 raw; all amounts are Python in
 - States: `open -> paid | underpaid | overpaid | expired`. Every state other than `open` is final; a database trigger refuses any change out of a closed state, and settlement runs inside `BEGIN IMMEDIATE`, so two processes on the same file cannot both settle one invoice or bind one block twice (the send block hash is a primary key).
 - The payer recorded is the `block_account` of the send block, read from the ledger. Refund instructions go to that account. A payer that someone *claims* is ignored and reported as ignored.
 - Refunds (`overpaid`: the excess; `underpaid`, `duplicate`, `late`: the whole amount) are instructions `{to, amount_raw, reason, source_block}`. Your wallet sends them, or not.
-- `receipt()` lists the fields and the exact `block_info` calls that reproduce the claim; `verify_receipt()` re-checks the id, the tag arithmetic and every ledger claim using only a public node. An unreachable node is reported as not verified, never as verified.
+- `receipt()` lists the fields and the exact `block_info` calls that reproduce the claim; `verify_receipt()` re-checks the id, the tag arithmetic, the invoice's own window and every ledger claim using only a public node. The window half matters as much as the tag: the tag says which order an *amount* is for, the window says which order a *moment* is for, so a receipt naming a block the node timestamps outside `created_at..expires_at` (the same ±`CLOCK_SKEW_S` `check_invoice` allows) does not verify. An unreachable node is reported as not verified, never as verified.
 
 ## Receipt v2 — what the payment was *for*
 

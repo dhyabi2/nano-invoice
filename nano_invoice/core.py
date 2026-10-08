@@ -861,6 +861,8 @@ def receipt(invoice, store=None):
         "block_info(send_block).contents.link_as_account == merchant",
         "block_info(send_block).amount == received_raw",
         "block_info(send_block).confirmed == 'true'",
+        "block_info(send_block).local_timestamp is inside created_at..expires_at"
+        f" (+-{CLOCK_SKEW_S}s)",
     ]
     if inv.receive_block:
         reproduce.append({"action": "block_info", "json_block": "true", "hash": inv.receive_block})
@@ -1014,8 +1016,32 @@ def verify_receipt(rcpt, rpc=None, witness_at=None):
     check("received_ends_in_tag", received % TAG_MODULUS == tag)
     expected_state = "paid" if received == pay else "overpaid" if received > pay else "underpaid"
     check("state_matches_amount", rcpt.get("state") == expected_state, f"expected {expected_state}")
-    created_at = int(rcpt.get("created_at") or 0)
-    receipt_sent_at = int(rcpt.get("sent_at") or 0)
+    # These were read with a bare `int()`, which is the same defect the guard at
+    # the top of this function exists to prevent, 60 lines further down: a
+    # receipt carrying `"created_at": [1]` or `"sent_at": {}` raised TypeError
+    # (and `"created_at": "soon"` raised ValueError) OUT of verify_receipt,
+    # rather than refusing. A receipt is written by the party being checked, so
+    # a time field this function cannot read is a refusal and is named as one.
+    def _time(name):
+        value = rcpt.get(name)
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    created_at = _time("created_at")
+    receipt_sent_at = _time("sent_at")
+    expires_at = _time("expires_at")
+    for _name, _value in (("created_at", created_at), ("expires_at", expires_at)):
+        if _value is None:
+            check(f"{_name}_readable", False,
+                  f"{_name}={rcpt.get(_name)!r} is not a whole number of seconds;"
+                  " a receipt states the window its settling block must fall inside")
+    if rcpt.get("sent_at") is not None and receipt_sent_at is None:
+        check("sent_at_readable", False,
+              f"sent_at={rcpt.get('sent_at')!r} is not a whole number of seconds")
     # Reticuli's repair, sharpened: the before-payment ordering must be checked
     # against the world (the settling block's node-reported time), not against
     # the merchant-written document. We fetch the send block from the ledger
@@ -1038,6 +1064,43 @@ def verify_receipt(rcpt, rpc=None, witness_at=None):
               f"receipt says send {receipt_sent_at}, ledger block says {node_send_time}")
     send_time = node_send_time or receipt_sent_at
     send_time_source = "ledger local_timestamp" if node_send_time else "receipt (no node time reported)"
+    # The window is the other half of the binding, and it was published and
+    # never read. `check_invoice` settles an invoice only from a block sent
+    # after it was created (allowing CLOCK_SKEW_S) and not after it expired -
+    # it ignores an earlier block as "sent before the invoice existed" and
+    # records a later one as `late`, which refunds rather than settles. The
+    # receipt carries `created_at` and `expires_at` for exactly that reason,
+    # and verify_receipt used neither, so the stranger-verifiable path accepted
+    # two settlements the issuer's own code refuses:
+    #
+    #   - a send 5000 s BEFORE the invoice was created verified ok, because the
+    #     only failing check was `witness_before_send`, which is excluded from
+    #     `ok` whenever no witness is supplied - and `nano-invoice verify`
+    #     supplies none (cli.py: `core.verify_receipt(doc, rpc=rpc)`), so it
+    #     exited 0;
+    #   - a send 96399 s AFTER it expired verified ok even WITH a witness,
+    #     since a witness between creation and the late block satisfies both
+    #     witness checks.
+    #
+    # That is the tag's own argument: the tag says which order an amount is
+    # for, the window says which order a *moment* is for, and an old unrelated
+    # payment to the merchant whose amount ends in this tag settles nothing.
+    # Checked against the node's local_timestamp where there is one, so the
+    # ledger answers rather than the document; +-CLOCK_SKEW_S on each end, the
+    # same tolerance check_invoice allows, so no receipt this tool can issue is
+    # refused by it.
+    if not send_time:
+        check("send_inside_invoice_window", False,
+              "no send time a stranger can check: the block reports no local_timestamp"
+              " and the receipt states none")
+    elif created_at is None or expires_at is None:
+        check("send_inside_invoice_window", False,
+              "the receipt states no window for its settling block")
+    else:
+        check("send_inside_invoice_window",
+              created_at - CLOCK_SKEW_S <= send_time <= expires_at + CLOCK_SKEW_S,
+              f"send {send_time} (from {send_time_source}) against the invoice's"
+              f" {created_at}..{expires_at} +-{CLOCK_SKEW_S}s")
     # The before-payment ordering (Reticuli's repair): the binding must be
     # witnessed after it exists and before the block that settled it. When a
     # witness is supplied it is a hard check; when omitted the gap is reported
@@ -1048,7 +1111,7 @@ def verify_receipt(rcpt, rpc=None, witness_at=None):
                        "detail": "no witness time supplied: 'published before payment' is the payee's word, not a check"})
     else:
         witness_at = int(witness_at)
-        check("witness_after_creation", witness_at >= created_at,
+        check("witness_after_creation", created_at is not None and witness_at >= created_at,
               f"witness {witness_at} vs creation {created_at}")
         if send_time:
             check("witness_before_send", witness_at < send_time,

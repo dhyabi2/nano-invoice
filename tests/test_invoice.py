@@ -566,6 +566,128 @@ class TestUpgradeAnOlderDatabase(Base):
             store.close()
 
 
+class TestTheInvoiceWindow(Base):
+    """`check_invoice` settles an invoice only from a block sent after it was
+    created (allowing CLOCK_SKEW_S) and not after it expired. The receipt
+    publishes `created_at` and `expires_at` so a stranger can re-check that,
+    and `verify_receipt` read neither - so the stranger-verifiable path accepted
+    two settlements the issuer's own code refuses. The tag says which order an
+    *amount* is for; the window says which order a *moment* is for.
+    """
+
+    def forged(self, send_ts, created_at=T0, expires_s=3600, tag=424242, amount=5 * XNO):
+        """A hand-written receipt naming a real confirmed send of the exact
+        tagged amount to the merchant - and nothing else wrong with it."""
+        pay = amount + tag
+        send, receive = self.ledger.send(BUYER, MERCHANT, pay, send_ts)
+        okh = ni.order_key_hash("order-1001")
+        return {
+            "schema": core.RECEIPT_SCHEMA,
+            "invoice_id": ni.invoice_id_for(MERCHANT, okh),
+            "order_key_sha256": okh,
+            "merchant": MERCHANT, "sender": BUYER,
+            "amount_raw": str(amount), "tag": tag, "pay_raw": str(pay),
+            "received_raw": str(pay), "state": "paid",
+            "send_block": send, "receive_block": receive,
+            "created_at": created_at, "expires_at": created_at + expires_s,
+            "sent_at": send_ts,
+        }
+
+    def test_a_send_that_predates_the_invoice_does_not_verify(self):
+        """It used to verify `ok: True`: the only failing check was
+        `witness_before_send`, which is excluded from `ok` when no witness is
+        supplied - and `nano-invoice verify` supplies none, so it exited 0."""
+        r = self.forged(send_ts=T0 - 5000)
+        res = ni.verify_receipt(json.loads(json.dumps(r)), rpc=self.ledger)
+        self.assertFalse(res["ok"], "a send 5000s before the invoice existed must not verify")
+        self.assertIn("send_inside_invoice_window",
+                      [c["check"] for c in res["checks"] if not c["ok"]])
+
+    def test_a_send_after_the_invoice_expired_does_not_verify(self):
+        """This one verified `ok: True` even WITH a witness: a witness between
+        creation and the late block satisfies both witness checks."""
+        r = self.forged(send_ts=T0 + 99999)
+        for witness in (None, T0 + 5):
+            res = ni.verify_receipt(json.loads(json.dumps(r)), rpc=self.ledger, witness_at=witness)
+            self.assertFalse(res["ok"], f"a send after expiry must not verify (witness={witness})")
+            self.assertIn("send_inside_invoice_window",
+                          [c["check"] for c in res["checks"] if not c["ok"]])
+
+    def test_the_window_is_read_from_the_ledger_not_from_the_receipt(self):
+        """A receipt that lies about `sent_at` to put a late block inside the
+        window is judged on the node's own local_timestamp."""
+        r = self.forged(send_ts=T0 + 99999)
+        r["sent_at"] = T0 + 10  # inside the window, if anyone believed it
+        res = ni.verify_receipt(json.loads(json.dumps(r)), rpc=self.ledger)
+        failed = [c["check"] for c in res["checks"] if not c["ok"]]
+        self.assertFalse(res["ok"])
+        self.assertIn("send_inside_invoice_window", failed)
+        detail = next(c["detail"] for c in res["checks"]
+                      if c["check"] == "send_inside_invoice_window")
+        self.assertIn("ledger local_timestamp", detail)
+
+    def test_an_unreadable_time_field_refuses_rather_than_raising(self):
+        """`created_at` and `sent_at` were read with a bare `int()` 60 lines
+        below the guard that exists to catch exactly this, so a receipt
+        carrying a list or a word there raised TypeError/ValueError out of
+        verify_receipt instead of refusing."""
+        good = self.forged(send_ts=T0 + 10)
+        for field, bad, expect in (("created_at", [1], "created_at_readable"),
+                                   ("created_at", "soon", "created_at_readable"),
+                                   ("expires_at", [2], "expires_at_readable"),
+                                   ("sent_at", {"a": 1}, "sent_at_readable")):
+            with self.subTest(field=field, value=bad):
+                r = dict(good)
+                r[field] = bad
+                try:
+                    res = ni.verify_receipt(r, rpc=self.ledger)
+                except Exception as e:
+                    self.fail(f"{field}={bad!r}: verify_receipt raised "
+                              f"{type(e).__name__}: {e} instead of refusing")
+                self.assertFalse(res["ok"])
+                self.assertIn(expect, [c["check"] for c in res["checks"] if not c["ok"]])
+
+    # ---- controls: the window must not cost an honest receipt ----
+
+    def test_a_receipt_this_tool_issued_still_verifies(self):
+        inv = self.invoice()
+        self.ledger.send(BUYER, MERCHANT, inv.pay_raw, T0 + 10)
+        self.check(inv)
+        r = json.loads(json.dumps(ni.receipt(inv, store=self.store)))
+        res = ni.verify_receipt(r, rpc=self.ledger)
+        self.assertTrue(res["ok"], [c for c in res["checks"] if not c["ok"]])
+
+    def test_the_window_allows_the_same_skew_check_invoice_allows(self):
+        """check_invoice accepts a block up to CLOCK_SKEW_S before the invoice
+        was created, so verify_receipt must not refuse one."""
+        inv = self.invoice()
+        self.ledger.send(BUYER, MERCHANT, inv.pay_raw, T0 - ni.CLOCK_SKEW_S + 1)
+        out = self.check(inv)
+        self.assertEqual(out["invoice"]["state"], "paid", out["observations"])
+        r = json.loads(json.dumps(ni.receipt(inv, store=self.store)))
+        res = ni.verify_receipt(r, rpc=self.ledger)
+        self.assertTrue(res["ok"], [c for c in res["checks"] if not c["ok"]])
+
+    def test_a_block_at_the_last_second_of_the_window_verifies(self):
+        inv = self.invoice(expires_s=3600)
+        self.ledger.send(BUYER, MERCHANT, inv.pay_raw, T0 + 3600)
+        out = self.check(inv, now=T0 + 3601)
+        self.assertEqual(out["invoice"]["state"], "paid", out["observations"])
+        r = json.loads(json.dumps(ni.receipt(inv, store=self.store)))
+        self.assertTrue(ni.verify_receipt(r, rpc=self.ledger)["ok"])
+
+    def test_a_v2_receipt_still_verifies_end_to_end(self):
+        terms = {"policy_version": 1, "not_before": T0 - 10, "not_after": T0 + 7200,
+                 "max_raw_per_payment": str(XNO), "allowed_payees": [MERCHANT]}
+        inv = self.invoice(terms=terms, intent_hash="a" * 64, idempotency_key="order-1")
+        self.ledger.send(BUYER, MERCHANT, inv.pay_raw, T0 + 10)
+        self.check(inv)
+        r = json.loads(json.dumps(ni.receipt(inv, store=self.store)))
+        self.assertEqual(r["schema"], core.RECEIPT_SCHEMA_V2)
+        res = ni.verify_receipt(r, rpc=self.ledger)
+        self.assertTrue(res["ok"], [c for c in res["checks"] if not c["ok"]])
+
+
 class TestWitness(Base):
     """Reticuli's ordering rule (a block settles 'something', not 'this order'):
     a binding is 'published before payment' only if a witness the issuer does
