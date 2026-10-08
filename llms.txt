@@ -9,7 +9,7 @@ Nano blocks carry no memo. nano-invoice gives each order a unique exact amount: 
 - check_invoice(invoice, store=..., rpc="https://rpc.nano.to", own_accounts=[...], not_income={account: reason}) -> {invoice, observations, refunds}
 - States: open -> paid | underpaid | overpaid | expired (all final). Faucet/own-account blocks are reported as not_income and never pay.
 - refund_instruction(...) / refund_hints(store, id) -> {to (chain sender), amount_raw, reason, source_block}; instructions only.
-- receipt(invoice, store) -> JSON with the block_info calls that reproduce it; verify_receipt(receipt, rpc) re-checks from the public ledger alone.
+- receipt(invoice, store) -> JSON with the block_info calls that reproduce it; verify_receipt(receipt, rpc) re-checks from the public ledger alone: the id, the tag arithmetic, the ledger claims, and that the settling block's local_timestamp falls inside the invoice's created_at..expires_at window (+-CLOCK_SKEW_S).
 - CLI: nano-invoice create|check|receipt|verify|verify-log|verdict|tombstone|refund-hint|show (JSON output).
 
 ## Receipt v2 - what the payment was FOR (schema nano-invoice/receipt/v2)
