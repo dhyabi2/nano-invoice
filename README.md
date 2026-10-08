@@ -155,6 +155,24 @@ unconfirmed block settled. Only the payment is missing from a run here.
 - A receipt proves that a confirmed send of exactly `pay_raw` went from `sender` to `merchant`. That this amount meant *this order* rests on the issuer's tag allocation; anyone holding the order key can re-derive the invoice id, but not the issuer's store.
 - Underpaid closes the invoice: issue a new invoice (new order key) and refund the short payment.
 
+## Agent skill bundle
+
+`skills/nano-invoice/` is this tool packaged as an agent skill (OpenClaw `SKILL.md` format), and
+it runs from a plain checkout with nothing installed:
+
+```bash
+python3 skills/nano-invoice/invoice_cli.py --help
+```
+
+It carries no copy of the money arithmetic - `invoice_cli.py` resolves the repository root and
+calls the one implementation in `nano_invoice/`, so a fix lands in exactly one place. The bundle
+lives here rather than in a skills catalogue because
+[openclaw/agent-skills#308](https://github.com/openclaw/agent-skills/pull/308) was closed on
+2026-10-07 on the ground that a skill which installs and wraps an external project belongs with
+that project's own distribution. `tests/test_skill_bundle.py` runs the bundle the way its
+SKILL.md says to run it - a subprocess, a foreign working directory, and no `PYTHONPATH` - so
+"runs from a checkout" stays an assertion rather than a sentence.
+
 ## Tests
 
 ```bash
