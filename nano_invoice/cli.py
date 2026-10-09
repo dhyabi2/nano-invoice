@@ -1,8 +1,10 @@
-"""nano-invoice create|check|receipt|verify|verify-log|verdict|tombstone|role-check|ack-verify|refund-hint|show.
+"""nano-invoice create|check|receipt|verify|verify-log|verdict|tombstone|role-check|ack-verify|rep-check|refund-hint|show.
 
 JSON on stdout. Exit 0 on a sound answer, 1 on a receipt or log that does not
 verify, 2 on a usage or document error, 3 on an RPC failure - and, for
-`ack-verify` (offline, no RPC), 3 on a payer acknowledgment that does not verify."""
+`ack-verify` (offline, no RPC), 3 on a payer acknowledgment that does not verify.
+`rep-check` exits 0 only when the representative matches and the block is
+confirmed (before --delivered-at, when given), 1 otherwise."""
 import argparse
 import json
 import os
@@ -12,6 +14,7 @@ import time
 from . import account as acct
 from . import core
 from . import nano_sig
+from . import rep_binding
 from .rpc import DEFAULT_RPC, Rpc
 
 
@@ -90,6 +93,15 @@ def build_parser():
     av.add_argument("block_hash", help="the settling send block's hash, 64 hex")
     av.add_argument("signature", help="128 hex: Ed25519 with BLAKE2b-512, Nano's block scheme")
 
+    rc = sub.add_parser("rep-check", help="hold a block's representative to "
+                                          "nano_address(sha256(scope)), read-only")
+    rc.add_argument("--block", required=True, help="hash of a block of the dedicated invoice account")
+    sc = rc.add_mutually_exclusive_group(required=True)
+    sc.add_argument("--scope-file", help="file whose exact bytes are the scope")
+    sc.add_argument("--scope", help="scope as a string (hashed as UTF-8)")
+    rc.add_argument("--delivered-at", help="unix seconds or ISO 8601; the block must be confirmed "
+                                           "and seen by the node before it")
+
     tb = sub.add_parser("tombstone", help="retire or supersede a receipt without rewriting it")
     tb.add_argument("--invoice", required=True)
     tb.add_argument("--reason", required=True)
@@ -157,6 +169,16 @@ def main(argv=None):
                   "proves": "the payer account's key acknowledged this artifact hash for this payment"
                   if ok else "nothing: the signature does not verify for these three values"})
             return 0 if ok else 3
+        if args.cmd == "rep-check":
+            if args.scope_file:
+                with open(args.scope_file, "rb") as fh:
+                    scope = fh.read()
+            else:
+                scope = args.scope
+            result = rep_binding.check_rep_binding(args.block, scope,
+                                                   delivered_at=args.delivered_at, rpc=rpc)
+            _out(result)
+            return 0 if result["ok"] else 1
         if args.cmd in ("verify", "verify-log"):
             src = sys.stdin if args.receipt == "-" else open(args.receipt)
             with src:

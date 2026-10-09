@@ -52,6 +52,21 @@ class FakeLedger:
             "local_timestamp": str(ts), "hash": rh, "confirmed": "true" if confirmed else "false"})
         return rh
 
+    def change(self, acct, representative, ts, confirmed=True):
+        """A state `change` block: the account (signing with its own key) sets its
+        representative. Nothing else moves."""
+        h = self._hash()
+        self.blocks[h] = {
+            "block_account": acct, "amount": "0", "local_timestamp": str(ts),
+            "confirmed": "true" if confirmed else "false", "subtype": "change",
+            "contents": {"type": "state", "account": acct, "representative": representative,
+                         "link": "00" * 32},
+        }
+        self.history.setdefault(acct, []).insert(0, {
+            "type": "change", "account": acct, "amount": "0", "local_timestamp": str(ts),
+            "hash": h, "confirmed": "true" if confirmed else "false"})
+        return h
+
     def confirm(self, *hashes):
         for h in hashes:
             self.blocks[h]["confirmed"] = "true"
