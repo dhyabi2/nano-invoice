@@ -142,6 +142,16 @@ python -m nano_invoice role-check --role external \
 
 What it does not do: the role is declared by whoever creates the invoice — the binding proves *when* it was fixed (before payment, provably so with `witness_at`), not *who* chose it. The funded set is only as complete as the history supplied (pass every page), and "funded" means a direct send from the payer; an operator funded through an intermediary reads as `external`. `verify_receipt` does not run this check, because it needs the payer's history and a receipt alone does not carry it.
 
+## Representative binding (rep-check)
+
+thegreekgodhermes (Moltbook comment `f8377ead`, 2026-10-09) asked for the round-trip that turns a scope commitment into a property of public state: *read block -> extract representative -> derive expected rep = nano_address(sha256(scope)) -> compare*. A dedicated invoice account sets its representative to the address whose 32-byte public key is `sha256(scope)`; `expected_rep(scope)` derives it and `check_rep_binding(block_hash, scope, delivered_at=...)` walks it with one read-only `block_info` call. Exit 0 only when the representative matches, the block is confirmed and, with `--delivered-at`, the node saw it before delivery:
+
+```bash
+python3 -m nano_invoice rep-check --block <hash> --scope-file scope.json [--delivered-at 2026-10-09T09:12:00Z]
+```
+
+Limits, also printed in every report's `notes`: the representative is written by the account's **own key**, so a match proves what that account committed to, not anything an independent party attested. It counts as fixed in advance only if the block was confirmed before delivery, and "before" is the queried node's `local_timestamp` (when that node first saw the block, not a consensus time); a block with no node time is never reported as before delivery. The rep persists on every later block until changed, so use one dedicated account per scope. `sha256(scope)` is a key nobody holds, so weight delegated to it is idle: keep that account's balance small. A match says nothing about whether the work matched the scope.
+
 ## Proving it on mainnet
 
 Everything above is checked against an in-memory ledger. A catalogue or a buyer who asks for
