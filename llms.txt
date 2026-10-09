@@ -10,7 +10,7 @@ Nano blocks carry no memo. nano-invoice gives each order a unique exact amount: 
 - States: open -> paid | underpaid | overpaid | expired (all final). Faucet/own-account blocks are reported as not_income and never pay.
 - refund_instruction(...) / refund_hints(store, id) -> {to (chain sender), amount_raw, reason, source_block}; instructions only.
 - receipt(invoice, store) -> JSON with the block_info calls that reproduce it; verify_receipt(receipt, rpc) re-checks from the public ledger alone: the id, the tag arithmetic, the ledger claims, and that the settling block's local_timestamp falls inside the invoice's created_at..expires_at window (+-CLOCK_SKEW_S).
-- CLI: nano-invoice create|check|receipt|verify|verify-log|verdict|tombstone|refund-hint|show (JSON output).
+- CLI: nano-invoice create|check|receipt|verify|verify-log|verdict|tombstone|ack-verify|ack-read|refund-hint|show (JSON output).
 
 ## Receipt v2 - what the payment was FOR (schema nano-invoice/receipt/v2)
 - create_invoice(..., terms={policy_version, not_before, not_after, max_raw_per_payment, allowed_payees?, revocation?, note?}, intent_hash=<sha256 of the quote>, idempotency_key=<str>) -> a bound invoice. Without terms= nothing changes and the receipt is v1.
@@ -22,6 +22,8 @@ Nano blocks carry no memo. nano-invoice gives each order a unique exact amount: 
 - verify_log(records) -> {ok, break_at, reason, length, checks}: each record carries the sha256 of the previous one, so a removed, reordered or edited record is reported at its index. SQLite triggers refuse UPDATE and DELETE on the log.
 - Idempotency: one set of terms per key, ever. Same key + same terms -> the same invoice; same key + anything bound differently -> IdempotencyConflict, compared by the binding digest.
 - Offline: the terms are embedded, so a verifier with no network answers "was this authorised when issued" (window, cap, payee list). revocation is a pointer that is REPORTED and never fetched, so "revoked since" stays an open question.
+- Payer ack v2 (the payer can revise its verdict): sign_delivery_ack_v2(private_key, output_commitment, send_block, "delivered"|"failed"|"indeterminate", signed_at:int, reason=None) signs 134 bytes: b"nano-invoice/delivery-ack/v2\n" + output_commitment(32) + send_block(32) + verdict byte (01/02/03) + signed_at (u64 big-endian UTC unix seconds) + sha256(reason) or 32 zero bytes. v1 (93 bytes, no verdict, no time) verifies unchanged.
+- read_payer_acks(payer, output_commitment, send_block, acks) -> {ok, verdict, current, superseded, ignored}: acks not signed by the payer or for another payment are ignored; greatest signed_at wins (a later "failed" supersedes the payer's earlier "delivered"); ties: failed > indeterminate > delivered, then reason hash, then signature; v1 sorts first. CLI: nano-invoice ack-read PAYER OUTPUT BLOCK acks.json. signed_at is the payer's claim, not proof of time.
 - accept_token is a dispute handle only. No decision in the package reads it; the suite pins that every verification decision is identical with it present, absent or garbage.
 - A v1 receipt verifies unchanged, and a database written by 0.1.0 upgrades with additive nullable columns.
 - What it still does not prove (creditclaw, 2026-10-04): invoice purpose, payer identity, or whether the buyer's delivery mark was honest rather than collusive. A verdict is one named party's assertion, which makes it disputable, not adjudicated.

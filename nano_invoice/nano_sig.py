@@ -24,12 +24,50 @@ thegreekgodhermes, Moltbook comment 980f299d): the payer signs
 payment. The domain tag means the signature can never be replayed as a Nano
 block signature (a block hash is 32 bytes; this message is 93) nor as an ack
 under a later version of this format.
+
+v2 - a verdict the payer can revise (antonzoomagent, Moltbook comment 8b77efdf:
+"a recipient who signs receipt on delivery but discovers the resource was
+unusable an hour later"). v1 signs no verdict and no time, so a payer has
+nothing to sign that says "failed" and nothing orders it after "delivered".
+The payer signs
+
+    ack_message_v2(output_commitment, payment_block_hash, verdict, signed_at, reason)
+      = b"nano-invoice/delivery-ack/v2\\n"   (29 ASCII bytes, fixed)
+        || bytes.fromhex(output_commitment)  (32 bytes)
+        || bytes.fromhex(payment_block_hash) (32 bytes)
+        || verdict code                      (1 byte: 0x01 delivered, 0x02 failed,
+                                              0x03 indeterminate)
+        || signed_at                         (8 bytes: unsigned big-endian integer,
+                                              UTC unix seconds, 0 <= signed_at < 2**64)
+        || reason_sha256                     (32 bytes: sha256 of the reason as UTF-8,
+                                              or 32 zero bytes when there is no reason
+                                              or it is "")
+
+134 bytes in all. v1 bytes and v1 verification are unchanged. signed_at is
+the payer's own claim about when it signed; it orders the payer's statements
+against each other and proves nothing about wall-clock time.
+
+`read_payer_acks` reads a sequence of v1/v2 acks for one (output_commitment,
+send_block) and one payer, and names the current verdict:
+  - an ack that does not verify under the payer's key, or is for another
+    artifact or payment, is IGNORED (listed with a reason, never counted);
+  - among the rest the greatest (signed_at, rank, reason_sha256, signature)
+    is current, where rank is failed 2 > indeterminate 1 > delivered 0. So the
+    later statement wins; on equal signed_at the more cautious verdict wins,
+    then the larger reason hash, then the larger signature hex (uppercase) -
+    the answer never depends on input order;
+  - a v1 ack reads as "delivered" with no signed_at and sorts before every v2
+    ack, so any v2 ack from the same payer supersedes it.
 """
 import hashlib
+import struct
 
 from . import account as acct
 
 ACK_DOMAIN = b"nano-invoice/delivery-ack/v1\n"
+ACK_DOMAIN_V2 = b"nano-invoice/delivery-ack/v2\n"
+ACK_VERDICT_CODES = {"delivered": 1, "failed": 2, "indeterminate": 3}
+_ACK_RANK = {"delivered": 0, "indeterminate": 1, "failed": 2}
 
 # ------------------------------------------------------- RFC 8032 arithmetic
 
@@ -205,3 +243,111 @@ def verify_delivery_ack(payer_address, output_commitment, payment_block_hash, si
     except (ValueError, TypeError):
         return False
     return verify(public, message, sig)
+
+
+# ------------------------------------------- delivery acknowledgment, v2
+
+def _reason_sha256(reason):
+    if reason is None or reason == "":
+        return bytes(32)
+    if not isinstance(reason, str):
+        raise ValueError("reason must be a string")
+    return hashlib.sha256(reason.encode("utf-8")).digest()
+
+
+def ack_message_v2(output_commitment_hex, payment_block_hash_hex, verdict, signed_at, reason=None):
+    """The exact 134 bytes a payer signs for a v2 ack (layout in the module docstring)."""
+    if verdict not in ACK_VERDICT_CODES:
+        raise ValueError(f"verdict must be one of {', '.join(ACK_VERDICT_CODES)}")
+    if type(signed_at) is not int or not 0 <= signed_at < 2 ** 64:
+        raise ValueError("signed_at must be an int of UTC unix seconds, 0 <= signed_at < 2**64")
+    return (ACK_DOMAIN_V2 + _hex32(output_commitment_hex, "output_commitment")
+            + _hex32(payment_block_hash_hex, "payment_block_hash")
+            + bytes([ACK_VERDICT_CODES[verdict]]) + struct.pack(">Q", signed_at)
+            + _reason_sha256(reason))
+
+
+def sign_delivery_ack_v2(private_key, output_commitment, payment_block_hash, verdict, signed_at,
+                         reason=None):
+    """64-byte signature as 128 uppercase hex characters."""
+    return sign(bytes(private_key), ack_message_v2(output_commitment, payment_block_hash, verdict,
+                                                   signed_at, reason)).hex().upper()
+
+
+def verify_delivery_ack_v2(payer_address, output_commitment, payment_block_hash, verdict, signed_at,
+                           signature, reason=None):
+    """Offline: did the payer's key sign this verdict, at this signed_at, for this artifact and
+    payment (and this reason, when one is given)? False, never raises, on malformed input."""
+    try:
+        public = acct.public_key(payer_address)
+        message = ack_message_v2(output_commitment, payment_block_hash, verdict, signed_at, reason)
+        if not isinstance(signature, str) or len(signature) != 128:
+            return False
+        sig = bytes.fromhex(signature)
+    except (ValueError, TypeError):
+        return False
+    return verify(public, message, sig)
+
+
+def read_payer_acks(payer_address, output_commitment, payment_block_hash, acks):
+    """Name the payer's current verdict from a sequence of acks (rule in the module docstring).
+
+    Each ack is a dict: {"version": 2, "verdict", "signed_at", "signature", "reason"?,
+    "output_commitment"?, "send_block"?} or {"version": 1, "signature"}. When an ack names
+    output_commitment / send_block they must match the ones asked about. Returns
+    {ok, verdict, current, superseded, ignored, rule}; ok is False when no ack verifies.
+    """
+    try:
+        want = (_hex32(output_commitment, "output_commitment"),
+                _hex32(payment_block_hash, "payment_block_hash"))
+    except ValueError:
+        want = None
+    valid, ignored = [], []
+    for i, a in enumerate(acks or ()):
+        if not isinstance(a, dict) or want is None:
+            ignored.append({"index": i, "reason": "malformed"})
+            continue
+        try:
+            named = (_hex32(a.get("output_commitment", output_commitment), "output_commitment"),
+                     _hex32(a.get("send_block", payment_block_hash), "send_block"))
+        except ValueError:
+            ignored.append({"index": i, "reason": "malformed"})
+            continue
+        if named != want:
+            ignored.append({"index": i, "reason": "other_payment_or_artifact"})
+            continue
+        sig = a.get("signature")
+        if a.get("version") == 1:
+            if not verify_delivery_ack(payer_address, output_commitment, payment_block_hash, sig):
+                ignored.append({"index": i, "reason": "not_signed_by_payer"})
+                continue
+            entry = {"index": i, "version": 1, "verdict": "delivered", "signed_at": None,
+                     "signature": sig.upper()}
+            valid.append(((-1, 0, b"", sig.upper()), entry))
+            continue
+        verdict, at, reason = a.get("verdict"), a.get("signed_at"), a.get("reason")
+        try:
+            ack_message_v2(output_commitment, payment_block_hash, verdict, at, reason)
+        except ValueError:
+            ignored.append({"index": i, "reason": "malformed"})
+            continue
+        if a.get("version") != 2:
+            ignored.append({"index": i, "reason": "malformed"})
+            continue
+        if not verify_delivery_ack_v2(payer_address, output_commitment, payment_block_hash,
+                                      verdict, at, sig, reason):
+            ignored.append({"index": i, "reason": "not_signed_by_payer"})
+            continue
+        entry = {"index": i, "version": 2, "verdict": verdict, "signed_at": at,
+                 "signature": sig.upper()}
+        if reason:
+            entry["reason"] = reason
+        valid.append(((at, _ACK_RANK[verdict], _reason_sha256(reason), sig.upper()), entry))
+    valid.sort(key=lambda kv: kv[0])
+    current = valid[-1][1] if valid else None
+    return {"ok": current is not None, "verdict": current["verdict"] if current else None,
+            "payer": payer_address, "current": current,
+            "superseded": [e for _, e in valid[:-1]], "ignored": ignored,
+            "rule": "greatest (signed_at, failed>indeterminate>delivered, reason_sha256, signature) "
+                    "among acks that verify under the payer's key wins; v1 sorts first; "
+                    "acks not signed by the payer are ignored"}
