@@ -66,6 +66,9 @@ def build_parser():
     fs = rl.add_mutually_exclusive_group(required=True)
     fs.add_argument("--funded", action="append", help="an account the payer has funded (repeatable)")
     fs.add_argument("--history-file", help="the payer's account_history reply as JSON")
+    rl.add_argument("--sent-at-corroborated", action="store_true",
+                    help="the receipt's sent_at has been held to the ledger (verify), so a send "
+                         "the cut-off withholds really did come after the payment")
 
     vd = sub.add_parser("verdict", help="append a delivery verdict after settlement")
     vd.add_argument("--invoice", required=True)
@@ -123,7 +126,9 @@ def main(argv=None):
                 rsrc = sys.stdin if args.receipt == "-" else open(args.receipt)
                 with rsrc:
                     doc = json.load(rsrc)
-                result = core.check_counterparty_role(doc, funded=args.funded, history=history)
+                result = core.check_counterparty_role(
+                    doc, funded=args.funded, history=history,
+                    sent_at_corroborated=args.sent_at_corroborated)
             else:
                 if not (args.payer and args.receiver):
                     raise core.InvoiceError("--role needs --payer and --receiver")

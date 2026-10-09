@@ -106,9 +106,12 @@ class Check(rv2.Base):
         self.assertTrue(ni.check_counterparty_role(rcpt, history=h)["ok"])
 
     def test_funding_after_the_payment_is_not_counted(self):
+        # ...once the cut-off that says "after" is held to the ledger rather than
+        # to the receipt. See TheCutoffIsTheReceiptsOwnWord for why it has to be.
         rcpt = self.paid_receipt(terms=rv2.terms(counterparty_role="external"))
         self.ledger.send(BUYER, MERCHANT, XNO // 10, T0 + 5000)
-        self.assertTrue(ni.check_counterparty_role(rcpt, history=history(self.ledger, BUYER))["ok"])
+        self.assertTrue(ni.check_counterparty_role(rcpt, history=history(self.ledger, BUYER),
+                                                   sent_at_corroborated=True)["ok"])
 
     def test_operator_holds_only_when_the_receiver_is_funded(self):
         rcpt = self.paid_receipt(terms=rv2.terms(counterparty_role="operator"))
@@ -186,3 +189,91 @@ class RoleCli(rv2.Base):
     def test_a_role_without_terms_is_refused(self):
         rc, out = self.create("cli-role-noterms", "--counterparty-role", "external")
         self.assertEqual(rc, 2)
+
+
+class TheCutoffIsTheReceiptsOwnWord(rv2.Base):
+    """`check_counterparty_role` takes its `before` cut-off from the receipt's
+    `sent_at`, and the cut-off can only ever make the funded set smaller - so it
+    can only ever turn `operator` into `external`, which is the one direction a
+    self-dealing receipt benefits from. A receiver funded only by a withheld send
+    is refused rather than reported, until the cut-off is held to the ledger."""
+
+    def funding_first_then_an_understated_sent_at(self):
+        # the payer funded the merchant BEFORE paying it: the truthful reading is
+        # `operator`. The receipt then claims to have been sent before that.
+        self.ledger.send(BUYER, MERCHANT, XNO // 10, T0 - 500)
+        rcpt = self.paid_receipt(terms=rv2.terms(counterparty_role="external"))
+        self.assertEqual(ni.check_counterparty_role(
+            rcpt, history=history(self.ledger, BUYER))["observed_role"], "operator")
+        return dict(rcpt, sent_at=T0 - 900), history(self.ledger, BUYER)
+
+    def test_an_understated_sent_at_is_refused_not_read_as_external(self):
+        rcpt, h = self.funding_first_then_an_understated_sent_at()
+        verdict = ni.check_counterparty_role(rcpt, history=h)
+        self.assertFalse(verdict["ok"])
+        self.assertEqual(verdict["reason"], "cutoff_hides_funding")
+        self.assertIsNone(verdict["observed_role"],
+                          "no role may be reported off a cut-off the document chose")
+        self.assertIn(MERCHANT, verdict["withheld_by_cutoff"])
+
+    def test_the_refusal_does_not_depend_on_which_role_was_declared(self):
+        # declared `operator` is in fact the truthful one here; the same cut-off
+        # would have called it a mismatch. Both verdicts are unsound, so neither
+        # is given.
+        self.ledger.send(BUYER, MERCHANT, XNO // 10, T0 - 500)
+        rcpt = self.paid_receipt(terms=rv2.terms(counterparty_role="operator"))
+        verdict = ni.check_counterparty_role(dict(rcpt, sent_at=T0 - 900),
+                                            history=history(self.ledger, BUYER))
+        self.assertEqual(verdict["reason"], "cutoff_hides_funding")
+
+    def test_a_corroborated_cutoff_takes_the_after_payment_reading(self):
+        # This is the legitimate shape: pay a stranger, fund them later. It is
+        # indistinguishable from the case above WITHOUT the ledger, which is why
+        # the caller has to say it checked.
+        rcpt = self.paid_receipt(terms=rv2.terms(counterparty_role="external"))
+        self.ledger.send(BUYER, MERCHANT, XNO // 10, T0 + 5000)
+        h = history(self.ledger, BUYER)
+        self.assertEqual(ni.check_counterparty_role(rcpt, history=h)["reason"],
+                         "cutoff_hides_funding")
+        verdict = ni.check_counterparty_role(rcpt, history=h, sent_at_corroborated=True)
+        self.assertTrue(verdict["ok"], verdict)
+        self.assertEqual(verdict["observed_role"], "external")
+        self.assertIn(MERCHANT, verdict["withheld_by_cutoff"],
+                      "what the cut-off withheld is reported even when it is believed")
+
+    def test_a_withheld_send_to_someone_else_refuses_nothing(self):
+        rcpt = self.paid_receipt(terms=rv2.terms(counterparty_role="external"))
+        self.ledger.send(BUYER, SIBLING, XNO // 10, T0 + 5000)
+        verdict = ni.check_counterparty_role(rcpt, history=history(self.ledger, BUYER))
+        self.assertTrue(verdict["ok"], verdict)
+        self.assertEqual(verdict["observed_role"], "external")
+
+    def test_funded_both_sides_of_the_cutoff_is_not_withheld_at_all(self):
+        self.ledger.send(BUYER, MERCHANT, XNO // 10, T0 - 500)
+        rcpt = self.paid_receipt(terms=rv2.terms(counterparty_role="external"))
+        self.ledger.send(BUYER, MERCHANT, XNO // 10, T0 + 5000)
+        verdict = ni.check_counterparty_role(rcpt, history=history(self.ledger, BUYER))
+        self.assertEqual(verdict["reason"], "role_mismatch")
+        self.assertEqual(verdict["observed_role"], "operator")
+        self.assertEqual(verdict["withheld_by_cutoff"], [])
+
+    def test_a_sent_at_that_spells_no_time_withholds_nothing(self):
+        # `raw_amount({})` is None, so the cut-off is dropped rather than
+        # compared: `ts >= {}` is a TypeError out of a check strangers run on
+        # documents they did not write.
+        self.ledger.send(BUYER, MERCHANT, XNO // 10, T0 - 500)
+        rcpt = self.paid_receipt(terms=rv2.terms(counterparty_role="external"))
+        for bad in ({}, [1], "later", 1.5, True):
+            verdict = ni.check_counterparty_role(dict(rcpt, sent_at=bad),
+                                                 history=history(self.ledger, BUYER))
+            self.assertEqual(verdict["reason"], "role_mismatch", bad)
+
+    def test_funded_accounts_still_returns_a_bare_frozenset(self):
+        self.ledger.send(BUYER, MERCHANT, XNO // 10, T0 - 500)
+        h = history(self.ledger, BUYER)
+        self.assertIsInstance(v2.funded_accounts(BUYER, h), frozenset)
+        self.assertEqual(v2.funded_accounts(BUYER, h),
+                         v2.funded_and_withheld(BUYER, h)[0])
+
+    def test_cutoff_hides_funding_is_a_declared_reason(self):
+        self.assertIn("cutoff_hides_funding", v2.REASONS)

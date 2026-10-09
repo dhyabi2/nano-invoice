@@ -927,7 +927,7 @@ def receipt(invoice, store=None):
     return out
 
 
-def check_counterparty_role(rcpt, funded=None, history=None):
+def check_counterparty_role(rcpt, funded=None, history=None, sent_at_corroborated=False):
     """Hold a receipt's declared `counterparty_role` to the payer's funded set.
 
     The role is read from the receipt's binding (the terms, hashed at issue -
@@ -939,14 +939,18 @@ def check_counterparty_role(rcpt, funded=None, history=None):
     Supply the payer's funded set either as `funded` (accounts) or as `history`
     (an account_history reply for the payer, which this function reads and never
     fetches); from a history, the settling send itself and anything sent at or
-    after it are left out. A v1 receipt, or terms with no role, report
-    `declared_role: None` and `ok: True` - nothing was declared, so nothing is
-    contradicted.
+    after it are left out. That cut-off is the receipt's own `sent_at`, so a
+    receiver funded only by a send the cut-off withholds is refused
+    `cutoff_hides_funding` rather than reported `external` - the receipt would
+    otherwise be choosing its own verdict. Pass `sent_at_corroborated=True` once
+    `verify_receipt` has held that `sent_at` to the ledger. A v1 receipt, or terms
+    with no role, report `declared_role: None` and `ok: True` - nothing was
+    declared, so nothing is contradicted.
     """
     if (funded is None) == (history is None):
         raise InvoiceError("pass exactly one of funded= (accounts) or history= (account_history)")
     payer, receiver = rcpt.get("sender"), rcpt.get("merchant")
-    declared = None
+    declared, withheld = None, ()
     if rcpt.get("schema") == RECEIPT_SCHEMA_V2:
         binding = rcpt.get("binding")
         if not isinstance(binding, dict) or v2.digest(binding) != rcpt.get("binding_sha256"):
@@ -957,11 +961,13 @@ def check_counterparty_role(rcpt, funded=None, history=None):
         declared = terms.get("counterparty_role") if isinstance(terms, dict) else None
     if history is not None:
         try:
-            funded = v2.funded_accounts(payer, history, before=rcpt.get("sent_at"),
-                                        exclude_blocks=(rcpt.get("send_block"),))
+            funded, withheld = v2.funded_and_withheld(
+                payer, history, before=rcpt.get("sent_at"),
+                exclude_blocks=(rcpt.get("send_block"),))
         except v2.TermsError as e:
             raise InvoiceError(f"{e.reason}: {e.detail}") from e
-    return v2.counterparty_role_check(declared, payer, receiver, funded)
+    return v2.counterparty_role_check(declared, payer, receiver, funded, withheld,
+                                      cutoff_corroborated=sent_at_corroborated)
 
 
 def receipt_schema_of(invoice):

@@ -123,6 +123,7 @@ REASONS = (
     "log_record_unknown_kind",
     "counterparty_role_unknown",
     "role_mismatch",
+    "cutoff_hides_funding",
     "history_not_the_payers",
     "history_malformed",
 )
@@ -319,14 +320,33 @@ def funded_accounts(payer, history, before=None, exclude_blocks=()):
     """The set of accounts `payer` has sent to, read from an account_history
     response the CALLER supplies. Pure: nothing is fetched.
 
+    The thin half of `funded_and_withheld`, kept because a caller who sets no
+    `before` has nothing to withhold. Prefer the pair whenever `before` comes
+    from a document you are checking rather than from your own clock.
+    """
+    return funded_and_withheld(payer, history, before=before, exclude_blocks=exclude_blocks)[0]
+
+
+def funded_and_withheld(payer, history, before=None, exclude_blocks=()):
+    """`(funded, withheld)` - the accounts `payer` has sent to, and the ones a
+    `before` cut-off took out of that set. Pure: nothing is fetched.
+
     `history` is the node's `account_history` reply ({"account", "history": [...]})
     or its list of entries; concatenate the pages yourself - a funded set is only
-    as complete as the history it was read from. `before` (unix seconds) drops
-    sends timed at or after it; a send with no time is kept, so a gap in the
-    node's data can produce a mismatch, never hide one. `exclude_blocks` drops
-    named send hashes - the settling payment is itself a send to the receiver
-    and must not count as having funded it.
+    as complete as the history it was read from. `before` (unix seconds) withholds
+    sends timed at or after it; a send with no time, or a `before` that does not
+    spell a whole number of seconds, is kept, so a gap in the node's data can
+    produce a mismatch, never hide one. `exclude_blocks` drops named send hashes -
+    the settling payment is itself a send to the receiver and must not count as
+    having funded it.
+
+    `withheld` is reported rather than discarded because the cut-off can only ever
+    make the funded set SMALLER, so it can only ever turn an observed `operator`
+    into `external` - the one direction a self-dealing receipt benefits from. An
+    account funded both before and after the cut-off is in `funded` and is not
+    withheld: nothing was hidden about it.
     """
+    before = raw_amount(before) if before is not None else None
     if isinstance(history, dict):
         named = history.get("account")
         if named and not acct.same_account(named, payer):
@@ -337,7 +357,7 @@ def funded_accounts(payer, history, before=None, exclude_blocks=()):
     if not isinstance(entries, (list, tuple)):
         raise TermsError("history_malformed", f"expected a list of entries, got {type(entries).__name__}")
     skip = {str(h).upper() for h in exclude_blocks if h}
-    funded = set()
+    funded, withheld = set(), set()
     for e in entries:
         if not isinstance(e, dict):
             raise TermsError("history_malformed", f"entry is {type(e).__name__}")
@@ -346,18 +366,18 @@ def funded_accounts(payer, history, before=None, exclude_blocks=()):
         if str(e.get("hash", "")).upper() in skip:
             continue
         ts = raw_amount(e.get("local_timestamp")) if e.get("local_timestamp") is not None else None
-        if before is not None and ts and ts >= before:
-            continue
         # non-raw history names the destination in `account`; a raw state block in `link_as_account`
         dest = e.get("link_as_account") if e.get("type") == "state" else e.get("account")
         try:
-            funded.add(acct.normalise(dest))
+            dest = acct.normalise(dest)
         except (acct.InvalidAccount, TypeError, AttributeError) as err:
             raise TermsError("history_malformed", f"send {e.get('hash')!r}: {err}") from err
-    return frozenset(funded)
+        (withheld if before is not None and ts and ts >= before else funded).add(dest)
+    return frozenset(funded), frozenset(withheld - funded)
 
 
-def counterparty_role_check(declared, payer, receiver, funded):
+def counterparty_role_check(declared, payer, receiver, funded, withheld=(),
+                            cutoff_corroborated=False):
     """Hold a declared counterparty role to the payer's funded set.
 
     The observed class is derived, not asserted: `self` if the receiver is the
@@ -365,6 +385,21 @@ def counterparty_role_check(declared, payer, receiver, funded):
     declared role that differs is `role_mismatch` - the case that matters being
     "external" paid to an account the payer funded. No declaration is reported
     as such (`ok`, `declared_role: None`), never invented.
+
+    `withheld` (from `funded_and_withheld`) are accounts a `before` cut-off took
+    out of `funded`, and they are always reported as `withheld_by_cutoff`.
+
+    A receiver that appears only there has TWO readings and the document cannot
+    tell them apart: the payer funded it after paying it (`external` was true
+    when it was declared), or the receipt understated the cut-off so that funding
+    which came first reads as if it came after. `check_counterparty_role` takes
+    the cut-off from the receipt's own `sent_at`, so the receipt under scrutiny
+    chooses which reading it gets - and only one of them is in its interest.
+    So the default is to refuse that case, `cutoff_hides_funding`, reporting NO
+    role in either direction: "we could not look" is not the answer `external`.
+    Pass `cutoff_corroborated=True` once the cut-off is held to the ledger rather
+    than to the document - `verify_receipt`'s `sent_at_matches_ledger` is that
+    check - and the after-payment reading is then taken at its word.
     """
     if acct.same_account(receiver, payer):
         observed = "self"
@@ -373,7 +408,15 @@ def counterparty_role_check(declared, payer, receiver, funded):
     else:
         observed = "external"
     out = {"check": "counterparty_role", "declared_role": declared, "observed_role": observed,
-           "payer": acct.normalise(payer), "receiver": acct.normalise(receiver)}
+           "payer": acct.normalise(payer), "receiver": acct.normalise(receiver),
+           "withheld_by_cutoff": sorted(acct.normalise(w) for w in withheld)}
+    hidden = observed == "external" and any(acct.same_account(receiver, w) for w in withheld)
+    if hidden and not cutoff_corroborated:
+        return dict(out, ok=False, reason="cutoff_hides_funding", observed_role=None,
+                    detail="the payer funded the receiver by a send timed at or after the cut-off, "
+                           "and the cut-off came from the receipt rather than from the ledger; hold "
+                           "sent_at to the ledger (verify_receipt), then say so with "
+                           "cutoff_corroborated=True (--sent-at-corroborated)")
     if declared is None:
         return dict(out, ok=True, reason=None,
                     detail="no counterparty_role was declared; there is nothing to hold this settlement to")

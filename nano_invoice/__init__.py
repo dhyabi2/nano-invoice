@@ -16,7 +16,7 @@ from .core import (
 )
 from .receipt_v2 import (
     ASSET, COUNTERPARTY_ROLES, SCALE, VERDICTS, LedgerBroken, TermsError, canonical_json,
-    counterparty_role_check, digest, funded_accounts, normalise_terms,
+    counterparty_role_check, digest, funded_accounts, funded_and_withheld, normalise_terms,
 )
 from .rpc import DEFAULT_RPC, Rpc, RpcError
 

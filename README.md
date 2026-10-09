@@ -130,6 +130,8 @@ python -m nano_invoice role-check --role external \
     --funded nano_3un4xgn97mxejkoewydihe57ijgx3j83tp988zu9d4oujhdjc1d1k4jnkouj
 ```
 
+**The cut-off is the receipt's own word, so by default a withheld send refuses rather than passes.** Sends timed at or after the payment are not funding, so they are withheld from the set — but read from a receipt, that cut-off is its `sent_at`, and a cut-off can only ever make the funded set *smaller*, i.e. only ever turn `operator` into `external`. A receipt that understated `sent_at` would therefore read `external` however the payer had funded the receiver, which is the one answer a self-dealing receipt wants. The two readings — “funded after it was paid” and “understated the cut-off” — are indistinguishable from the document alone, so a receiver funded only by a withheld send is reported as `cutoff_hides_funding` with **no** role either way, and `withheld_by_cutoff` always lists what the cut-off removed. Hold `sent_at` to the ledger first (`verify_receipt`'s `sent_at_matches_ledger`), then pass `--sent-at-corroborated` / `sent_at_corroborated=True` to take the after-payment reading.
+
 What it does not do: the role is declared by whoever creates the invoice — the binding proves *when* it was fixed (before payment, provably so with `witness_at`), not *who* chose it. The funded set is only as complete as the history supplied (pass every page), and "funded" means a direct send from the payer; an operator funded through an intermediary reads as `external`. `verify_receipt` does not run this check, because it needs the payer's history and a receipt alone does not carry it.
 
 ## Proving it on mainnet
