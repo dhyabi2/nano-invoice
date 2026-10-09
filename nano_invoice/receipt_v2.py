@@ -63,6 +63,7 @@ import hashlib
 import json
 
 from . import account as acct
+from . import nano_sig
 
 RAW_PER_XNO = 10 ** 30
 ASSET = "XNO"
@@ -126,6 +127,9 @@ REASONS = (
     "cutoff_hides_funding",
     "history_not_the_payers",
     "history_malformed",
+    "payer_ack_not_a_signature",
+    "payer_ack_needs_output_commitment",
+    "payer_ack_invalid",
 )
 
 
@@ -507,7 +511,7 @@ def record(kind, *, seq, prev_sha256, body, asserted_by=None, asserted_at=None):
     return dict(inner, record_sha256=digest(inner))
 
 
-def verdict_body(verdict, output_commitment=None, accept_token=None, note=None):
+def verdict_body(verdict, output_commitment=None, accept_token=None, note=None, payer_ack=None):
     """heysaladcommerceprobe's delivery verdict.
 
     `accept_token` rides along as wickthefamiliar's "quality/dispute handle".
@@ -515,6 +519,14 @@ def verdict_body(verdict, output_commitment=None, accept_token=None, note=None):
     the verification verdict is byte-identical with it present, absent or
     garbage. It is carried so a dispute has a handle, never so a payment has a
     gate.
+
+    `payer_ack` (optional) is the payer's Ed25519/BLAKE2b signature over
+    `nano_sig.ack_message(output_commitment, send_block)` - 128 hex characters.
+    `asserted_by` is a name anyone can type; `payer_ack` is checkable by a
+    stranger against the send block's `block_account`. Its validity against the
+    payment is checked where the payment is known (`append_verdict`,
+    `verify_payer_acks`); here only its shape. The key is written into the body
+    only when an ack is given, so an unsigned verdict's bytes are unchanged.
     """
     if verdict not in VERDICTS:
         raise LedgerBroken("verdict_unknown", -1, f"{verdict!r}: expected one of {', '.join(VERDICTS)}")
@@ -523,12 +535,73 @@ def verdict_body(verdict, output_commitment=None, accept_token=None, note=None):
                            f"{output_commitment!r}: expected 64 lowercase hex characters")
     if note is not None and not isinstance(note, str):
         raise LedgerBroken("verdict_unknown", -1, "note must be a string")
-    return {
+    body = {
         "verdict": verdict,
         "output_commitment": output_commitment,
         "accept_token": accept_token,
         "note": note,
     }
+    if payer_ack is not None:
+        if not _is_signature_hex(payer_ack):
+            raise LedgerBroken("payer_ack_not_a_signature", -1,
+                               f"{payer_ack!r}: expected 128 hex characters")
+        if output_commitment is None:
+            raise LedgerBroken("payer_ack_needs_output_commitment", -1,
+                               "a payer_ack signs an output_commitment; there is none to sign")
+        body["payer_ack"] = payer_ack.upper()
+    return body
+
+
+def _is_signature_hex(value):
+    if not isinstance(value, str) or len(value) != 128:
+        return False
+    try:
+        bytes.fromhex(value)
+    except ValueError:
+        return False
+    return True
+
+
+def verify_payer_acks(rcpt):
+    """Hold every verdict's `payer_ack` to the receipt's payer and payment block. Offline.
+
+    The payer is the receipt's `sender` - the send block's `block_account`,
+    which `verify_receipt` separately holds to the ledger - and the payment is
+    its `send_block`. Returns `(checks, payer_signed)`:
+
+      * a verdict carrying a `payer_ack` that does not verify is a failed
+        `payer_ack_invalid` check (the receipt is refused);
+      * `payer_signed` is True only when the LATEST verdict carries an ack
+        that verifies; a verdict with no ack is valid and reads False.
+
+    What a valid ack proves: the holder of the payer account's key acknowledged
+    that exact output_commitment for that exact payment. Not that the artifact
+    was any good, and not that buyer and seller are not colluding.
+    """
+    checks = []
+    log = rcpt.get("log")
+    if not isinstance(log, list):
+        return checks, False
+    payer, block = rcpt.get("sender"), rcpt.get("send_block")
+    latest_signed = False
+    for index, rec in enumerate(log):
+        if not isinstance(rec, dict) or rec.get("kind") != "verdict":
+            continue
+        body = rec.get("body") if isinstance(rec.get("body"), dict) else {}
+        ack = body.get("payer_ack")
+        if ack is None:
+            latest_signed = False
+            continue
+        ok = nano_sig.verify_delivery_ack(payer, body.get("output_commitment"), block, ack)
+        checks.append({
+            "check": "payer_ack" if ok else "payer_ack_invalid", "ok": ok, "index": index,
+            "detail": (f"signed by the key of {payer} over output_commitment and send_block"
+                       if ok else
+                       f"the signature does not verify for payer {payer!r}, output_commitment "
+                       f"{body.get('output_commitment')!r} and send_block {block!r}"),
+        })
+        latest_signed = ok
+    return checks, latest_signed
 
 
 def tombstone_body(reason, superseded_by=None, note=None):
