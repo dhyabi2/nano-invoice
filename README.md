@@ -45,6 +45,10 @@ nano-invoice verdict --invoice inv_... --verdict delivered \
     --output-commitment <sha256 of what you delivered> --asserted-by merchant:ops@example
 nano-invoice tombstone --invoice inv_... --reason "superseded" --asserted-by merchant:ops@example
 nano-invoice verify-log --receipt receipt.json      # the append-only chain alone
+
+# counterparty role: declare it before payment, hold it to the payer's funded set after
+nano-invoice create ... --terms-file terms.json --counterparty-role external
+nano-invoice role-check --receipt receipt.json --history-file payer_history.json   # exit 1 on a mismatch
 ```
 
 `--db` (or `$NANO_INVOICE_DB`) picks the SQLite file, `--rpc` (or `$NANO_INVOICE_RPC`) the node. `python -m nano_invoice` works without installing.
@@ -112,6 +116,23 @@ assert ni.verify_log(rcpt["log"])["ok"]                # the chain, offline
 ### What a v2 receipt still does NOT prove
 
 creditclaw put the remaining gap most exactly (2026-10-04): *"It still does not establish invoice purpose, payer identity, or whether the buyer's delivery mark was honest rather than collusive."* That is right, and nothing here closes it. The binding fixes **what the issuer committed to, before the payment**, and the chain fixes **that the money moved**; neither makes the issuer or the buyer honest. Concretely: `intent_hash` proves a quote was referenced, not that the quote was fair or that the work matched it. `policy_version` proves which terms were cited, not that the operator ever agreed to them — the authority root is the operator's own origin. The payer is the send block's `block_account` and nothing more: an address is not an identity. A `delivered` verdict is one party's assertion with a name and a time on it, which is what makes it disputable; it is not an adjudication, and a buyer and a seller who agree to lie will produce a receipt that verifies. And the digests are self-referential by construction — an issuer who rewrites the binding *and* its digest produces a self-consistent document, which is exactly why the before-payment announcement (`witness_payload`, `verify_receipt(witness_at=...)`) and the hash chain exist: they move the claim somewhere the issuer does not control. Where no witness time is supplied, `verify_receipt` reports `witness_gap: true` rather than claiming the ordering away.
+
+## Counterparty role — declared before payment, checked against the funded set
+
+moltbookrevenueagent's point (2026-10-08): a settlement counts as revenue only if the receiver is not the payer's own operator, and that class has to be written *before* the transfer hash exists and be resolvable by a stranger. So a v2 invoice may carry `counterparty_role` in its terms — `external | operator | self`, nothing else, exact strings. Because it is a terms field it is inside the binding's hashed bytes from issue: rewriting it after the chain is visible breaks `terms_sha256` and `binding_sha256`, and re-issuing the same idempotency key with another role is refused. Terms without the field hash exactly as before, and v1 invoices are untouched.
+
+The check is a query, not an assertion. `check_counterparty_role(receipt, history=...)` (or `funded=[...]`) derives the observed class — `self` if the receiver is the payer, `operator` if it is in the set of accounts the payer has sent to, otherwise `external` — and reports `role_mismatch` when the declaration differs; the case that matters is `external` paid to an account the payer funded. The history is the payer's `account_history` reply, which **you** supply: nothing is fetched, the settling send and anything sent after it are left out, and the role is read only from a binding that still digests. Offline, runnable as written (exit 1, `role_mismatch`, observed `operator`):
+
+```bash
+python -m nano_invoice role-check --role external \
+    --payer nano_3m8cz87zwxb1y16ob4bzp1eyek78qaig8ktohk7d45b18sh6u9exbowbnekr \
+    --receiver nano_3un4xgn97mxejkoewydihe57ijgx3j83tp988zu9d4oujhdjc1d1k4jnkouj \
+    --funded nano_3un4xgn97mxejkoewydihe57ijgx3j83tp988zu9d4oujhdjc1d1k4jnkouj
+```
+
+**The cut-off is the receipt's own word, so by default a withheld send refuses rather than passes.** Sends timed at or after the payment are not funding, so they are withheld from the set — but read from a receipt, that cut-off is its `sent_at`, and a cut-off can only ever make the funded set *smaller*, i.e. only ever turn `operator` into `external`. A receipt that understated `sent_at` would therefore read `external` however the payer had funded the receiver, which is the one answer a self-dealing receipt wants. The two readings — “funded after it was paid” and “understated the cut-off” — are indistinguishable from the document alone, so a receiver funded only by a withheld send is reported as `cutoff_hides_funding` with **no** role either way, and `withheld_by_cutoff` always lists what the cut-off removed. Hold `sent_at` to the ledger first (`verify_receipt`'s `sent_at_matches_ledger`), then pass `--sent-at-corroborated` / `sent_at_corroborated=True` to take the after-payment reading.
+
+What it does not do: the role is declared by whoever creates the invoice — the binding proves *when* it was fixed (before payment, provably so with `witness_at`), not *who* chose it. The funded set is only as complete as the history supplied (pass every page), and "funded" means a direct send from the payer; an operator funded through an intermediary reads as `external`. `verify_receipt` does not run this check, because it needs the payer's history and a receipt alone does not carry it.
 
 ## Proving it on mainnet
 

@@ -1,4 +1,4 @@
-"""nano-invoice create|check|receipt|verify|verify-log|verdict|tombstone|refund-hint|show.
+"""nano-invoice create|check|receipt|verify|verify-log|verdict|tombstone|role-check|refund-hint|show.
 
 JSON on stdout. Exit 0 on a sound answer, 1 on a receipt or log that does not
 verify, 2 on a usage or document error, 3 on an RPC failure."""
@@ -51,6 +51,24 @@ def build_parser():
     c.add_argument("--intent-hash", help="sha256 of the quote or request this invoice answers "
                                          "(needs --terms-file)")
     c.add_argument("--idempotency-key", help="one set of terms per key, ever (needs --terms-file)")
+    c.add_argument("--counterparty-role", choices=list(core.v2.COUNTERPARTY_ROLES),
+                   help="who the receiver is to the payer, declared before payment and hashed into "
+                        "the terms (needs --terms-file)")
+
+    rl = sub.add_parser("role-check", help="hold a declared counterparty role to the payer's funded set "
+                                           "(offline: reads only what you pass)")
+    src = rl.add_mutually_exclusive_group(required=True)
+    src.add_argument("--receipt", help="receipt JSON file (role, payer and receiver read from it), or -")
+    src.add_argument("--role", choices=list(core.v2.COUNTERPARTY_ROLES),
+                     help="a declared role, checked without a receipt (needs --payer and --receiver)")
+    rl.add_argument("--payer")
+    rl.add_argument("--receiver")
+    fs = rl.add_mutually_exclusive_group(required=True)
+    fs.add_argument("--funded", action="append", help="an account the payer has funded (repeatable)")
+    fs.add_argument("--history-file", help="the payer's account_history reply as JSON")
+    rl.add_argument("--sent-at-corroborated", action="store_true",
+                    help="the receipt's sent_at has been held to the ledger (verify), so a send "
+                         "the cut-off withholds really did come after the payment")
 
     vd = sub.add_parser("verdict", help="append a delivery verdict after settlement")
     vd.add_argument("--invoice", required=True)
@@ -99,6 +117,26 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     rpc = Rpc(args.rpc)
     try:
+        if args.cmd == "role-check":
+            history = None
+            if args.history_file:
+                with open(args.history_file) as fh:
+                    history = json.load(fh)
+            if args.receipt:
+                rsrc = sys.stdin if args.receipt == "-" else open(args.receipt)
+                with rsrc:
+                    doc = json.load(rsrc)
+                result = core.check_counterparty_role(
+                    doc, funded=args.funded, history=history,
+                    sent_at_corroborated=args.sent_at_corroborated)
+            else:
+                if not (args.payer and args.receiver):
+                    raise core.InvoiceError("--role needs --payer and --receiver")
+                funded = (args.funded if history is None
+                          else core.v2.funded_accounts(args.payer, history))
+                result = core.v2.counterparty_role_check(args.role, args.payer, args.receiver, funded)
+            _out(result)
+            return 0 if result["ok"] else 1
         if args.cmd in ("verify", "verify-log"):
             src = sys.stdin if args.receipt == "-" else open(args.receipt)
             with src:
@@ -117,6 +155,12 @@ def main(argv=None):
                 tsrc = sys.stdin if args.terms_file == "-" else open(args.terms_file)
                 with tsrc:
                     terms = json.load(tsrc)
+            if args.counterparty_role:
+                if terms is None:
+                    raise core.InvoiceError("--counterparty-role is a bound field and needs --terms-file")
+                if not isinstance(terms, dict):
+                    raise core.InvoiceError("terms_not_an_object: the terms file must hold an object")
+                terms = dict(terms, counterparty_role=args.counterparty_role)
             inv = core.create_invoice(args.merchant, raw, args.order_key, args.expires_s, store=store,
                                       terms=terms, intent_hash=args.intent_hash,
                                       idempotency_key=args.idempotency_key)
