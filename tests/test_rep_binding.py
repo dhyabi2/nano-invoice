@@ -102,6 +102,18 @@ class Check(unittest.TestCase):
         self.assertFalse(r["confirmed_before_delivery"])
         self.assertFalse(r["ok"])
 
+    def test_block_seen_in_the_same_second_as_delivery_is_not_before_it(self):
+        # The boundary itself. "Confirmed BEFORE delivery" is strict: a block the
+        # node first saw in the same second the work was delivered does not show
+        # the scope was fixed in advance of it. Without this, `ts < delivered`
+        # relaxing to `ts <= delivered` passes the whole suite.
+        h = self.ledger.change(INVOICE_ACCT, rb.expected_rep(SCOPE), T0)
+        r = self.check(h, delivered_at=T0)
+        self.assertTrue(r["match"])
+        self.assertTrue(r["confirmed"])
+        self.assertFalse(r["confirmed_before_delivery"])
+        self.assertFalse(r["ok"])
+
     def test_block_with_no_node_time_cannot_be_before_delivery(self):
         h = self.ledger.change(INVOICE_ACCT, rb.expected_rep(SCOPE), 0)
         r = self.check(h, delivered_at=T0)
