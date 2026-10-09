@@ -1,8 +1,9 @@
-"""nano-invoice create|check|receipt|verify|verify-log|verdict|tombstone|role-check|ack-verify|rep-check|refund-hint|show.
+"""nano-invoice create|check|receipt|verify|verify-log|verdict|tombstone|role-check|ack-verify|ack-read|rep-check|refund-hint|show.
 
 JSON on stdout. Exit 0 on a sound answer, 1 on a receipt or log that does not
 verify, 2 on a usage or document error, 3 on an RPC failure - and, for
-`ack-verify` (offline, no RPC), 3 on a payer acknowledgment that does not verify.
+`ack-verify` (offline, no RPC), 3 on a payer acknowledgment that does not verify;
+for `ack-read` (offline), 3 when no ack in the list verifies under the payer.
 `rep-check` exits 0 only when the representative matches and the block is
 confirmed (before --delivered-at, when given), 1 otherwise."""
 import argparse
@@ -92,6 +93,17 @@ def build_parser():
     av.add_argument("output_commitment", help="sha256 of the delivered artifact, 64 hex")
     av.add_argument("block_hash", help="the settling send block's hash, 64 hex")
     av.add_argument("signature", help="128 hex: Ed25519 with BLAKE2b-512, Nano's block scheme")
+    av.add_argument("--verdict", choices=list(nano_sig.ACK_VERDICT_CODES),
+                    help="check a v2 ack, which also signs the verdict (needs --signed-at)")
+    av.add_argument("--signed-at", type=int, help="v2: the UTC unix seconds the payer signed")
+    av.add_argument("--reason", help="v2: the reason the payer signed (bound by sha256)")
+
+    ar = sub.add_parser("ack-read", help="name the payer's current verdict from a list of "
+                                         "v1/v2 acks, offline")
+    ar.add_argument("payer_address", help="the settling send block's block_account")
+    ar.add_argument("output_commitment", help="sha256 of the delivered artifact, 64 hex")
+    ar.add_argument("block_hash", help="the settling send block's hash, 64 hex")
+    ar.add_argument("acks", help="JSON file (or - for stdin): a list of acks")
 
     rc = sub.add_parser("rep-check", help="hold a block's representative to "
                                           "nano_address(sha256(scope)), read-only")
@@ -160,6 +172,29 @@ def main(argv=None):
                 result = core.v2.counterparty_role_check(args.role, args.payer, args.receiver, funded)
             _out(result)
             return 0 if result["ok"] else 1
+        if args.cmd == "ack-read":
+            src = sys.stdin if args.acks == "-" else open(args.acks)
+            with src:
+                acks = json.load(src)
+            result = nano_sig.read_payer_acks(args.payer_address, args.output_commitment,
+                                              args.block_hash, acks)
+            _out(result)
+            return 0 if result["ok"] else 3
+        if args.cmd == "ack-verify" and args.verdict is not None:
+            if args.signed_at is None:
+                raise core.InvoiceError("--verdict needs --signed-at")
+            ok = nano_sig.verify_delivery_ack_v2(args.payer_address, args.output_commitment,
+                                                 args.block_hash, args.verdict, args.signed_at,
+                                                 args.signature, args.reason)
+            _out({"ok": ok, "payer_signed": ok, "payer": args.payer_address,
+                  "output_commitment": args.output_commitment, "send_block": args.block_hash,
+                  "verdict": args.verdict, "signed_at": args.signed_at, "reason": args.reason,
+                  "message": "nano-invoice/delivery-ack/v2\\n || output_commitment || send_block"
+                             " || verdict(1) || signed_at(u64 BE) || sha256(reason) or 32 zero bytes",
+                  "proves": "the payer account's key signed this verdict at this signed_at for this "
+                            "artifact hash and payment"
+                  if ok else "nothing: the signature does not verify for these values"})
+            return 0 if ok else 3
         if args.cmd == "ack-verify":
             ok = nano_sig.verify_delivery_ack(args.payer_address, args.output_commitment,
                                               args.block_hash, args.signature)
