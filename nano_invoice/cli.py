@@ -1,7 +1,8 @@
-"""nano-invoice create|check|receipt|verify|verify-log|verdict|tombstone|role-check|refund-hint|show.
+"""nano-invoice create|check|receipt|verify|verify-log|verdict|tombstone|role-check|ack-verify|refund-hint|show.
 
 JSON on stdout. Exit 0 on a sound answer, 1 on a receipt or log that does not
-verify, 2 on a usage or document error, 3 on an RPC failure."""
+verify, 2 on a usage or document error, 3 on an RPC failure - and, for
+`ack-verify` (offline, no RPC), 3 on a payer acknowledgment that does not verify."""
 import argparse
 import json
 import os
@@ -10,6 +11,7 @@ import time
 
 from . import account as acct
 from . import core
+from . import nano_sig
 from .rpc import DEFAULT_RPC, Rpc
 
 
@@ -78,6 +80,15 @@ def build_parser():
     vd.add_argument("--asserted-at", type=int, help="unix seconds (default: now)")
     vd.add_argument("--accept-token", help="a dispute handle only; no payment path reads it")
     vd.add_argument("--note")
+    vd.add_argument("--payer-ack", help="the payer's signature (128 hex) over "
+                                        "ack_message(output_commitment, send_block); refused "
+                                        "unless it verifies against the ledger's sender")
+
+    av = sub.add_parser("ack-verify", help="check a payer-signed delivery acknowledgment, offline")
+    av.add_argument("payer_address", help="the settling send block's block_account")
+    av.add_argument("output_commitment", help="sha256 of the delivered artifact, 64 hex")
+    av.add_argument("block_hash", help="the settling send block's hash, 64 hex")
+    av.add_argument("signature", help="128 hex: Ed25519 with BLAKE2b-512, Nano's block scheme")
 
     tb = sub.add_parser("tombstone", help="retire or supersede a receipt without rewriting it")
     tb.add_argument("--invoice", required=True)
@@ -137,6 +148,15 @@ def main(argv=None):
                 result = core.v2.counterparty_role_check(args.role, args.payer, args.receiver, funded)
             _out(result)
             return 0 if result["ok"] else 1
+        if args.cmd == "ack-verify":
+            ok = nano_sig.verify_delivery_ack(args.payer_address, args.output_commitment,
+                                              args.block_hash, args.signature)
+            _out({"ok": ok, "payer_signed": ok, "payer": args.payer_address,
+                  "output_commitment": args.output_commitment, "send_block": args.block_hash,
+                  "message": "nano-invoice/delivery-ack/v1\\n || output_commitment || send_block",
+                  "proves": "the payer account's key acknowledged this artifact hash for this payment"
+                  if ok else "nothing: the signature does not verify for these three values"})
+            return 0 if ok else 3
         if args.cmd in ("verify", "verify-log"):
             src = sys.stdin if args.receipt == "-" else open(args.receipt)
             with src:
@@ -170,7 +190,8 @@ def main(argv=None):
                 args.invoice, args.verdict, output_commitment=args.output_commitment,
                 asserted_by=args.asserted_by,
                 asserted_at=args.asserted_at if args.asserted_at is not None else int(time.time()),
-                accept_token=args.accept_token, note=args.note, store=store))
+                accept_token=args.accept_token, note=args.note, store=store,
+                payer_ack=args.payer_ack))
         elif args.cmd == "tombstone":
             _out(core.append_tombstone(
                 args.invoice, args.reason, superseded_by=args.superseded_by,

@@ -22,6 +22,7 @@ import sqlite3
 import time
 
 from . import account as acct
+from . import nano_sig
 from . import receipt_v2 as v2
 from .rpc import as_rpc
 
@@ -808,7 +809,7 @@ def witness_payload(invoice, store=None, witness_channel=None):
 
 
 def append_verdict(invoice, verdict, output_commitment=None, asserted_by=None, asserted_at=None,
-                   accept_token=None, note=None, store=None):
+                   accept_token=None, note=None, store=None, payer_ack=None):
     """Append a delivery verdict AFTER settlement. The receipt is not rewritten.
 
     heysaladcommerceprobe asked for the verdict and the output commitment;
@@ -816,6 +817,11 @@ def append_verdict(invoice, verdict, output_commitment=None, asserted_by=None, a
     are required, because an unattributed verdict is the issuer grading its own
     homework. `accept_token` rides along as wickthefamiliar's dispute handle and
     is read by no decision in this package.
+
+    `payer_ack` (optional): the payer's signature over
+    `nano_sig.ack_message(output_commitment, send_block)`. It is checked here
+    against the ledger's sender and settling block, and refused
+    (`payer_ack_invalid`) if it does not verify - a log never carries a bad one.
     """
     store = _require_store(store)
     inv = store.get(invoice)
@@ -826,7 +832,12 @@ def append_verdict(invoice, verdict, output_commitment=None, asserted_by=None, a
             f"{inv.id} is open: a delivery verdict is appended after settlement, not before it")
     try:
         body = v2.verdict_body(verdict, output_commitment=output_commitment,
-                               accept_token=accept_token, note=note)
+                               accept_token=accept_token, note=note, payer_ack=payer_ack)
+        if "payer_ack" in body and not nano_sig.verify_delivery_ack(
+                inv.sender, output_commitment, inv.send_block, body["payer_ack"]):
+            raise v2.LedgerBroken("payer_ack_invalid", -1,
+                                  f"does not verify for payer {inv.sender} and send block "
+                                  f"{inv.send_block}")
         return store.append(inv.id, "verdict", body,
                             asserted_by=asserted_by, asserted_at=asserted_at)
     except v2.LedgerBroken as e:
@@ -1019,9 +1030,10 @@ def verify_receipt(rcpt, rpc=None, witness_at=None):
         claimed_invoice_id = rcpt["invoice_id"]
     except (AttributeError, KeyError, ValueError, TypeError, acct.InvalidAccount) as e:
         check("receipt_well_formed", False, f"{type(e).__name__}: {e}")
-        return {"ok": False, "checks": checks}
+        return {"ok": False, "payer_signed": False, "checks": checks}
     is_v2 = rcpt.get("schema") == RECEIPT_SCHEMA_V2
     check("schema", rcpt.get("schema") in RECEIPT_SCHEMAS, rcpt.get("schema", ""))
+    payer_signed = False
     if is_v2:
         # The bound half: what the payment was FOR. Checked from the receipt's
         # own bytes, so it answers with no network at all - and then the ledger
@@ -1039,6 +1051,10 @@ def verify_receipt(rcpt, rpc=None, witness_at=None):
             if head is not None:
                 check("log_head_sha256", rcpt.get("log_head_sha256") == head,
                       f"receipt says {rcpt.get('log_head_sha256')!r}, the log ends at {head}")
+            # Offline: a verdict's payer_ack against the sender and send block
+            # (which the ledger checks below hold to the chain).
+            ack_checks, payer_signed = v2.verify_payer_acks(rcpt)
+            checks.extend(ack_checks)
     check("invoice_id_rederives", invoice_id_for(merchant, order_key_sha256) == claimed_invoice_id)
     # The tag is the ONLY thing binding an amount to an order - Nano blocks carry
     # no memo - so a tag of 0 makes every arithmetic check below vacuous: any
@@ -1164,7 +1180,7 @@ def verify_receipt(rcpt, rpc=None, witness_at=None):
     if s is None:
         check("ledger_reachable", False, "block_info for send block failed")
         ok = all(c["ok"] for c in checks if not (witness_gap and c["check"] == "witness_before_send"))
-        return {"ok": ok, "witness_gap": witness_gap, "checks": checks}
+        return {"ok": ok, "witness_gap": witness_gap, "payer_signed": payer_signed, "checks": checks}
     try:
         contents = s.get("contents") or {}
         dest = contents.get("link_as_account") or contents.get("destination")
@@ -1184,4 +1200,4 @@ def verify_receipt(rcpt, rpc=None, witness_at=None):
     except Exception as e:  # an unreachable or lying node must never read as verified
         check("ledger_reachable", False, f"{type(e).__name__}: {e}")
     ok = all(c["ok"] for c in checks if not (witness_gap and c["check"] == "witness_before_send"))
-    return {"ok": ok, "witness_gap": witness_gap, "checks": checks}
+    return {"ok": ok, "witness_gap": witness_gap, "payer_signed": payer_signed, "checks": checks}

@@ -18,6 +18,8 @@ from .receipt_v2 import (
     ASSET, COUNTERPARTY_ROLES, SCALE, VERDICTS, LedgerBroken, TermsError, canonical_json,
     counterparty_role_check, digest, funded_accounts, funded_and_withheld, normalise_terms,
 )
+from .nano_sig import ack_message, sign_delivery_ack, verify_delivery_ack
+from .receipt_v2 import verify_payer_acks
 from .rpc import DEFAULT_RPC, Rpc, RpcError
 
 __version__ = "0.1.0"
