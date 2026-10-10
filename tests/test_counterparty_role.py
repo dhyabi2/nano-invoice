@@ -277,3 +277,78 @@ class TheCutoffIsTheReceiptsOwnWord(rv2.Base):
 
     def test_cutoff_hides_funding_is_a_declared_reason(self):
         self.assertIn("cutoff_hides_funding", v2.REASONS)
+
+
+class ARawHistoryNamesTheDestinationInThreeDifferentFields(rv2.Base):
+    """`account_history` answers in more than one shape, and the funded set has
+    to read the destination out of each of them.
+
+    Non-raw history names it in `account`. With `raw=true` a state block names it
+    in `link_as_account` - and a LEGACY (pre-state) send block names it in
+    `destination`, carrying no `account` at all while still reading
+    `type: "send"`. A payer whose account predates state blocks therefore has
+    such entries in the full history the README asks the caller to pass, and
+    reading one is not optional: the funded set exists to answer "has the payer
+    ever funded this receiver".
+    """
+    PAYER, RECEIVER = BUYER, MERCHANT
+
+    def raw_legacy_send(self, destination, ts=None):
+        """A legacy send block exactly as `account_history raw=true` serialises it."""
+        entry = {"type": "send", "previous": "0" * 64, "destination": destination,
+                 "balance": "00000000000000000000000000000000", "work": "0" * 16,
+                 "signature": "0" * 128, "height": "2", "hash": "A" * 64,
+                 "amount": str(XNO // 10)}
+        if ts is not None:
+            entry["local_timestamp"] = str(ts)
+        return {"account": self.PAYER, "history": [entry]}
+
+    def raw_state_send(self, destination, ts=None):
+        entry = {"type": "state", "subtype": "send", "account": self.PAYER,
+                 "link_as_account": destination, "height": "2", "hash": "B" * 64,
+                 "amount": str(XNO // 10)}
+        if ts is not None:
+            entry["local_timestamp"] = str(ts)
+        return {"account": self.PAYER, "history": [entry]}
+
+    def test_a_legacy_sends_destination_is_in_the_funded_set(self):
+        funded, withheld = v2.funded_and_withheld(
+            self.PAYER, self.raw_legacy_send(self.RECEIVER, T0 - 500))
+        self.assertEqual(sorted(funded), [self.RECEIVER])
+        self.assertEqual(sorted(withheld), [])
+
+    def test_a_raw_state_sends_destination_is_in_the_funded_set(self):
+        funded, _ = v2.funded_and_withheld(
+            self.PAYER, self.raw_state_send(self.RECEIVER, T0 - 500))
+        self.assertEqual(sorted(funded), [self.RECEIVER])
+
+    def test_external_paid_to_an_account_a_legacy_send_funded_is_a_mismatch(self):
+        # the whole point: the declaration is contradicted, not unanswerable
+        funded, withheld = v2.funded_and_withheld(
+            self.PAYER, self.raw_legacy_send(self.RECEIVER, T0 - 500))
+        verdict = v2.counterparty_role_check("external", self.PAYER, self.RECEIVER,
+                                             funded, withheld)
+        self.assertFalse(verdict["ok"], verdict)
+        self.assertEqual(verdict["reason"], "role_mismatch")
+        self.assertEqual(verdict["observed_role"], "operator")
+
+    def test_a_legacy_send_is_held_to_the_cutoff_like_any_other(self):
+        funded, withheld = v2.funded_and_withheld(
+            self.PAYER, self.raw_legacy_send(self.RECEIVER, T0 + 5000), before=T0)
+        self.assertEqual(sorted(funded), [])
+        self.assertEqual(sorted(withheld), [self.RECEIVER])
+
+    def test_a_legacy_send_is_excluded_by_hash_like_any_other(self):
+        funded, _ = v2.funded_and_withheld(
+            self.PAYER, self.raw_legacy_send(self.RECEIVER, T0 - 500),
+            exclude_blocks=("A" * 64,))
+        self.assertEqual(sorted(funded), [])
+
+    def test_a_send_that_names_no_destination_in_any_field_is_still_refused(self):
+        # the refusal this fix removes for legacy blocks must stay for an entry
+        # that really does not say where the money went
+        broken = {"account": self.PAYER,
+                  "history": [{"type": "send", "hash": "C" * 64, "amount": str(XNO)}]}
+        with self.assertRaises(v2.TermsError) as cm:
+            v2.funded_and_withheld(self.PAYER, broken)
+        self.assertEqual(cm.exception.reason, "history_malformed")
