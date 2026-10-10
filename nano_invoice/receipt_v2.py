@@ -370,8 +370,18 @@ def funded_and_withheld(payer, history, before=None, exclude_blocks=()):
         if str(e.get("hash", "")).upper() in skip:
             continue
         ts = raw_amount(e.get("local_timestamp")) if e.get("local_timestamp") is not None else None
-        # non-raw history names the destination in `account`; a raw state block in `link_as_account`
-        dest = e.get("link_as_account") if e.get("type") == "state" else e.get("account")
+        # Where a send names its destination depends on which shape the node
+        # answered with: non-raw history puts it in `account`, a raw state block
+        # in `link_as_account`, and a raw LEGACY (pre-state) send block in
+        # `destination` - the field `core._resolve_send` has always read as its
+        # second choice. Without that third reading an old payer's full history
+        # raised `history_malformed` instead of answering, because a legacy send
+        # has `type: "send"` (so it is not the state branch) and carries no
+        # `account` at all. Reading it can only ADD to the funded set, i.e. only
+        # turn an observed `external` into `operator`, which is the direction
+        # that catches self-dealing rather than the one that hides it.
+        dest = (e.get("link_as_account") if e.get("type") == "state"
+                else (e.get("account") or e.get("destination")))
         try:
             dest = acct.normalise(dest)
         except (acct.InvalidAccount, TypeError, AttributeError) as err:
