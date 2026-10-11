@@ -53,6 +53,58 @@ nano-invoice role-check --receipt receipt.json --history-file payer_history.json
 
 `--db` (or `$NANO_INVOICE_DB`) picks the SQLite file, `--rpc` (or `$NANO_INVOICE_RPC`) the node. `python -m nano_invoice` works without installing.
 
+## Use with an x402 seller
+
+nano-invoice does not parse or emit x402 messages itself. It is the settlement side: it gives an
+XNO entry in a 402 an amount that names one request, and it decides from the ledger whether that
+request was paid. [`examples/x402_seller.py`](examples/x402_seller.py) is the glue, one file of
+plain functions, and the entry it builds goes **beside** a seller's existing USDC entry, never instead of it:
+
+```bash
+python3 examples/x402_seller.py --merchant nano_1yo6c1t64ahfjdw1dxizmbbnpdmbrckwhw9phbg5pdkeubrizga4qhnjmnx7 --amount-xno 0.0001
+```
+
+prints this, here re-wrapped (offline; the tag and invoice id differ per run):
+
+```json
+{
+  "x402Version": 2,
+  "resource": {"url": "https://seller.example/api/report"},
+  "accepts": [
+    {"scheme": "exact", "network": "eip155:8453", "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+     "amount": "10000", "payTo": "0xYOUR_BASE_ADDRESS", "maxTimeoutSeconds": 60},
+    {"scheme": "exact", "network": "nano:mainnet", "asset": "XNO",
+     "amount": "100000000000000000000550034",
+     "payTo": "nano_1yo6c1t64ahfjdw1dxizmbbnpdmbrckwhw9phbg5pdkeubrizga4qhnjmnx7",
+     "maxTimeoutSeconds": 300, "extra": {"decimals": 30, "invoiceId": "inv_f0894c472f1a2b9a6666afa29bc611f2"}}
+  ]
+}
+```
+
+1. **On the unpaid request**, call `create_invoice(merchant, price_raw, order_key=<request id>, ...)`
+   and append `nano_accepts_entry(inv)` to `accepts[]`. Its `amount` is the invoice's `pay_raw`
+   in raw (10\*\*30 per XNO): the price plus a tag in the lowest six digits, which is what ties an
+   `exact` payment of that amount to this request and no other. The same request id returns the
+   same invoice, so a repeated 402 quotes the same amount.
+2. **On the retry**, decode the payment payload and call `settle_nano(payment, store, rpc)`. It
+   reads the invoice id from `accepted.extra.invoiceId`, runs `check_invoice` against the Nano
+   ledger, and returns `serve: true` only for `paid` (or `overpaid`, with the excess as a refund
+   instruction). A block hash in the payload is compared with the block the ledger settled and is
+   never trusted on its own; `underpaid`, `open` and `expired` are refused, with any refund owed
+   addressed to the account the ledger says sent it.
+3. **The USDC entry is not touched.** The example passes it through and never reads it; it is
+   still verified and settled by the seller's existing facilitator.
+
+`tests/test_x402_seller_example.py` runs this against the in-memory ledger: the 402 shape, an
+exact payment served, a round untagged amount not matched, an underpaid payment refused with its
+refund, a claimed block that is not the settling block refused.
+
+What this does not do: it does not decode the `PAYMENT-SIGNATURE` header (pass it the decoded
+JSON), it does not sign or broadcast the payment (the buyer's wallet does), and it does not
+remember that a request was already served: a settled block hash is public, so serve each
+invoice once on your side. The buyer's client must pay `amount` exactly; a client that rounds
+the price drops the tag and the payment matches nothing (see **Limits** below).
+
 ## How the binding works
 
 ```
