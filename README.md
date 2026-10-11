@@ -64,7 +64,7 @@ plain functions, and the entry it builds goes **beside** a seller's existing USD
 python3 examples/x402_seller.py --merchant nano_1yo6c1t64ahfjdw1dxizmbbnpdmbrckwhw9phbg5pdkeubrizga4qhnjmnx7 --amount-xno 0.0001
 ```
 
-prints this, here re-wrapped (offline; the tag and invoice id differ per run):
+prints this, here re-wrapped (offline; the tag differs per run, the invoice id follows from the merchant and request id):
 
 ```json
 {
@@ -86,8 +86,10 @@ prints this, here re-wrapped (offline; the tag and invoice id differ per run):
    in raw (10\*\*30 per XNO): the price plus a tag in the lowest six digits, which is what ties an
    `exact` payment of that amount to this request and no other. The same request id returns the
    same invoice, so a repeated 402 quotes the same amount.
-2. **On the retry**, decode the payment payload and call `settle_nano(payment, store, rpc)`. It
-   reads the invoice id from `accepted.extra.invoiceId`, runs `check_invoice` against the Nano
+2. **On the retry**, look up the invoice you issued for this request (the same request id returns
+   it) and call `settle_nano(payment, store, inv.id, rpc)`. The invoice id in
+   `accepted.extra.invoiceId` is the buyer's to write, so a payload naming any other invoice, even
+   a paid one for a cheaper request, is refused as `wrong_invoice`. Then it runs `check_invoice` against the Nano
    ledger, and returns `serve: true` only for `paid` (or `overpaid`, with the excess as a refund
    instruction). A block hash in the payload is compared with the block the ledger settled and is
    never trusted on its own; `underpaid`, `open` and `expired` are refused, with any refund owed
@@ -97,7 +99,7 @@ prints this, here re-wrapped (offline; the tag and invoice id differ per run):
 
 `tests/test_x402_seller_example.py` runs this against the in-memory ledger: the 402 shape, an
 exact payment served, a round untagged amount not matched, an underpaid payment refused with its
-refund, a claimed block that is not the settling block refused.
+refund, a claimed block that is not the settling block refused, a paid invoice for another request refused.
 
 What this does not do: it does not decode the `PAYMENT-SIGNATURE` header (pass it the decoded
 JSON), it does not sign or broadcast the payment (the buyer's wallet does), and it does not

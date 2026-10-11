@@ -34,8 +34,8 @@ class X402Seller(unittest.TestCase):
             body["payload"]["blockHash"] = block
         return body
 
-    def settle(self, payment, now=T0 + 30):
-        return x.settle_nano(payment, self.store, rpc=self.ledger, now=now)
+    def settle(self, payment, now=T0 + 30, expected=None):
+        return x.settle_nano(payment, self.store, expected or self.inv.id, rpc=self.ledger, now=now)
 
     def test_402_keeps_usdc_first_and_untouched_and_adds_xno_last(self):
         body = x.payment_required("https://s.example/r", [USDC], self.inv)
@@ -89,7 +89,18 @@ class X402Seller(unittest.TestCase):
         self.assertEqual(self.settle(self.payment(network="eip155:8453"))["reason"], "not_nano")
         bogus = self.payment()
         bogus["accepted"]["extra"]["invoiceId"] = "inv_" + "0" * 32
-        self.assertEqual(self.settle(bogus)["reason"], "unknown_invoice")
+        self.assertEqual(self.settle(bogus, expected=bogus["accepted"]["extra"]["invoiceId"])["reason"],
+                         "unknown_invoice")
+        self.assertEqual(self.settle(bogus)["reason"], "wrong_invoice")
+
+    def test_a_paid_cheap_invoice_does_not_unlock_another_request(self):
+        cheap = ni.create_invoice(MERCHANT, XNO // 1000000, "req-cheap", 300, store=self.store, now=T0)
+        send, _ = self.ledger.send(BUYER, MERCHANT, cheap.pay_raw, T0 + 10)
+        paid_cheap = self.payment(block=send, inv=cheap)
+        self.assertTrue(self.settle(paid_cheap, expected=cheap.id)["serve"])
+        r = self.settle(paid_cheap)          # retried on req-1, whose invoice is self.inv
+        self.assertFalse(r["serve"])
+        self.assertEqual(r["reason"], "wrong_invoice")
 
     def test_cli_prints_the_402_offline(self):
         buf = io.StringIO()

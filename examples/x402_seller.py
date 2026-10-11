@@ -7,9 +7,11 @@ nano-invoice does not speak x402. This file is the glue, and it is all of it:
      `nano_accepts_entry(inv)` to the end of the 402's `accepts[]`. Its
      `amount` is the invoice's tagged `pay_raw`, so an `exact` payment of that
      amount is the payment for *this* request and no other.
-  2. On the retry, read the invoice id back from the payment payload's
-     `accepted.extra.invoiceId` and call `settle_nano(...)`, which runs
-     `check_invoice` against the ledger. The block hash the client names is only
+  2. On the retry, look up the invoice the seller issued for *this* request
+     (`create_invoice` with the same request id returns it) and call
+     `settle_nano(payment, store, inv.id, ...)`. A payload naming any other
+     invoice, even a paid one, is refused; then `check_invoice` runs against
+     the ledger. The block hash the client names is only
      compared with the block the ledger settled; it is never trusted on its own.
 
 The USDC entry is passed through unchanged and is never read here: it is still
@@ -73,14 +75,22 @@ def invoice_id_of(payment):
     return extra.get("invoiceId")
 
 
-def settle_nano(payment, store, rpc=None, **check_kw):
-    """Decide whether a decoded payment payload pays its invoice, from the ledger.
+def settle_nano(payment, store, expected_invoice_id, rpc=None, **check_kw):
+    """Decide whether a decoded payment payload pays the invoice the seller
+    issued for this request, from the ledger.
+
+    `expected_invoice_id` is the seller's, never the buyer's: the id of the
+    invoice created for the request being retried. The id in the payload is
+    the buyer's to write, so without this a paid invoice for a cheap request
+    would unlock an expensive one.
 
     Returns {"serve": bool, "reason": str, "state": str|None, "refunds": [...]}.
     """
     inv_id = invoice_id_of(payment)
     if inv_id is None:
         return {"serve": False, "reason": "not_nano", "state": None, "refunds": []}
+    if inv_id != expected_invoice_id:
+        return {"serve": False, "reason": "wrong_invoice", "state": None, "refunds": []}
     try:
         inv = store.get(inv_id)
     except core.NotFound:
