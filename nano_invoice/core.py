@@ -647,7 +647,19 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
     A block pays only if: it is a confirmed send to the merchant, it was sent
     after the invoice was created, before it expired, its amount ends in this
     invoice's tag, it is not from the merchant's own or a not-income account,
-    and it is not already bound to any invoice. Exactly pay_raw -> paid.
+    and it is not already bound to any invoice. Exactly pay_raw -> paid; more
+    than pay_raw -> overpaid.
+
+    A send below pay_raw does not close an open invoice. The tag is public on
+    the ledger as soon as the buyer broadcasts, so anyone can send dust that
+    carries it, and dust that sorted or confirmed first used to close the
+    invoice as underpaid and turn the buyer's exact payment into a duplicate.
+    Such a send is reported as `short` and bound to nothing while the invoice
+    is open and not yet past expires_at + skew_s. Once the invoice is paid or
+    overpaid it is recorded as a duplicate (whole amount refunded). If the
+    invoice reaches expiry having seen only short sends, the first of them
+    closes it as underpaid and any others are duplicates, so every short send
+    is refunded in full.
     """
     store = _require_store(store)
     inv = store.get(invoice)
@@ -655,6 +667,7 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
     own = _accounts(own_accounts) | {inv.merchant}
     excluded = {acct.normalise(k): v for k, v in (not_income or {}).items()}
     observations = []
+    short = []
     for ob in scan(rpc, inv.merchant, inv.tag, inv.created_at - skew_s, max_blocks):
         view = {k: (str(v) if k == "amount_raw" else v) for k, v in ob.items() if k != "problems"}
         if ob["problems"]:
@@ -684,9 +697,11 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
         if ob["block_ts"] > inv.expires_at:
             observations.append(_record(store, ob, "late", inv.id, "sent after the invoice expired", now, view))
             continue
+        if ob["amount_raw"] < inv.pay_raw:
+            short.append((ob, view))  # decided below, after every exact or larger send
+            continue
         if current.state == "open":
-            kind = ("payment" if ob["amount_raw"] == inv.pay_raw
-                    else "underpaid" if ob["amount_raw"] < inv.pay_raw else "overpaid")
+            kind = "payment" if ob["amount_raw"] == inv.pay_raw else "overpaid"
             try:
                 observations.append(_record(store, ob, kind, inv.id, None, now, view))
                 continue
@@ -694,8 +709,25 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
                 current = store.get(inv.id)  # another process settled it first
         kind = "late" if current.state == "expired" else "duplicate"
         observations.append(_record(store, ob, kind, inv.id, f"invoice already {current.state}", now, view))
+    expiring = now > inv.expires_at + skew_s
+    for ob, view in short:
+        current = store.get(inv.id)
+        if current.state == "open":
+            if not expiring:
+                observations.append(dict(view, outcome="short", reason=(
+                    "below pay_raw: does not close the invoice; bound and refunded once it is "
+                    "paid or expires")))
+                continue
+            try:
+                observations.append(_record(store, ob, "underpaid", inv.id, None, now, view))
+                continue
+            except IllegalTransition:
+                current = store.get(inv.id)  # another process settled it first
+        kind = "late" if current.state == "expired" else "duplicate"
+        observations.append(_record(store, ob, kind, inv.id,
+                                    f"below pay_raw; invoice already {current.state}", now, view))
     current = store.get(inv.id)
-    if current.state == "open" and now > current.expires_at + skew_s:
+    if current.state == "open" and expiring:
         try:
             current = store.expire(inv.id, now)
         except IllegalTransition:
