@@ -222,6 +222,22 @@ CREATE TRIGGER IF NOT EXISTS invoice_log_no_delete BEFORE DELETE ON invoice_log
   BEGIN SELECT RAISE(ABORT, 'invoice_log is append-only: a record cannot be removed'); END;
 CREATE UNIQUE INDEX IF NOT EXISTS invoices_idempotency
   ON invoices(merchant, idempotency_key) WHERE idempotency_key IS NOT NULL;
+-- A confirmed, in-time send below pay_raw that check_invoice saw while the
+-- invoice was still open. It is not bound (dust must not close the invoice),
+-- but it is remembered, so the close at expiry, or Store.expire, still binds
+-- and refunds it after it has scrolled out of the scan window. A new table,
+-- created IF NOT EXISTS, so a database written by an earlier release opens
+-- unchanged and simply starts with no rows here.
+CREATE TABLE IF NOT EXISTS short_sends(
+  send_block TEXT PRIMARY KEY,
+  invoice_id TEXT NOT NULL REFERENCES invoices(id),
+  receive_block TEXT,
+  merchant TEXT NOT NULL,
+  sender TEXT NOT NULL,
+  amount_raw TEXT NOT NULL,
+  block_ts INTEGER,
+  seen_at INTEGER NOT NULL
+);
 """
 
 
@@ -358,11 +374,42 @@ class Store:
                  prev, rec["record_sha256"], asserted_by, asserted_at))
         return rec
 
+    def note_short(self, invoice_id, observed, now=None):
+        """Remember a short send seen while the invoice is open. Idempotent."""
+        now = int(time.time()) if now is None else now
+        with self.tx() as c:
+            c.execute(
+                "INSERT OR IGNORE INTO short_sends(send_block, invoice_id, receive_block, merchant,"
+                " sender, amount_raw, block_ts, seen_at) VALUES (?,?,?,?,?,?,?,?)",
+                (observed["send_block"], invoice_id, observed.get("receive_block"),
+                 observed["merchant"], observed["sender"], str(observed["amount_raw"]),
+                 observed.get("block_ts"), now))
+
+    def pending_shorts(self, invoice_id):
+        """Remembered short sends for this invoice not yet bound to anything, oldest first."""
+        rows = self.conn.execute(
+            "SELECT * FROM short_sends WHERE invoice_id = ? AND send_block NOT IN"
+            " (SELECT send_block FROM payments) ORDER BY block_ts, send_block", (invoice_id,)).fetchall()
+        return [dict(r, amount_raw=int(r["amount_raw"])) for r in rows]
+
     def expire(self, invoice_id, now=None):
+        """Close an open invoice as expired. Every short send check_invoice saw
+        while it was open is recorded in the same transaction as a duplicate
+        (refunded in full), so closing it this way never drops a buyer's money."""
         now = int(time.time()) if now is None else now
         with self.tx() as c:
             _transition(c, invoice_id, "expired", now, None)
+            c.execute(
+                "INSERT INTO payments(send_block, receive_block, merchant, invoice_id, kind, sender,"
+                " amount_raw, block_ts, reason, recorded_at)"
+                " SELECT send_block, receive_block, merchant, invoice_id, 'duplicate', sender,"
+                " amount_raw, block_ts, ?, ? FROM short_sends WHERE invoice_id = ? AND send_block"
+                " NOT IN (SELECT send_block FROM payments)",
+                (SHORT_EXPIRED_REASON, now, invoice_id))
         return self.get(invoice_id)
+
+
+SHORT_EXPIRED_REASON = "below pay_raw, sent before expiry; invoice closed expired with no payment"
 
 
 def _payment(row):
@@ -655,11 +702,15 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
     carries it, and dust that sorted or confirmed first used to close the
     invoice as underpaid and turn the buyer's exact payment into a duplicate.
     Such a send is reported as `short` and bound to nothing while the invoice
-    is open and not yet past expires_at + skew_s. Once the invoice is paid or
+    is open and not yet past expires_at + skew_s, but it is remembered in the
+    store, so the later close still binds it even if a busy account has pushed
+    it out of the max_blocks scan window, and Store.expire records it as a
+    refundable duplicate. Once the invoice is paid or
     overpaid it is recorded as a duplicate (whole amount refunded). If the
     invoice reaches expiry having seen only short sends, the first of them
     closes it as underpaid and any others are duplicates, so every short send
-    is refunded in full.
+    is refunded in full. A short send first seen after the invoice was closed
+    expired is a duplicate (refunded), never `late`: it was sent in time.
     """
     store = _require_store(store)
     inv = store.get(invoice)
@@ -710,6 +761,17 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
         kind = "late" if current.state == "expired" else "duplicate"
         observations.append(_record(store, ob, kind, inv.id, f"invoice already {current.state}", now, view))
     expiring = now > inv.expires_at + skew_s
+    in_window = {ob["send_block"] for ob, _ in short}
+    for ob, _ in short:
+        store.note_short(inv.id, ob, now)
+    # Short sends seen by an earlier check but no longer in the scan window
+    # (a busy account) are still decided here, after the ones scanned now.
+    for row in store.pending_shorts(inv.id):
+        if row["send_block"] not in in_window:
+            ob = {k: row[k] for k in ("send_block", "receive_block", "merchant", "sender",
+                                      "amount_raw", "block_ts")}
+            short.append((ob, dict(ob, amount_raw=str(ob["amount_raw"]), remembered=True)))
+    short.sort(key=lambda x: (x[0]["block_ts"], x[0]["send_block"]))
     for ob, view in short:
         current = store.get(inv.id)
         if current.state == "open":
@@ -723,8 +785,12 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
                 continue
             except IllegalTransition:
                 current = store.get(inv.id)  # another process settled it first
-        kind = "late" if current.state == "expired" else "duplicate"
-        observations.append(_record(store, ob, kind, inv.id,
+        if current.state == "expired":
+            # Sent in time (block_ts <= expires_at was checked above) but the
+            # invoice was closed without it: still a short send, not a late one.
+            observations.append(_record(store, ob, "duplicate", inv.id, SHORT_EXPIRED_REASON, now, view))
+            continue
+        observations.append(_record(store, ob, "duplicate", inv.id,
                                     f"below pay_raw; invoice already {current.state}", now, view))
     current = store.get(inv.id)
     if current.state == "open" and expiring:

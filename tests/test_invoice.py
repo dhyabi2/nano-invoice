@@ -320,12 +320,71 @@ class TestDustDoesNotCloseTheInvoice(Base):
         self.assertEqual(sorted((r["to"], r["amount_raw"], r["reason"]) for r in res["refunds"]),
                          sorted([(OTHER, str(inv.tag), "underpaid"), (BUYER, str(short), "duplicate")]))
 
+    def _scroll_out(self, n=10):
+        for i in range(n):  # a busy account: later unrelated sends push it out of max_blocks
+            self.ledger.send(OTHER, MERCHANT, XNO + 1 + i, T0 + 30 + i)
+
+    def test_a_short_send_that_scrolls_out_of_the_scan_window_still_closes_it_underpaid(self):
+        inv = self.invoice(expires_s=600)
+        short = inv.pay_raw - 10 ** 29
+        real, _ = self.ledger.send(BUYER, MERCHANT, short, T0 + 10)
+        self.check(inv, now=T0 + 20, max_blocks=5)
+        self._scroll_out()
+        res = self.check(inv, now=T0 + 600 + ni.CLOCK_SKEW_S + 1, max_blocks=5)
+        got = self.store.get(inv)
+        self.assertEqual((got.state, got.send_block), ("underpaid", real))
+        self.assertEqual([(r["to"], r["amount_raw"], r["reason"]) for r in res["refunds"]],
+                         [(BUYER, str(short), "underpaid")])
+
+    def test_expiring_by_hand_still_refunds_a_short_send_already_seen(self):
+        inv = self.invoice(expires_s=600)
+        short = inv.pay_raw - 10 ** 29
+        real, _ = self.ledger.send(BUYER, MERCHANT, short, T0 + 10)
+        self.check(inv, now=T0 + 20)
+        self.store.expire(inv.id, now=T0 + 30)
+        self.assertEqual(self.store.get(inv).state, "expired")
+        refunds = ni.refund_hints(self.store, inv.id)
+        self.assertEqual([(r["to"], r["amount_raw"], r["source_block"]) for r in refunds],
+                         [(BUYER, str(short), real)])
+
+    def test_a_remembered_dust_send_never_beats_a_later_exact_payment(self):
+        inv = self.invoice(expires_s=600)
+        dust, _ = self.ledger.send(OTHER, MERCHANT, inv.tag, T0 + 5)
+        self.check(inv, now=T0 + 20, max_blocks=5)
+        self._scroll_out()
+        exact, _ = self.ledger.send(BUYER, MERCHANT, inv.pay_raw, T0 + 100)
+        self.check(inv, now=T0 + 120, max_blocks=5)
+        got = self.store.get(inv)
+        self.assertEqual((got.state, got.send_block), ("paid", exact))
+        self.assertEqual(self.store.payment(dust)["kind"], "duplicate")
+
+    def test_a_short_send_made_in_time_is_not_called_late(self):
+        inv = self.invoice(expires_s=600)
+        self.store.expire(inv.id, now=T0 + 30)  # closed before the check ever saw the send
+        real, _ = self.ledger.send(BUYER, MERCHANT, inv.pay_raw - 10 ** 29, T0 + 10)
+        res = self.check(inv, now=T0 + 700)
+        pay = self.store.payment(real)
+        self.assertNotEqual(pay["kind"], "late")
+        self.assertIn("before expiry", pay["reason"])
+        self.assertEqual([r["to"] for r in res["refunds"]], [BUYER])
+
     def test_an_overpayment_still_settles_at_once(self):
         inv = self.invoice()
         over, _ = self.ledger.send(BUYER, MERCHANT, inv.pay_raw + 10 ** 6, T0 + 10)
         self.check(inv)
         got = self.store.get(inv)
         self.assertEqual((got.state, got.send_block), ("overpaid", over))
+
+
+class TestDocsDescribeShortSends(unittest.TestCase):
+    def test_every_doc_names_the_short_outcome_and_the_check_after_expiry(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for name in ("README.md", "llms.txt", os.path.join("skills", "nano-invoice", "SKILL.md")):
+            with open(os.path.join(root, name), encoding="utf-8") as f:
+                text = f.read()
+            self.assertIn("`short`" if name != "llms.txt" else '"short"', text, name)
+            self.assertIn("after", text, name)
+            self.assertNotIn("Underpaid closes the invoice:", text, name)
 
 
 class TestBinding(Base):
@@ -631,6 +690,15 @@ class TestUpgradeAnOlderDatabase(Base):
         witnessed = ni.create_invoice(MERCHANT, XNO // 4, "order-witnessed",
                                       store=store, now=T0, witness_at=T0 + 30)
         self.assertEqual(witnessed.witness_at, T0 + 30)
+
+    def test_a_database_without_short_sends_opens_and_remembers_short_sends(self):
+        inv = self.invoice("order-before-short-sends", expires_s=600)
+        self.store.conn.execute("DROP TABLE short_sends")  # the shape 5053d7f and earlier wrote
+        self.store.close()
+        self.store = ni.Store(self.db)
+        real, _ = self.ledger.send(BUYER, MERCHANT, inv.pay_raw - 10 ** 29, T0 + 10)
+        self.check(inv, now=T0 + 20)
+        self.assertEqual([r["send_block"] for r in self.store.pending_shorts(inv.id)], [real])
 
     def test_migrating_twice_is_a_no_op(self):
         inv = self.invoice("order-1")
