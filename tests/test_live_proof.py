@@ -134,6 +134,25 @@ class ProofHarness(unittest.TestCase):
         self.assertNotIn("3. receipt", self.out.getvalue())
         self.assertIn("gave up after", self.out.getvalue())
 
+    def test_a_short_payment_is_reported_not_given_up_on(self):
+        """A send below the amount keeps the invoice open; the run must say a short
+        payment arrived, not that nothing did."""
+        inv_id = core.invoice_id_for(MERCHANT, core.order_key_hash("proof-order"))
+        clock = [self.t0]
+
+        def sleep(s):
+            clock[0] += s
+            if len(self.ledger.blocks) == 0:
+                inv = self.store.get(inv_id)
+                self.ledger.send(BUYER, MERCHANT, inv.pay_raw - 10 ** 20, self.t0 + 5)
+
+        facts = self._run(sleep=sleep, clock=lambda: clock[0], poll_s=30, timeout_s=60)
+        self.assertFalse(facts["settled"])
+        self.assertEqual(facts["state"], "open")
+        self.assertEqual([o["sender"] for o in facts["short"]], [BUYER])
+        self.assertNotIn("gave up after", self.out.getvalue())
+        self.assertIn("short payment", self.out.getvalue())
+
     def test_an_unconfirmed_payment_is_not_reported_as_settled(self):
         """The harness must not call an unconfirmed block proof of anything."""
         inv_id = core.invoice_id_for(MERCHANT, core.order_key_hash("proof-order"))

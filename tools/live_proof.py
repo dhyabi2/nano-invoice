@@ -50,6 +50,19 @@ def run_proof(rpc, merchant, amount_raw, order_key, store, out=sys.stdout,
         _emit(out, 2, f"ledger read #{polls} - state {state}", result)
         if state in SETTLED or state == "expired":
             break
+        short = [o for o in result["observations"] if o.get("outcome") == "short"]
+        if short:
+            # A send below pay_raw keeps the invoice open (dust must not close
+            # it), so waiting for a settled state would only end in "gave up".
+            _emit(out, 3, "short payment: below the amount asked, invoice left open", {
+                "invoice_id": inv.id, "pay_raw": str(inv.pay_raw), "short_sends": short,
+                "what_happens": ("the invoice stays payable until expires_at; if no exact "
+                                 "payment arrives, a check after expiry closes it underpaid "
+                                 "and every short send becomes a refund to its sender")})
+            out.write(f"\n-- a short payment arrived ({len(short)} send(s) below "
+                      f"{inv.pay_raw} raw carrying tag {inv.tag}); the invoice is still open.\n")
+            return {"settled": False, "short": short, "invoice_id": inv.id, "polls": polls,
+                    "state": state}
         if clock() >= deadline:
             out.write(f"\n-- gave up after {timeout_s}s with the invoice still open; "
                       f"no payment matching tag {inv.tag} arrived.\n")
