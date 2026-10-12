@@ -87,7 +87,7 @@ prints this, here re-wrapped (offline; the tag differs per run, the invoice id f
    `exact` payment of that amount to this request and no other. The same request id returns the
    same invoice, so a repeated 402 quotes the same amount.
 2. **On the retry**, look up the invoice you issued for this request (the same request id returns
-   it) and call `settle_nano(payment, store, inv.id, rpc)`. The invoice id in
+   it; if you key per issuance, `<request id>|<attempt>`, see below, keep the attempt too) and call `settle_nano(payment, store, inv.id, rpc)`. The invoice id in
    `accepted.extra.invoiceId` is the buyer's to write, so a payload naming any other invoice, even
    a paid one for a cheaper request, is refused as `wrong_invoice`. Then it runs `check_invoice` against the Nano
    ledger, and returns `serve: true` only for `paid` (or `overpaid`, with the excess as a refund
@@ -107,22 +107,30 @@ remember that a request was already served: a settled block hash is public, so s
 invoice once on your side. The buyer's client must pay `amount` exactly; a client that rounds
 the price drops the tag and the payment matches nothing (see **Limits** below).
 
-**Know this before you mount it: the 402 publishes the tag, and underpaid is final.** The entry's
-`amount` *is* `pay_raw`, so its low six digits are the tag — public to everyone who reads the
-challenge, not only to the buyer. A confirmed send whose amount ends in that tag and is below
-`pay_raw` closes the invoice `underpaid`, and the cheapest such amount is the tag itself
-(~1e-25 XNO); Nano has no fee, so that send costs nothing. The genuine payment that follows is
-then recorded `duplicate` and refunded, and `settle_nano` answers `serve: false`,
-`reason: "underpaid"`. The remedy **Limits** gives for an underpaid invoice — "issue a new
-invoice (new order key)" — is not available in this flow as written, because the order key is
-the request id and `create_invoice` is idempotent on it: the retry returns the same,
-permanently-underpaid invoice, so that request can never be paid by anybody. If you serve
-requests an untrusted caller can see, derive the order key per *issuance* rather than per
-request (`<request id>|<attempt>`), accepting that each 402 then quotes a different amount, and
-reconcile the attempts yourself. `tests/test_x402_seller_example.py`
-(`test_the_published_tag_lets_a_stranger_close_the_request_with_dust`) measures the whole
-sequence. Whether `underpaid` should stay final is a deliberate design decision in `core.py`
-and is not changed here.
+**Know this before you mount it: the tag is public, and underpaid is final.** The entry's
+`amount` *is* `pay_raw`, so its low six digits are the tag, public to everyone who reads the
+challenge. It is also public to anyone watching the merchant's account once the buyer
+broadcasts, because the amount is on the ledger. A confirmed send whose amount ends in that tag
+and is below `pay_raw` closes the invoice `underpaid`. The cheapest such amount is the tag itself
+(at most about 1e-24 XNO; the tag is at most 999999 raw), and Nano has no fee, so that send costs
+nothing. The buyer's exact payment is then recorded `duplicate`, and `settle_nano` answers
+`serve: false`, `reason: "underpaid"`. Seeing the buyer's send first does not stop an attacker:
+
+- `scan` orders sends by `(block_ts, send_block)` and the node's `local_timestamp` has 1-second
+  resolution, so a dust send in the same second whose block hash sorts lower is bound first.
+- `check_invoice` skips unconfirmed sends, so a dust send that confirms before the buyer's
+  closes the invoice, and the buyer's payment becomes `duplicate`.
+
+The remedy **Limits** gives for an underpaid invoice, "issue a new invoice (new order key)", is
+not available in this flow as written: the order key is the request id and `create_invoice` is
+idempotent on it, so the retry returns the same underpaid invoice. Keying per *issuance*
+(`<request id>|<attempt>`) only makes a retry possible; it does not prevent the attack, since an
+attacker can dust each new tag. Every new 402 also holds a tag until its invoice expires, so
+unauthenticated callers can push the merchant toward `TagsExhausted`. Today the merchant's remedy
+is to refund the buyer's `duplicate` payment. The real fix is a library change (an underpaid send
+below `amount_raw` not closing the invoice, or preferring the send of exactly `pay_raw`); it is
+not made yet. `tests/test_x402_seller_example.py`
+(`test_the_published_tag_lets_a_stranger_close_the_request_with_dust`) shows the sequence.
 
 ## How the binding works
 

@@ -110,8 +110,7 @@ class X402Seller(unittest.TestCase):
         the tag is public to everyone who reads the challenge, not just to the
         buyer. A send whose amount ends in that tag and is below `pay_raw` is
         recorded `underpaid`, and underpaid is final. The cheapest such amount
-        is the tag itself -- here 9e-26 XNO -- and Nano has no fee, so the send
-        costs nothing at all.
+        is the tag itself, and Nano has no fee, so the send costs nothing.
 
         Documented behaviour on its own (README, "Limits": "Underpaid closes
         the invoice: issue a new invoice (new order key)"). What this test

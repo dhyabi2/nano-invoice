@@ -18,13 +18,13 @@ $ python3 -m py_compile nano_invoice/*.py tests/*.py tools/*.py examples/*.py   
 `examples/x402_seller.py` is the newest code in the repository (#15) and the
 only part of it that an untrusted party can see the output of. Its
 `nano_accepts_entry` advertises the invoice's `pay_raw` as the entry's
-`amount` (`x402_seller.py:46`) — which is the whole point of the design, since
+`amount` (`x402_seller.py:63`) — which is the whole point of the design, since
 an `exact` payment of that amount is what names this request. The consequence
 is that **the tag is public to everyone who reads the 402**, not only to the
 buyer: it is the low six digits of a number published in the challenge.
 
 A confirmed send whose amount ends in that tag and is below `pay_raw` is
-recorded `underpaid` (`core.py:688`), and `underpaid` is final. The cheapest
+recorded `underpaid` (`core.py:689`), and `underpaid` is final. The cheapest
 such amount is the tag itself, and Nano has no fee, so the send costs nothing
 whatsoever. Measured against the in-memory ledger:
 
@@ -68,13 +68,23 @@ decision and nothing more.
 What this PR does is make the limit true where it is stated and impossible to
 rediscover in production:
 
-- `README.md`, the x402 section: the limit stated plainly, with the cost of the
-  attack, what `settle_nano` answers, why the documented remedy is unavailable,
-  and the workaround that needs no change to `core.py` — derive the order key
-  per *issuance* (`<request id>|<attempt>`) rather than per request, accepting
-  that each 402 then quotes a different amount.
-- `examples/x402_seller.py` module docstring: the same, where someone mounting
-  the glue will actually read it.
+- `README.md`, the x402 section: the limit stated plainly. The tag is public
+  in the 402 and, once the buyer broadcasts, to anyone watching the merchant's
+  account, since the amount is on the ledger. So seeing the buyer's send does
+  not protect it: a dust send in the same second whose block hash sorts lower
+  is bound first (`scan` sorts by `(block_ts, send_block)`, `core.py:634`, and
+  `local_timestamp` has 1-second resolution), and `check_invoice` skips
+  unconfirmed sends (`core.py:670`), so a dust send that confirms first closes
+  the invoice and the buyer's exact payment becomes `duplicate`. Keying per
+  issuance (`<request id>|<attempt>`) only makes a retry possible; it does not
+  prevent the attack (an attacker can dust each new tag), and every new 402
+  holds a tag until expiry, so unauthenticated callers can push toward
+  `TagsExhausted`. The merchant's remedy today is to refund the buyer's
+  `duplicate` payment. The real fix is a library change (an underpaid send
+  below `amount_raw` not closing the invoice, or preferring the exact
+  `pay_raw` send); it is not in this PR.
+- `examples/x402_seller.py` module docstring: the same, shorter, where someone
+  mounting the glue will actually read it.
 - `tests/test_x402_seller_example.py`: one test,
   `test_the_published_tag_lets_a_stranger_close_the_request_with_dust`, that
   walks the whole measured sequence — the tag is the low six digits of the
@@ -101,7 +111,7 @@ $ python3 -m py_compile nano_invoice/*.py tests/*.py tools/*.py examples/*.py   
   against the public node (read-only): it prints
   `ask the buyer to send exactly 250000000000000000000000563128 raw to nano_1yo6…`
   then `open [] []`, which is exactly what the README says it prints.
-- **`xno_to_raw` (`core.py:98`)** does the decimal multiplication inside
+- **`xno_to_raw` (`core.py:90`)** does the decimal multiplication inside
   `localcontext()` with `ctx.prec = 100`, so the default 28 digits cannot
   silently round raw away — the hazard TIER0 names, already closed here, with
   the comment naming it. `require_raw` refuses a bool and a float by type
