@@ -150,8 +150,27 @@ class ProofHarness(unittest.TestCase):
         self.assertFalse(facts["settled"])
         self.assertEqual(facts["state"], "open")
         self.assertEqual([o["sender"] for o in facts["short"]], [BUYER])
-        self.assertNotIn("gave up after", self.out.getvalue())
+        self.assertNotIn("no payment matching tag", self.out.getvalue())
         self.assertIn("short payment", self.out.getvalue())
+
+    def test_dust_before_the_exact_payment_does_not_end_the_run(self):
+        """Anyone can send `tag` raw for free; the run must keep waiting for the buyer."""
+        inv_id = core.invoice_id_for(MERCHANT, core.order_key_hash("proof-order"))
+        clock, sent = [self.t0], []
+
+        def sleep(s):
+            clock[0] += s
+            sent.append(s)
+            inv = self.store.get(inv_id)
+            if len(sent) == 1:
+                self.ledger.send(account("dust"), MERCHANT, inv.tag, self.t0 + 5)
+            elif len(sent) == 2:
+                self.ledger.send(BUYER, MERCHANT, inv.pay_raw, self.t0 + 10)
+
+        facts = self._run(sleep=sleep, clock=lambda: clock[0], poll_s=5, timeout_s=60)
+        self.assertTrue(facts["settled"])
+        self.assertEqual(facts["state"], "paid")
+        self.assertEqual(self.store.get(inv_id).sender, BUYER)
 
     def test_an_unconfirmed_payment_is_not_reported_as_settled(self):
         """The harness must not call an unconfirmed block proof of anything."""
