@@ -17,6 +17,19 @@ nano-invoice does not speak x402. This file is the glue, and it is all of it:
 The USDC entry is passed through unchanged and is never read here: it is still
 verified and settled by the seller's existing facilitator.
 
+One limit to read before mounting this, because this flow cannot recover from
+it: the entry's `amount` IS `pay_raw`, so its low six digits are the invoice's
+tag, and the tag is therefore public to anyone who reads the 402. A confirmed
+send ending in that tag and below `pay_raw` closes the invoice `underpaid`,
+which is final; the cheapest one is the tag itself and Nano has no fee, so it
+costs nothing. The genuine payment is then a `duplicate` and `settle_nano`
+answers `serve: false, reason: "underpaid"`. The README's remedy for an
+underpaid invoice - a new order key - is unavailable here, because the order
+key is the request id and `create_invoice` is idempotent on it. Serving
+requests an untrusted caller can see means deriving the order key per
+ISSUANCE (`<request id>|<attempt>`) and reconciling the attempts yourself.
+See `tests/test_x402_seller_example.py`.
+
     python3 examples/x402_seller.py --merchant nano_1... --amount-xno 0.0001
 
 prints the 402 body for one request, offline (the invoice goes into a temporary

@@ -107,6 +107,23 @@ remember that a request was already served: a settled block hash is public, so s
 invoice once on your side. The buyer's client must pay `amount` exactly; a client that rounds
 the price drops the tag and the payment matches nothing (see **Limits** below).
 
+**Know this before you mount it: the 402 publishes the tag, and underpaid is final.** The entry's
+`amount` *is* `pay_raw`, so its low six digits are the tag — public to everyone who reads the
+challenge, not only to the buyer. A confirmed send whose amount ends in that tag and is below
+`pay_raw` closes the invoice `underpaid`, and the cheapest such amount is the tag itself
+(~1e-25 XNO); Nano has no fee, so that send costs nothing. The genuine payment that follows is
+then recorded `duplicate` and refunded, and `settle_nano` answers `serve: false`,
+`reason: "underpaid"`. The remedy **Limits** gives for an underpaid invoice — "issue a new
+invoice (new order key)" — is not available in this flow as written, because the order key is
+the request id and `create_invoice` is idempotent on it: the retry returns the same,
+permanently-underpaid invoice, so that request can never be paid by anybody. If you serve
+requests an untrusted caller can see, derive the order key per *issuance* rather than per
+request (`<request id>|<attempt>`), accepting that each 402 then quotes a different amount, and
+reconcile the attempts yourself. `tests/test_x402_seller_example.py`
+(`test_the_published_tag_lets_a_stranger_close_the_request_with_dust`) measures the whole
+sequence. Whether `underpaid` should stay final is a deliberate design decision in `core.py`
+and is not changed here.
+
 ## How the binding works
 
 ```

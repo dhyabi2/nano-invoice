@@ -13,6 +13,7 @@ from tests.fake_ledger import FakeLedger, account
 XNO = 10 ** 30
 MERCHANT = account("x402-merchant")
 BUYER = account("x402-buyer")
+STRANGER = account("x402-stranger")      # anyone who merely read the 402
 T0 = 1_800_000_000
 USDC = {"scheme": "exact", "network": "eip155:8453", "asset": "0xUSDC", "amount": "10000",
         "payTo": "0xSELLER", "maxTimeoutSeconds": 60}
@@ -101,6 +102,47 @@ class X402Seller(unittest.TestCase):
         r = self.settle(paid_cheap)          # retried on req-1, whose invoice is self.inv
         self.assertFalse(r["serve"])
         self.assertEqual(r["reason"], "wrong_invoice")
+
+    def test_the_published_tag_lets_a_stranger_close_the_request_with_dust(self):
+        """Measured, and pinned because the x402 flow cannot recover from it.
+
+        The 402's `amount` IS `pay_raw`, so its low six digits are the tag:
+        the tag is public to everyone who reads the challenge, not just to the
+        buyer. A send whose amount ends in that tag and is below `pay_raw` is
+        recorded `underpaid`, and underpaid is final. The cheapest such amount
+        is the tag itself -- here 9e-26 XNO -- and Nano has no fee, so the send
+        costs nothing at all.
+
+        Documented behaviour on its own (README, "Limits": "Underpaid closes
+        the invoice: issue a new invoice (new order key)"). What this test
+        pins is that the x402 remedy is NOT available: the order key is the
+        request id and `create_invoice` is idempotent on it, so the retry
+        returns the same, permanently-underpaid invoice. The request can never
+        be paid, by anybody.
+        """
+        tag = self.inv.tag
+        self.assertEqual(int(x.nano_accepts_entry(self.inv)["amount"]) % ni.TAG_MODULUS, tag)
+
+        self.ledger.send(STRANGER, MERCHANT, tag, T0 + 10)       # free, and enough
+        self.assertEqual(ni.check_invoice(self.inv, rpc=self.ledger, store=self.store,
+                                          now=T0 + 20)["invoice"]["state"], "underpaid")
+
+        # The real buyer now pays the advertised amount, exactly.
+        send, _ = self.ledger.send(BUYER, MERCHANT, self.inv.pay_raw, T0 + 30)
+        after = ni.check_invoice(self.inv, rpc=self.ledger, store=self.store, now=T0 + 40)
+        self.assertEqual(after["invoice"]["state"], "underpaid")
+        exact = [o for o in after["observations"] if o["send_block"] == send]
+        self.assertEqual([o["outcome"] for o in exact], ["duplicate"])
+
+        r = self.settle(self.payment(block=send), now=T0 + 50)
+        self.assertFalse(r["serve"])
+        self.assertEqual(r["reason"], "underpaid")
+
+        # And the README's remedy is unreachable here: same request id, same invoice.
+        again = ni.create_invoice(MERCHANT, XNO // 10000, "req-1", 300,
+                                  store=self.store, now=T0 + 60)
+        self.assertEqual(again.id, self.inv.id)
+        self.assertEqual(self.store.get(again.id).state, "underpaid")
 
     def test_cli_prints_the_402_offline(self):
         buf = io.StringIO()
