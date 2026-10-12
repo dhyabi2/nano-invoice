@@ -78,7 +78,7 @@ rediscover in production:
   the invoice and the buyer's exact payment becomes `duplicate`. Keying per
   issuance (`<request id>|<attempt>`) only makes a retry possible; it does not
   prevent the attack (an attacker can dust each new tag), and every new 402
-  holds a tag until expiry, so unauthenticated callers can push toward
+  holds a tag until expiry plus the 7-day quarantine (`core.py:31`), so unauthenticated callers can push toward
   `TagsExhausted`. The merchant's remedy today is to refund the buyer's
   `duplicate` payment. The real fix is a library change (an underpaid send
   below `amount_raw` not closing the invoice, or preferring the exact

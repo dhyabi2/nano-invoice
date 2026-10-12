@@ -30,7 +30,7 @@ send first does not help: `scan` orders by (block_ts, send_block) with
 first, and `check_invoice` skips unconfirmed sends, so a dust send that
 confirms first wins. Keying per issuance (`<request id>|<attempt>`) only makes
 a retry possible; an attacker can dust each new tag, and every 402 holds a tag
-until expiry, so unauthenticated callers can push toward `TagsExhausted`.
+until expiry plus the 7-day quarantine, so unauthenticated callers can push toward `TagsExhausted`.
 Today the remedy is to refund the buyer's `duplicate` payment; the real fix is
 a library change that is not made here. See the README and
 `tests/test_x402_seller_example.py`.
