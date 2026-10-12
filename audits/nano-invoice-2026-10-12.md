@@ -18,7 +18,7 @@ $ python3 -m py_compile nano_invoice/*.py tests/*.py tools/*.py examples/*.py   
 `examples/x402_seller.py` is the newest code in the repository (#15) and the
 only part of it that an untrusted party can see the output of. Its
 `nano_accepts_entry` advertises the invoice's `pay_raw` as the entry's
-`amount` (`x402_seller.py:63`) — which is the whole point of the design, since
+`amount` (`x402_seller.py:66`) — which is the whole point of the design, since
 an `exact` payment of that amount is what names this request. The consequence
 is that **the tag is public to everyone who reads the 402**, not only to the
 buyer: it is the low six digits of a number published in the challenge.
@@ -78,7 +78,11 @@ rediscover in production:
   the invoice and the buyer's exact payment becomes `duplicate`. Keying per
   issuance (`<request id>|<attempt>`) only makes a retry possible; it does not
   prevent the attack (an attacker can dust each new tag), and every new 402
-  holds a tag until expiry plus the 7-day quarantine (`core.py:31`), so unauthenticated callers can push toward
+  holds a tag while its invoice is open (`core.py:480`), which lasts until
+  `check_invoice` (`core.py:697-700`) or `Store.expire` (`core.py:361`) runs
+  on it after expiry, and then for the 7-day quarantine (`core.py:31`). There
+  is no built-in sweep, so an abandoned 402 nobody checks holds its tag until
+  the merchant expires it, and unauthenticated callers can push toward
   `TagsExhausted`. The merchant's remedy today is to refund the buyer's
   `duplicate` payment. The real fix is a library change (an underpaid send
   below `amount_raw` not closing the invoice, or preferring the exact

@@ -125,9 +125,10 @@ The remedy **Limits** gives for an underpaid invoice, "issue a new invoice (new 
 not available in this flow as written: the order key is the request id and `create_invoice` is
 idempotent on it, so the retry returns the same underpaid invoice. Keying per *issuance*
 (`<request id>|<attempt>`) only makes a retry possible; it does not prevent the attack, since an
-attacker can dust each new tag. Every new 402 also holds a tag until its invoice expires and then for the
-7-day quarantine after it closes, so
-unauthenticated callers can push the merchant toward `TagsExhausted`. Today the merchant's remedy
+attacker can dust each new tag. Every new 402 also holds a tag while its invoice is open, which
+lasts until `check_invoice` (or `Store.expire`) runs on it after expiry, and then for the 7-day
+quarantine. There is no built-in sweep, so an abandoned 402 nobody checks holds its tag until you expire it, and unauthenticated
+callers can push the merchant toward `TagsExhausted`. Today the merchant's remedy
 is to refund the buyer's `duplicate` payment. The real fix is a library change (an underpaid send
 below `amount_raw` not closing the invoice, or preferring the send of exactly `pay_raw`); it is
 not made yet. `tests/test_x402_seller_example.py`
