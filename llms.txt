@@ -7,7 +7,7 @@ Nano blocks carry no memo. nano-invoice gives each order a unique exact amount: 
 ## Use
 - create_invoice(merchant, amount_raw:int, order_key, expires_s, store=Store(path)) -> Invoice; idempotent per order_key; floats/bools refused; xno_to_raw("0.25") converts exactly.
 - check_invoice(invoice, store=..., rpc="https://rpc.nano.to", own_accounts=[...], not_income={account: reason}) -> {invoice, observations, refunds}
-- States: open -> paid | underpaid | overpaid | expired (all final). Faucet/own-account blocks are reported as not_income and never pay.
+- States: open -> paid | underpaid | overpaid | expired (all final). A send below pay_raw is observation outcome "short" and leaves the invoice open (dust cannot lock out the buyer); it is remembered, refunded as a duplicate if the invoice is paid, and closes it underpaid only on a check after expires_at + CLOCK_SKEW_S. Check open invoices again after expiry. Faucet/own-account blocks are reported as not_income and never pay.
 - refund_instruction(...) / refund_hints(store, id) -> {to (chain sender), amount_raw, reason, source_block}; instructions only.
 - receipt(invoice, store) -> JSON with the block_info calls that reproduce it; verify_receipt(receipt, rpc) re-checks from the public ledger alone: the id, the tag arithmetic, the ledger claims, and that the settling block's local_timestamp falls inside the invoice's created_at..expires_at window (+-CLOCK_SKEW_S).
 - CLI: nano-invoice create|check|receipt|verify|verify-log|verdict|tombstone|ack-verify|ack-read|refund-hint|show (JSON output).

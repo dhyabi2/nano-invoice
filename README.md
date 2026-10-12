@@ -93,13 +93,15 @@ prints this, here re-wrapped (offline; the tag differs per run, the invoice id f
    ledger, and returns `serve: true` only for `paid` (or `overpaid`, with the excess as a refund
    instruction). A block hash in the payload is compared with the block the ledger settled and is
    never trusted on its own; `underpaid`, `open` and `expired` are refused, with any refund owed
-   addressed to the account the ledger says sent it.
+   addressed to the account the ledger says sent it. A send below the amount leaves the invoice
+   `open` (its observation is `short`), so the buyer can still pay exactly; it is refunded once the
+   invoice is paid, or when a check after expiry closes it `underpaid`.
 3. **The USDC entry is not touched.** The example passes it through and never reads it; it is
    still verified and settled by the seller's existing facilitator.
 
 `tests/test_x402_seller_example.py` runs this against the in-memory ledger: the 402 shape, an
-exact payment served, a round untagged amount not matched, an underpaid payment refused with its
-refund, a claimed block that is not the settling block refused, a paid invoice for another request refused.
+exact payment served, a round untagged amount not matched, a short payment refused and the
+invoice left open, then closed underpaid with its refund after expiry, a claimed block that is not the settling block refused, a paid invoice for another request refused.
 
 What this does not do: it does not decode the `PAYMENT-SIGNATURE` header (pass it the decoded
 JSON), it does not sign or broadcast the payment (the buyer's wallet does), and it does not
@@ -117,6 +119,7 @@ pay_raw = amount_raw + tag        (1 XNO = 10**30 raw; all amounts are Python in
 - The tag (1..999999) is unique among the merchant's open invoices (enforced by a unique index, not only by the allocator) and is not reused for 7 days after its invoice closes, so a late payment for an old invoice cannot settle a new one.
 - `create_invoice` is idempotent on `(merchant, order_key)`: the same key returns the same invoice forever, and the same key with a different price raises `OrderConflict`. The invoice id is `inv_ + sha256("nano-invoice/v1|" + merchant + "|" + sha256(order_key))[:32]`, so anyone holding the order key can re-derive it. The order key itself is never stored, only its hash. Note what this binding is *not*: it is idempotency (same key, same invoice), not a cryptographic single-use signature. `order_key` decides *which order a block settles*; it does not by itself prove *which answer* that order was for — proving the answer leg is the separate signed fulfillment record's job, and nano-invoice deliberately does not overclaim it.
 - `check_invoice` reads the merchant's `receivable` and `account_history`, keeps blocks whose amount ends in the tag, then reads `block_info` for the receive and its send. A block settles the invoice only if the send is confirmed, addressed to the merchant, sent after the invoice was created and before it expired, not from the merchant's own accounts or a configured not-income list (faucets, tests, internal transfers), and not already bound to any invoice.
+- A confirmed, in-time send below `pay_raw` does **not** close an open invoice. The tag is public as soon as the buyer broadcasts, so anyone could send dust carrying it; closing on it would lock the real buyer out. Such a send is reported with outcome `short` and remembered in the store. If an exact (or larger) payment arrives, the short send becomes a `duplicate` refund. If none has arrived by `expires_at + CLOCK_SKEW_S`, the next check closes the invoice `underpaid` on the earliest short send (any others are duplicates), even if a busy account has since pushed it out of the `max_blocks` window; `Store.expire` records remembered short sends as duplicates. So **check (or sweep with `check_invoice`) every open invoice after it expires**: until then a short payment has no refund instruction.
 - States: `open -> paid | underpaid | overpaid | expired`. Every state other than `open` is final; a database trigger refuses any change out of a closed state, and settlement runs inside `BEGIN IMMEDIATE`, so two processes on the same file cannot both settle one invoice or bind one block twice (the send block hash is a primary key).
 - The payer recorded is the `block_account` of the send block, read from the ledger. Refund instructions go to that account. A payer that someone *claims* is ignored and reported as ignored.
 - Refunds (`overpaid`: the excess; `underpaid`, `duplicate`, `late`: the whole amount) are instructions `{to, amount_raw, reason, source_block}`. Your wallet sends them, or not.
@@ -243,11 +246,11 @@ unconfirmed block settled. Only the payment is missing from a run here.
 
 - **The payer must send the exact amount.** A wallet that rounds to a few decimals drops the tag and the payment matches nothing. Give the buyer `pay_raw` in raw (or as a full-precision `nano:` URI); a payment that matches no tag is not recorded by nano-invoice at all and needs a human or a manual refund.
 - **Two open invoices cannot share a tag**, so one merchant account can have at most 999,999 open invoices (fewer, counting the 7-day quarantine). Use several receiving accounts if you need more.
-- An off-by-a-few-raw payment can carry another open invoice's tag. It will not *pay* that invoice unless it is exact; it is recorded against it as underpaid or overpaid and gets a refund instruction. Random tag allocation makes this unlikely, not impossible.
+- An off-by-a-few-raw payment can carry another open invoice's tag. It will not *pay* that invoice unless it is exact; it is recorded against it as overpaid, or (if short) reported as `short` and later as underpaid or a duplicate, and gets a refund instruction. Random tag allocation makes this unlikely, not impossible.
 - "Sent after the invoice was created" uses the node's `local_timestamp` of the send, with 120 s of tolerance. A node that does not report timestamps cannot prove timing, and such blocks are ignored rather than trusted.
 - The scan reads at most `max_blocks` (default 1000) history entries per check. A very busy merchant account should check often or use a dedicated receiving account.
 - A receipt proves that a confirmed send of exactly `pay_raw` went from `sender` to `merchant`. That this amount meant *this order* rests on the issuer's tag allocation; anyone holding the order key can re-derive the invoice id, but not the issuer's store.
-- Underpaid closes the invoice: issue a new invoice (new order key) and refund the short payment.
+- A short payment does not close the invoice until it expires; then the first check after `expires_at + CLOCK_SKEW_S` closes it `underpaid`. Underpaid is final: issue a new invoice (new order key) and refund the short payment. A short send that was never checked before the invoice closed some other way is still refunded as a `duplicate`, never called `late`.
 
 ## Agent skill bundle
 
