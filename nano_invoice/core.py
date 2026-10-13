@@ -873,6 +873,109 @@ def refund_hints(store, invoice_id):
     return hints
 
 
+# ------------------------------------------------- four fields, independently
+
+DUPLICATE_KINDS = ("duplicate", "late")
+
+
+def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
+                      acceptance_rule=nano_sig.ACCEPTANCE_RULE_V1):
+    """Four fields for one invoice, each read on its own (SquidGibblets, Moltbook comment
+    18bc1c8a: "settlement, duplicate/refund disposition, delivered evidence, and payer-signed
+    acceptance").
+
+    - `settlement`: the invoice's state and the one send block that settled it.
+    - `duplicates`: every later transfer bound to this invoice as duplicate/late, each with
+      its refund disposition. A duplicate's hash is never evidence of work: it appears here
+      and nowhere else.
+    - `delivered_evidence`: the output_commitment (given, or the latest verdict's in the log),
+      or None.
+    - `payer_acceptance`: the verdict of the payer's current delivery-ack/v3 bound to THIS
+      invoice id, the settling send block, that output_commitment and `acceptance_rule`.
+      With no such ack, or none that verifies, it is "unknown" with a reason - never
+      "failed". v1/v2 acks bind no order or rule and are listed as not counted.
+    """
+    store = _require_store(store)
+    inv = store.get(invoice)
+    payments = store.payments_for(inv.id)
+    settling = [p for p in payments if p["kind"] in SETTLING_KINDS]
+    settle_refund = refund_instruction(settling[0], store=store) if settling else None
+    settlement = {
+        "state": inv.state, "send_block": inv.send_block, "sender": inv.sender,
+        "pay_raw": str(inv.pay_raw),
+        "received_raw": str(inv.received_raw) if inv.received_raw is not None else None,
+        "refund": dict(settle_refund, amount_raw=str(settle_refund["amount_raw"]))
+        if settle_refund else None,
+    }
+    duplicates = []
+    for p in payments:
+        if p["kind"] not in DUPLICATE_KINDS:
+            continue
+        r = refund_instruction(p, store=store)
+        duplicates.append({
+            "send_block": p["send_block"], "sender": p["sender"], "amount_raw": str(p["amount_raw"]),
+            "kind": p["kind"], "reason": p["reason"],
+            "disposition": "refund_owed",
+            "refund": dict(r, amount_raw=str(r["amount_raw"])),
+            "note": "instruction only: whether the refund was sent is not recorded here; "
+                    "this transfer is not evidence of completed work",
+        })
+    evidence, source = output_commitment, "given" if output_commitment else None
+    if evidence is None:
+        for rec in reversed(store.log(inv)):
+            oc = rec.get("kind") == "verdict" and (rec.get("body") or {}).get("output_commitment")
+            if oc:
+                evidence, source = oc, f"log verdict seq {rec.get('seq')}"
+                break
+    delivered_evidence = ({"output_commitment": evidence, "source": source}
+                          if evidence else None)
+
+    counted, not_counted = [], []
+    for i, a in enumerate(acks or ()):
+        if isinstance(a, dict) and a.get("version") == 3:
+            counted.append((i, a))
+        else:
+            not_counted.append({"index": i, "reason": "not_v3: binds no order id or acceptance rule"})
+
+    def unknown(reason, **extra):
+        return dict({"state": "unknown", "reason": reason, "acceptance_rule": acceptance_rule,
+                     "order_id": inv.id, "not_counted": not_counted}, **extra)
+
+    if inv.send_block is None:
+        acceptance = unknown("not_settled")
+    elif evidence is None:
+        acceptance = unknown("no_delivered_evidence")
+    elif not counted:
+        acceptance = unknown("no_v3_ack")
+    else:
+        r = nano_sig.read_payer_acks(inv.sender, evidence, inv.send_block, [a for _, a in counted],
+                                     order_id=inv.id, acceptance_rule=acceptance_rule)
+        remap = [i for i, _ in counted]
+        ignored = [dict(e, index=remap[e["index"]]) for e in r["ignored"]]
+        if not r["ok"]:
+            acceptance = unknown("no_v3_ack_verifies", ignored=ignored)
+        else:
+            acceptance = {
+                "state": r["verdict"], "payer": inv.sender, "order_id": inv.id,
+                "send_block": inv.send_block, "acceptance_rule": acceptance_rule,
+                "current": dict(r["current"], index=remap[r["current"]["index"]]),
+                "superseded": [dict(e, index=remap[e["index"]]) for e in r["superseded"]],
+                "ignored": ignored, "not_counted": not_counted,
+            }
+    return {
+        "invoice_id": inv.id,
+        "settlement": settlement,
+        "duplicates": duplicates,
+        "delivered_evidence": delivered_evidence,
+        "payer_acceptance": acceptance,
+        "proves": "payer_acceptance, when not unknown: the holder of the payer account's key "
+                  "signed this verdict for this invoice id, settling send block, output digest "
+                  "and acceptance rule",
+        "does_not_prove": "that the output was objectively correct, that the signer was "
+                          "authorised by a human operator, or that no off-ledger dispute exists",
+    }
+
+
 # ---------------------------------------------------------------- receipts
 
 def witness_payload(invoice, store=None, witness_channel=None):

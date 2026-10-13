@@ -1,9 +1,11 @@
-"""nano-invoice create|check|receipt|verify|verify-log|verdict|tombstone|role-check|ack-verify|ack-read|rep-check|refund-hint|show.
+"""nano-invoice create|check|receipt|verify|verify-log|verdict|tombstone|role-check|ack-verify|ack-read|acceptance|rep-check|refund-hint|show.
 
 JSON on stdout. Exit 0 on a sound answer, 1 on a receipt or log that does not
 verify, 2 on a usage or document error, 3 on an RPC failure - and, for
 `ack-verify` (offline, no RPC), 3 on a payer acknowledgment that does not verify;
 for `ack-read` (offline), 3 when no ack in the list verifies under the payer.
+`acceptance` (offline, reads the store) exits 0 whatever it reports: a missing or
+invalid payer ack reads "unknown", which is an answer, not a failure.
 `rep-check` exits 0 only when the representative matches and the block is
 confirmed (before --delivered-at, when given), 1 otherwise."""
 import argparse
@@ -104,6 +106,18 @@ def build_parser():
     ar.add_argument("output_commitment", help="sha256 of the delivered artifact, 64 hex")
     ar.add_argument("block_hash", help="the settling send block's hash, 64 hex")
     ar.add_argument("acks", help="JSON file (or - for stdin): a list of acks")
+
+    ac = sub.add_parser("acceptance", help="settlement, duplicates, delivered evidence and payer "
+                                           "acceptance for one invoice, each reported on its own "
+                                           "(offline)")
+    ac.add_argument("--invoice", required=True)
+    ac.add_argument("--acks", help="JSON file (or - for stdin): a list of payer acks; only "
+                                   "delivery-ack/v3 counts as acceptance")
+    ac.add_argument("--output-commitment", help="sha256 of what was delivered (default: the "
+                                                "latest verdict's in the log)")
+    ac.add_argument("--acceptance-rule", default=nano_sig.ACCEPTANCE_RULE_V1,
+                    help=f"the rule-version string a v3 ack must bind "
+                         f"(default {nano_sig.ACCEPTANCE_RULE_V1})")
 
     rc = sub.add_parser("rep-check", help="hold a block's representative to "
                                           "nano_address(sha256(scope)), read-only")
@@ -270,6 +284,15 @@ def main(argv=None):
                     if h["to"] != claimed:
                         h["ignored_claimed_payer"] = args.claimed_payer
             _out({"invoice_id": args.invoice, "refunds": hints})
+        elif args.cmd == "acceptance":
+            acks = ()
+            if args.acks:
+                src = sys.stdin if args.acks == "-" else open(args.acks)
+                with src:
+                    acks = json.load(src)
+            _out(core.acceptance_fields(args.invoice, store=store, acks=acks,
+                                        output_commitment=args.output_commitment,
+                                        acceptance_rule=args.acceptance_rule))
         elif args.cmd == "show":
             inv = store.get(args.invoice)
             _out({"invoice": inv.to_dict(),
