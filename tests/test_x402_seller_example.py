@@ -106,45 +106,49 @@ class X402Seller(unittest.TestCase):
         self.assertFalse(r["serve"])
         self.assertEqual(r["reason"], "wrong_invoice")
 
-    def test_the_published_tag_lets_a_stranger_close_the_request_with_dust(self):
-        """Measured, and pinned because the x402 flow cannot recover from it.
+    def test_a_strangers_dust_no_longer_locks_the_buyer_out(self):
+        """The x402 end of #17, from the angle that found it.
 
-        The 402's `amount` IS `pay_raw`, so its low six digits are the tag:
-        the tag is public to everyone who reads the challenge, not just to the
-        buyer. A send whose amount ends in that tag and is below `pay_raw` is
-        recorded `underpaid`, and underpaid is final. The cheapest such amount
-        is the tag itself, and Nano has no fee, so the send costs nothing.
+        The 402's `amount` IS `pay_raw`, so its low six digits are the tag, and
+        the tag is public to everyone who reads the challenge. Anyone can
+        therefore send dust carrying it, feelessly.
 
-        Documented behaviour on its own (README, "Limits": "Underpaid closes
-        the invoice: issue a new invoice (new order key)"). What this test
-        pins is that the x402 remedy is NOT available: the order key is the
-        request id and `create_invoice` is idempotent on it, so the retry
-        returns the same, permanently-underpaid invoice. The request can never
-        be paid, by anybody.
+        Before #17 that dust closed the invoice `underpaid` -- final -- so the
+        buyer's exact payment became a `duplicate`, `settle_nano` answered
+        `serve: false`, and because the order key is the request id and
+        `create_invoice` is idempotent on it, the retry returned the same dead
+        invoice: the request could never be paid by anybody.
+
+        Now the short send is reported `short` and remembered instead, and this
+        is the case that must keep working: dust first, then the real payment,
+        and the seller serves. `test_underpaid_is_refused_with_a_refund_to_the_
+        ledger_sender` covers the other end (nothing exact arrives, so the
+        invoice closes `underpaid` after expiry with a refund).
         """
         tag = self.inv.tag
         self.assertEqual(int(x.nano_accepts_entry(self.inv)["amount"]) % ni.TAG_MODULUS, tag)
 
-        self.ledger.send(STRANGER, MERCHANT, tag, T0 + 10)       # free, and enough
-        self.assertEqual(ni.check_invoice(self.inv, rpc=self.ledger, store=self.store,
-                                          now=T0 + 20)["invoice"]["state"], "underpaid")
+        # A stranger who merely read the 402 sends the tag itself: free, and
+        # enough to have killed the request before #17.
+        dust, _ = self.ledger.send(STRANGER, MERCHANT, tag, T0 + 10)
+        after_dust = ni.check_invoice(self.inv, rpc=self.ledger, store=self.store, now=T0 + 20)
+        self.assertEqual(after_dust["invoice"]["state"], "open")
+        self.assertEqual([o["outcome"] for o in after_dust["observations"]
+                          if o["send_block"] == dust], ["short"])
+        self.assertEqual(after_dust["refunds"], [])
 
-        # The real buyer now pays the advertised amount, exactly.
+        # The buyer now pays the advertised amount exactly, and is served.
         send, _ = self.ledger.send(BUYER, MERCHANT, self.inv.pay_raw, T0 + 30)
-        after = ni.check_invoice(self.inv, rpc=self.ledger, store=self.store, now=T0 + 40)
-        self.assertEqual(after["invoice"]["state"], "underpaid")
-        exact = [o for o in after["observations"] if o["send_block"] == send]
-        self.assertEqual([o["outcome"] for o in exact], ["duplicate"])
+        r = self.settle(self.payment(block=send), now=T0 + 40)
+        self.assertTrue(r["serve"])
+        self.assertEqual(r["state"], "paid")
 
-        r = self.settle(self.payment(block=send), now=T0 + 50)
-        self.assertFalse(r["serve"])
-        self.assertEqual(r["reason"], "underpaid")
-
-        # And the README's remedy is unreachable here: same request id, same invoice.
-        again = ni.create_invoice(MERCHANT, XNO // 10000, "req-1", 300,
-                                  store=self.store, now=T0 + 60)
-        self.assertEqual(again.id, self.inv.id)
-        self.assertEqual(self.store.get(again.id).state, "underpaid")
+        # The stranger's dust is bound as a duplicate and refunded to the
+        # stranger, not to the buyer and not silently dropped.
+        dust_refunds = [f for f in r["refunds"] if f["source_block"] == dust]
+        self.assertEqual([f["to"] for f in dust_refunds], [STRANGER])
+        # Refund instructions carry raw as a string, as the receipt JSON does.
+        self.assertEqual([f["amount_raw"] for f in dust_refunds], [str(tag)])
 
     def test_cli_prints_the_402_offline(self):
         buf = io.StringIO()

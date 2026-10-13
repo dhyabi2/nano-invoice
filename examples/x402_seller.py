@@ -18,25 +18,15 @@ nano-invoice does not speak x402. This file is the glue, and it is all of it:
 The USDC entry is passed through unchanged and is never read here: it is still
 verified and settled by the seller's existing facilitator.
 
-One limit to read before mounting this: the entry's `amount` IS `pay_raw`, so
-its low six digits are the invoice's tag. The tag is public to anyone who reads
-the 402, and to anyone watching the merchant's account once the buyer
-broadcasts. A confirmed send ending in that tag and below `pay_raw` closes the
-invoice `underpaid`, which is final; the cheapest one is the tag itself and
-Nano has no fee. The buyer's exact payment is then a `duplicate` and
-`settle_nano` answers `serve: false, reason: "underpaid"`. Seeing the buyer's
-send first does not help: `scan` orders by (block_ts, send_block) with
-1-second timestamps, so a same-second dust send with a lower hash is bound
-first, and `check_invoice` skips unconfirmed sends, so a dust send that
-confirms first wins. Keying per issuance (`<request id>|<attempt>`) only makes
-a retry possible; an attacker can dust each new tag, and every 402 holds a tag
-while its invoice is open (until `check_invoice` or `Store.expire` runs on it
-after expiry) and then for the 7-day quarantine; there is no built-in sweep,
-so an abandoned 402 holds its tag until you expire it, and unauthenticated
-callers can push toward `TagsExhausted`.
-Today the remedy is to refund the buyer's `duplicate` payment; the real fix is
-a library change that is not made here. See the README and
-`tests/test_x402_seller_example.py`.
+One thing to know before mounting this: the entry's `amount` IS `pay_raw`, so
+its low six digits are the invoice's tag, public to anyone who reads the 402
+and to anyone watching the merchant's account once the buyer broadcasts. So
+anyone can send dust carrying the tag. Since #17 a confirmed send below
+`pay_raw` is reported `short` and remembered instead of closing the invoice,
+so the buyer's exact payment still settles and this example still serves it.
+What that leaves for the seller is a sweep: check every open invoice after it
+expires, or a short payment never gets its refund instruction. See the README
+and `tests/test_x402_seller_example.py`.
 
     python3 examples/x402_seller.py --merchant nano_1... --amount-xno 0.0001
 

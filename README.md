@@ -109,32 +109,14 @@ remember that a request was already served: a settled block hash is public, so s
 invoice once on your side. The buyer's client must pay `amount` exactly; a client that rounds
 the price drops the tag and the payment matches nothing (see **Limits** below).
 
-**Know this before you mount it: the tag is public, and underpaid is final.** The entry's
-`amount` *is* `pay_raw`, so its low six digits are the tag, public to everyone who reads the
-challenge. It is also public to anyone watching the merchant's account once the buyer
-broadcasts, because the amount is on the ledger. A confirmed send whose amount ends in that tag
-and is below `pay_raw` closes the invoice `underpaid`. The cheapest such amount is the tag itself
-(at most about 1e-24 XNO; the tag is at most 999999 raw), and Nano has no fee, so that send costs
-nothing. The buyer's exact payment is then recorded `duplicate`, and `settle_nano` answers
-`serve: false`, `reason: "underpaid"`. Seeing the buyer's send first does not stop an attacker:
-
-- `scan` orders sends by `(block_ts, send_block)` and the node's `local_timestamp` has 1-second
-  resolution, so a dust send in the same second whose block hash sorts lower is bound first.
-- `check_invoice` skips unconfirmed sends, so a dust send that confirms before the buyer's
-  closes the invoice, and the buyer's payment becomes `duplicate`.
-
-The remedy **Limits** gives for an underpaid invoice, "issue a new invoice (new order key)", is
-not available in this flow as written: the order key is the request id and `create_invoice` is
-idempotent on it, so the retry returns the same underpaid invoice. Keying per *issuance*
-(`<request id>|<attempt>`) only makes a retry possible; it does not prevent the attack, since an
-attacker can dust each new tag. Every new 402 also holds a tag while its invoice is open, which
-lasts until `check_invoice` (or `Store.expire`) runs on it after expiry, and then for the 7-day
-quarantine. There is no built-in sweep, so an abandoned 402 nobody checks holds its tag until you expire it, and unauthenticated
-callers can push the merchant toward `TagsExhausted`. Today the merchant's remedy
-is to refund the buyer's `duplicate` payment. The real fix is a library change (an underpaid send
-below `amount_raw` not closing the invoice, or preferring the send of exactly `pay_raw`); it is
-not made yet. `tests/test_x402_seller_example.py`
-(`test_the_published_tag_lets_a_stranger_close_the_request_with_dust`) shows the sequence.
+**One thing to know before you mount it: the tag is public.** The entry's `amount` *is* `pay_raw`,
+so its low six digits are the tag, public to everyone who reads the challenge and to anyone
+watching the merchant's account once the buyer broadcasts. Anyone could therefore send dust
+carrying the tag. Since #17 that no longer locks the buyer out: a confirmed send below `pay_raw`
+is reported `short` and remembered rather than closing the invoice, so the exact payment that
+follows still settles and `settle_nano` still serves. The consequence for a seller is the
+sweeping rule under **Limits**: check every open invoice after it expires, because until that
+check a short payment has no refund instruction.
 
 ## How the binding works
 

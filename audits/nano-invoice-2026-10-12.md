@@ -13,7 +13,17 @@ $ python3 -m unittest discover -s tests     # Ran 261 tests — OK
 $ python3 -m py_compile nano_invoice/*.py tests/*.py tools/*.py examples/*.py   # clean
 ```
 
-## Found — the 402 publishes the tag, and in the x402 flow underpaid is unrecoverable
+## Found — the 402 publishes the tag, and dust could kill the request (FIXED by #17)
+
+> **Resolved while this audit was open.** What follows is what the audit found
+> on `bcbc114` and is kept as the record. The defect is **fixed on `main` by
+> #17** (`663b162`, "check_invoice: a send below the invoice amount no longer
+> closes an open invoice"), which landed the library change this note said was
+> the owner's to decide. A confirmed send below `pay_raw` is now reported
+> `short` and remembered in a new `short_sends` table instead of closing the
+> invoice, so the buyer's exact payment still settles; if nothing exact
+> arrives, the first check after expiry closes it `underpaid` on the earliest
+> short send and refunds it. Read the finding below in the past tense.
 
 `examples/x402_seller.py` is the newest code in the repository (#15) and the
 only part of it that an untrusted party can see the output of. Its
@@ -55,59 +65,72 @@ last line of the probe is that: same request id, same invoice, still
 limit the README calls recoverable becomes unrecoverable as soon as it is read
 through the x402 glue — category 3, a README claim the code does not support.
 
-## What I changed, and what I deliberately did not
+## What I changed, what I did not, and who closed it
 
-I did **not** change the settlement semantics. Whether `underpaid` should stay
-final, or whether a dust send below some floor should be ignored rather than
-binding, is a deliberate decision in `core.py` with the whole final-state
-machinery (a database trigger, `BEGIN IMMEDIATE`, the send-block primary key)
-built on top of it. Changing it is a redesign of the accept/refuse rule on the
-settle path and it is the owner's call, not an audit's. It is raised for that
-decision and nothing more.
+I did **not** change the settlement semantics, and I still think that was the
+right call at the time: whether `underpaid` should stay final was a deliberate
+decision in `core.py` with the whole final-state machinery built on it (a
+database trigger, `BEGIN IMMEDIATE`, the send-block primary key). Changing it
+redesigns the accept/refuse rule on the settle path, which is the owner's call
+and not an audit's. So this PR raised it for that decision and documented the
+limit where someone mounting the glue would read it.
 
-What this PR does is make the limit true where it is stated and impossible to
-rediscover in production:
+**The owner then made the call and the fix landed in #17**, in the form this
+note proposed ("an underpaid send below `amount_raw` not closing the invoice"),
+and with the part I had not thought through: the short send is *remembered*
+rather than ignored, so dust cannot lock the buyer out AND a real short payment
+still gets its refund instruction when the invoice finally closes. That is a
+better answer than either of the two I offered.
 
-- `README.md`, the x402 section: the limit stated plainly. The tag is public
-  in the 402 and, once the buyer broadcasts, to anyone watching the merchant's
-  account, since the amount is on the ledger. So seeing the buyer's send does
-  not protect it: a dust send in the same second whose block hash sorts lower
-  is bound first (`scan` sorts by `(block_ts, send_block)`, `core.py:634`, and
-  `local_timestamp` has 1-second resolution), and `check_invoice` skips
-  unconfirmed sends (`core.py:670`), so a dust send that confirms first closes
-  the invoice and the buyer's exact payment becomes `duplicate`. Keying per
-  issuance (`<request id>|<attempt>`) only makes a retry possible; it does not
-  prevent the attack (an attacker can dust each new tag), and every new 402
-  holds a tag while its invoice is open (`core.py:480`), which lasts until
-  `check_invoice` (`core.py:697-700`) or `Store.expire` (`core.py:361`) runs
-  on it after expiry, and then for the 7-day quarantine (`core.py:31`). There
-  is no built-in sweep, so an abandoned 402 nobody checks holds its tag until
-  the merchant expires it, and unauthenticated callers can push toward
-  `TagsExhausted`. The merchant's remedy today is to refund the buyer's
-  `duplicate` payment. The real fix is a library change (an underpaid send
-  below `amount_raw` not closing the invoice, or preferring the exact
-  `pay_raw` send); it is not in this PR.
-- `examples/x402_seller.py` module docstring: the same, shorter, where someone
-  mounting the glue will actually read it.
-- `tests/test_x402_seller_example.py`: one test,
-  `test_the_published_tag_lets_a_stranger_close_the_request_with_dust`, that
-  walks the whole measured sequence — the tag is the low six digits of the
-  published amount, a `tag`-raw send from a stranger closes the invoice, the
-  exact payment is a `duplicate`, `settle_nano` answers
-  `serve: false / underpaid`, and the same request id returns the same
-  underpaid invoice.
+The owner also widened the threat model well beyond what I had measured, and
+every addition checked out when I verified it against the tree:
 
-**There is no failing-then-passing test in this PR, and I want to be explicit
-about why:** nothing in the code changed, so there is nothing a test could
-fail against. The test pins behaviour that `main` already has. It earns its
-place by making a measured denial-of-sale a recorded property rather than a
-surprise, and by failing loudly if the semantics are later changed without the
-README being changed with them.
+- Seeing the buyer's send first did not protect the merchant. `scan` orders by
+  `(block_ts, send_block)` (`core.py:634`) and `local_timestamp` has 1-second
+  resolution, so a same-second dust send whose hash sorts lower was bound
+  first. I measured it in both directions, 12 trials: the lower hash wins
+  regardless of arrival order, and with the buyer a full second earlier the
+  invoice settled `paid`.
+- `check_invoice` skips unconfirmed sends (`core.py:670`), so dust that
+  confirmed first won outright.
+- The tag was held open-ended, not for seven days. An invoice stays `state =
+  'open'` until `check_invoice` or `Store.expire` runs on it, and there is no
+  built-in sweep; measured, an invoice expired 30 days earlier and never
+  checked still held its tag against 500 new invoices. My own PR comment had
+  said "burns a tag for 7 days", which understated it.
+- An attacker needs no hash luck: any amount congruent to the tag mod 10**6
+  re-rolls the block hash for free, so the same-second race is not a coin flip.
+
+**What this PR is now:** this note, and one regression test. The README and the
+example docstring no longer carry my description of the limit — `main`'s own
+documentation after #17 is both correct and more complete, so mine was deleted
+rather than reconciled. The test was rewritten from pinning the defect to
+pinning the fix from the angle that found it:
+`test_a_strangers_dust_no_longer_locks_the_buyer_out` sends the tag itself from
+a stranger, asserts the invoice stays `open` with the send reported `short` and
+no refund yet, then has the buyer pay exactly and asserts `settle_nano` serves,
+with the dust bound as a `duplicate` refunded to the stranger. #17's own
+addition to `test_underpaid_is_refused_with_a_refund_to_the_ledger_sender`
+covers the other end (nothing exact arrives, so expiry closes it `underpaid`);
+this covers dust-then-payment, which it does not.
+
+**It fails against pre-#17 `core.py`** (`'open' != 'underpaid'`), so it guards
+the fix rather than restating it:
 
 ```
-$ python3 -m unittest discover -s tests     # Ran 262 tests — OK
+$ python3 -m unittest discover -s tests     # Ran 275 tests — OK  (merged with main)
 $ python3 -m py_compile nano_invoice/*.py tests/*.py tools/*.py examples/*.py   # clean
 ```
+
+### A correction to this note's own earlier version
+
+Its first version cited `x402_seller.py:46` for the advertised amount; that
+line was `"payTo": inv.merchant` at every revision. `core.py:688` pointed at
+the start of the ternary rather than the `underpaid` branch the claim was
+about. Both were corrected by the owner, and both were mine. In a note whose
+standard is "file, line, what happens", a line reference quoted from memory of
+terminal output instead of checked against the file is not a small thing, and
+it recurred across three repositories in the same run.
 
 ## Also checked, found clean
 
