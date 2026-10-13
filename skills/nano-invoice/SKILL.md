@@ -83,7 +83,10 @@ python3 skills/nano-invoice/invoice_cli.py check --invoice inv_... \
    final. A block settles an invoice only if it is confirmed, addressed to the merchant, sent
    after creation and before expiry, not from the merchant's own accounts or a configured
    not-income list, and not already bound to another invoice. The sender is read from the
-   chain, never from a claim.
+   chain, never from a claim. A send below the amount does not close an open invoice: it is
+   reported as `short` (anyone can send dust carrying a public tag). Only a check after
+   `expires_at` + 120 s closes it `underpaid` with a refund, so check open invoices again
+   after they expire.
 
 3. **Receipt**, and verify it:
 

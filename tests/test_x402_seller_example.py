@@ -77,6 +77,9 @@ class X402Seller(unittest.TestCase):
         self.ledger.send(BUYER, MERCHANT, self.inv.pay_raw - ni.TAG_MODULUS, T0 + 10)
         r = self.settle(self.payment())
         self.assertFalse(r["serve"])
+        self.assertEqual((r["state"], r["refunds"]), ("open", []))  # still payable exactly
+        r = self.settle(self.payment(), now=self.inv.expires_at + ni.CLOCK_SKEW_S + 1)
+        self.assertFalse(r["serve"])
         self.assertEqual(r["state"], "underpaid")
         self.assertEqual(r["refunds"][0]["to"], BUYER)
 
