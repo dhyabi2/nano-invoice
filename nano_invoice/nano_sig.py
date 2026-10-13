@@ -84,7 +84,8 @@ unambiguous acceptance state"). v2 binds no order and no rule. The payer signs
 `read_payer_acks` a v3 ack is read only when the caller names the order and the
 rule (`order_id=`, `acceptance_rule=`); a v3 ack for another order or another
 rule is IGNORED and listed, like an ack for another artifact. It sorts by the
-same key as v2.
+same key as v2. When the caller names an order or a rule, v1 and v2 acks are
+ignored (`not_v3`): they bind neither, so they never decide that order's verdict.
 """
 import hashlib
 import struct
@@ -288,7 +289,7 @@ def _reason_sha256(reason):
 
 def ack_message_v2(output_commitment_hex, payment_block_hash_hex, verdict, signed_at, reason=None):
     """The exact 134 bytes a payer signs for a v2 ack (layout in the module docstring)."""
-    if verdict not in ACK_VERDICT_CODES:
+    if not isinstance(verdict, str) or verdict not in ACK_VERDICT_CODES:
         raise ValueError(f"verdict must be one of {', '.join(ACK_VERDICT_CODES)}")
     if type(signed_at) is not int or not 0 <= signed_at < 2 ** 64:
         raise ValueError("signed_at must be an int of UTC unix seconds, 0 <= signed_at < 2**64")
@@ -376,7 +377,9 @@ def read_payer_acks(payer_address, output_commitment, payment_block_hash, acks, 
     {ok, verdict, current, superseded, ignored, rule}; ok is False when no ack verifies.
 
     A v3 ack, {"version": 3, ..., "order_id"?, "acceptance_rule"?}, is read only when
-    `order_id` and `acceptance_rule` are given; if it names others it is ignored.
+    `order_id` and `acceptance_rule` are given; if it names others it is ignored. When either
+    is given, v1 and v2 acks (which bind no order or rule) are ignored as `not_v3` and never
+    decide the verdict. A field of the wrong type makes an ack `malformed`, never an error.
     """
     try:
         want = (_hex32(output_commitment, "output_commitment"),
@@ -396,6 +399,9 @@ def read_payer_acks(payer_address, output_commitment, payment_block_hash, acks, 
             continue
         if named != want:
             ignored.append({"index": i, "reason": "other_payment_or_artifact"})
+            continue
+        if (order_id is not None or acceptance_rule is not None) and a.get("version") != 3:
+            ignored.append({"index": i, "reason": "not_v3: binds no order id or acceptance rule"})
             continue
         sig = a.get("signature")
         if a.get("version") == 1:
@@ -420,7 +426,7 @@ def read_payer_acks(payer_address, output_commitment, payment_block_hash, acks, 
             try:
                 ack_message_v3(order_id, output_commitment, payment_block_hash, acceptance_rule,
                                verdict, at, reason)
-            except ValueError:
+            except (ValueError, TypeError):
                 ignored.append({"index": i, "reason": "malformed"})
                 continue
             if not verify_delivery_ack_v3(payer_address, order_id, output_commitment,
@@ -437,7 +443,7 @@ def read_payer_acks(payer_address, output_commitment, payment_block_hash, acks, 
             continue
         try:
             ack_message_v2(output_commitment, payment_block_hash, verdict, at, reason)
-        except ValueError:
+        except (ValueError, TypeError):
             ignored.append({"index": i, "reason": "malformed"})
             continue
         if a.get("version") != 2:

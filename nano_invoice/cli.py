@@ -4,8 +4,10 @@ JSON on stdout. Exit 0 on a sound answer, 1 on a receipt or log that does not
 verify, 2 on a usage or document error, 3 on an RPC failure - and, for
 `ack-verify` (offline, no RPC), 3 on a payer acknowledgment that does not verify;
 for `ack-read` (offline), 3 when no ack in the list verifies under the payer.
-`acceptance` (offline, reads the store) exits 0 whatever it reports: a missing or
-invalid payer ack reads "unknown", which is an answer, not a failure.
+`acceptance` (offline, reads the store) exits 0 whatever it reports - a missing or
+invalid payer ack reads "unknown", which is an answer, not a failure - and 2 on a
+usage or document error (unknown invoice, unreadable JSON, an --acks file whose top
+level is not a list, an --output-commitment that is not 64 lowercase hex).
 `rep-check` exits 0 only when the representative matches and the block is
 confirmed (before --delivered-at, when given), 1 otherwise."""
 import argparse
@@ -101,11 +103,16 @@ def build_parser():
     av.add_argument("--reason", help="v2: the reason the payer signed (bound by sha256)")
 
     ar = sub.add_parser("ack-read", help="name the payer's current verdict from a list of "
-                                         "v1/v2 acks, offline")
+                                         "v1/v2/v3 acks, offline (v3 only with --order-id)")
     ar.add_argument("payer_address", help="the settling send block's block_account")
     ar.add_argument("output_commitment", help="sha256 of the delivered artifact, 64 hex")
     ar.add_argument("block_hash", help="the settling send block's hash, 64 hex")
     ar.add_argument("acks", help="JSON file (or - for stdin): a list of acks")
+    ar.add_argument("--order-id", help="the invoice id a v3 ack must bind; when given, only v3 "
+                                       "acks count")
+    ar.add_argument("--acceptance-rule", help=f"the rule-version string a v3 ack must bind "
+                                              f"(with --order-id; default "
+                                              f"{nano_sig.ACCEPTANCE_RULE_V1})")
 
     ac = sub.add_parser("acceptance", help="settlement, duplicates, delivered evidence and payer "
                                            "acceptance for one invoice, each reported on its own "
@@ -113,8 +120,9 @@ def build_parser():
     ac.add_argument("--invoice", required=True)
     ac.add_argument("--acks", help="JSON file (or - for stdin): a list of payer acks; only "
                                    "delivery-ack/v3 counts as acceptance")
-    ac.add_argument("--output-commitment", help="sha256 of what was delivered (default: the "
-                                                "latest verdict's in the log)")
+    ac.add_argument("--output-commitment", help="sha256 of what was delivered, 64 lowercase hex "
+                                                "(default: the newest log verdict's, when it is "
+                                                "delivered and not tombstoned)")
     ac.add_argument("--acceptance-rule", default=nano_sig.ACCEPTANCE_RULE_V1,
                     help=f"the rule-version string a v3 ack must bind "
                          f"(default {nano_sig.ACCEPTANCE_RULE_V1})")
@@ -190,8 +198,13 @@ def main(argv=None):
             src = sys.stdin if args.acks == "-" else open(args.acks)
             with src:
                 acks = json.load(src)
+            if args.acceptance_rule is not None and args.order_id is None:
+                raise core.InvoiceError("--acceptance-rule needs --order-id")
+            rule = (args.acceptance_rule or nano_sig.ACCEPTANCE_RULE_V1
+                    if args.order_id is not None else None)
             result = nano_sig.read_payer_acks(args.payer_address, args.output_commitment,
-                                              args.block_hash, acks)
+                                              args.block_hash, acks, order_id=args.order_id,
+                                              acceptance_rule=rule)
             _out(result)
             return 0 if result["ok"] else 3
         if args.cmd == "ack-verify" and args.verdict is not None:
@@ -290,6 +303,8 @@ def main(argv=None):
                 src = sys.stdin if args.acks == "-" else open(args.acks)
                 with src:
                     acks = json.load(src)
+                if not isinstance(acks, list):
+                    raise core.InvoiceError("--acks must hold a JSON list of acks")
             _out(core.acceptance_fields(args.invoice, store=store, acks=acks,
                                         output_commitment=args.output_commitment,
                                         acceptance_rule=args.acceptance_rule))

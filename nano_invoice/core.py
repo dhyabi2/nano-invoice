@@ -888,11 +888,13 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
     - `duplicates`: every later transfer bound to this invoice as duplicate/late, each with
       its refund disposition. A duplicate's hash is never evidence of work: it appears here
       and nowhere else.
-    - `delivered_evidence`: the output_commitment (given, or the latest verdict's in the log),
-      or None.
+    - `delivered_evidence`: the output_commitment (given as 64 lowercase hex; "" reads as not
+      given), or else the newest log verdict's when that verdict is "delivered" and no
+      tombstone follows it; otherwise None.
     - `payer_acceptance`: the verdict of the payer's current delivery-ack/v3 bound to THIS
       invoice id, the settling send block, that output_commitment and `acceptance_rule`.
-      With no such ack, or none that verifies, it is "unknown" with a reason - never
+      With no such ack, or none that verifies, or an invoice not `paid`/`overpaid` (an
+      underpaid close can be a stranger's dust), it is "unknown" with a reason - never
       "failed". v1/v2 acks bind no order or rule and are listed as not counted.
     """
     store = _require_store(store)
@@ -920,13 +922,26 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
             "note": "instruction only: whether the refund was sent is not recorded here; "
                     "this transfer is not evidence of completed work",
         })
+    if output_commitment == "":
+        output_commitment = None
+    if output_commitment is not None and not v2.is_sha256(output_commitment):
+        raise InvoiceError(f"output_commitment_not_sha256: {output_commitment!r}: expected 64 "
+                           f"lowercase hex characters")
     evidence, source = output_commitment, "given" if output_commitment else None
     if evidence is None:
+        # The newest verdict or tombstone decides: only a "delivered" verdict with an
+        # output_commitment is delivered evidence; a later failed/indeterminate verdict
+        # or a tombstone withdraws an earlier one.
         for rec in reversed(store.log(inv)):
-            oc = rec.get("kind") == "verdict" and (rec.get("body") or {}).get("output_commitment")
-            if oc:
-                evidence, source = oc, f"log verdict seq {rec.get('seq')}"
+            if rec.get("kind") == "tombstone":
                 break
+            if rec.get("kind") != "verdict":
+                continue
+            body = rec.get("body") or {}
+            oc = body.get("output_commitment")
+            if body.get("verdict") == "delivered" and v2.is_sha256(oc):
+                evidence, source = oc, f"log verdict seq {rec.get('seq')}"
+            break
     delivered_evidence = ({"output_commitment": evidence, "source": source}
                           if evidence else None)
 
@@ -943,6 +958,9 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
 
     if inv.send_block is None:
         acceptance = unknown("not_settled")
+    elif inv.state not in ("paid", "overpaid"):
+        # underpaid: the closing send can be dust from anyone, so its sender is not "the payer"
+        acceptance = unknown("not_paid")
     elif evidence is None:
         acceptance = unknown("no_delivered_evidence")
     elif not counted:

@@ -188,3 +188,105 @@ class FourFields(Base):
         self.assertEqual(code, 0)
         self.assertEqual((out["settlement"]["state"], len(out["duplicates"]),
                           out["payer_acceptance"]["state"]), ("paid", 1, "failed"))
+
+    def test_failed_or_tombstoned_verdict_is_not_delivered_evidence(self):
+        ni.append_verdict(self.inv, "failed", output_commitment=OUTPUT, asserted_by="merchant",
+                          asserted_at=T0 + 400, store=self.store)
+        f = self.fields([ack3(self.inv.id, self.first)])
+        self.assertIsNone(f["delivered_evidence"])
+        self.assertEqual((f["payer_acceptance"]["state"], f["payer_acceptance"]["reason"]),
+                         ("unknown", "no_delivered_evidence"))
+        ni.append_verdict(self.inv, "delivered", output_commitment=OUTPUT, asserted_by="merchant",
+                          asserted_at=T0 + 500, store=self.store)
+        self.assertEqual(self.fields()["delivered_evidence"]["output_commitment"], OUTPUT)
+        ni.append_tombstone(self.inv, "retracted", asserted_by="merchant", asserted_at=T0 + 550,
+                            store=self.store)
+        self.assertIsNone(self.fields()["delivered_evidence"])
+
+    def test_given_output_commitment_is_validated_and_empty_means_not_given(self):
+        with self.assertRaises(ni.InvoiceError):
+            ni.acceptance_fields(self.inv, store=self.store, output_commitment="zz")
+        with self.assertRaises(ni.InvoiceError):
+            ni.acceptance_fields(self.inv, store=self.store, output_commitment=OUTPUT.upper())
+        ni.append_tombstone(self.inv, "retracted", asserted_by="merchant", asserted_at=T0 + 550,
+                            store=self.store)
+        f = ni.acceptance_fields(self.inv, store=self.store, output_commitment="",
+                                 acks=[ack3(self.inv.id, self.first)])
+        self.assertIsNone(f["delivered_evidence"])
+        self.assertEqual(f["payer_acceptance"]["reason"], "no_delivered_evidence")
+
+    def test_hostile_acks_are_malformed_not_a_crash(self):
+        hostile = [{"version": 3, "verdict": [1]}, {"version": 3, "verdict": {"a": 1}, "signed_at": T},
+                   {"version": 2, "verdict": [1], "signed_at": T},
+                   {"version": 3, "verdict": "delivered", "signed_at": T, "reason": [1],
+                    "order_id": [self.inv.id]}]
+        f = self.fields(hostile)
+        self.assertEqual(f["payer_acceptance"]["state"], "unknown")
+        r = nano_sig.read_payer_acks(PAYER, OUTPUT, self.first, hostile)
+        self.assertFalse(r["ok"])
+        r = nano_sig.read_payer_acks(PAYER, OUTPUT, self.first, hostile, order_id=self.inv.id,
+                                     acceptance_rule=RULE)
+        self.assertFalse(r["ok"])
+
+    def test_cli_acceptance_refuses_acks_that_are_not_a_list(self):
+        from nano_invoice import cli
+        self.store.close()
+        path = os.path.join(self.tmp.name, "acks.json")
+        with open(path, "w") as fh:
+            json.dump({"version": 3, "verdict": [1]}, fh)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cli.main(["--db", self.db, "acceptance", "--invoice", self.inv.id,
+                             "--acks", path])
+        self.store = ni.Store(self.db)
+        self.assertEqual(code, 2)
+        self.assertIn("list", json.loads(buf.getvalue())["message"])
+
+
+class UnderpaidDust(Base):
+    def test_a_strangers_dust_close_gives_no_payer_acceptance(self):
+        inv = self.v2_invoice()
+        dust, _ = self.ledger.send(PAYER, MERCHANT, inv.tag, T0 + 5)   # PAYER here is a stranger
+        ni.check_invoice(inv, rpc=self.ledger, store=self.store,
+                         now=T0 + 3600 + ni.CLOCK_SKEW_S + 1)
+        inv = self.store.get(inv.id)
+        self.assertEqual((inv.state, inv.send_block, inv.sender), ("underpaid", dust, PAYER))
+        ni.append_verdict(inv, "delivered", output_commitment=OUTPUT, asserted_by="merchant",
+                          asserted_at=T0 + 3800, store=self.store)
+        f = ni.acceptance_fields(inv, store=self.store, acks=[ack3(inv.id, dust)])
+        self.assertEqual((f["payer_acceptance"]["state"], f["payer_acceptance"]["reason"]),
+                         ("unknown", "not_paid"))
+
+
+class ReadV3OrderScoped(Base):
+    def test_v1_v2_do_not_decide_an_order_and_are_unchanged_without_one(self):
+        v2a = {"version": 2, "verdict": "failed", "signed_at": T + 99,
+               "signature": nano_sig.sign_delivery_ack_v2(SK, OUTPUT, BLOCK, "failed", T + 99)}
+        v1a = {"version": 1, "signature": nano_sig.sign_delivery_ack(SK, OUTPUT, BLOCK)}
+        acks = [ack3(ORDER, BLOCK, "delivered", T), v2a, v1a]
+        r = nano_sig.read_payer_acks(PAYER, OUTPUT, BLOCK, acks, order_id=ORDER,
+                                     acceptance_rule=RULE)
+        self.assertEqual((r["verdict"], r["current"]["version"]), ("delivered", 3))
+        self.assertEqual([e["index"] for e in r["ignored"]], [1, 2])
+        self.assertTrue(all(e["reason"].startswith("not_v3") for e in r["ignored"]))
+        r = nano_sig.read_payer_acks(PAYER, OUTPUT, BLOCK, acks[1:])
+        self.assertEqual((r["verdict"], r["current"]["version"]), ("failed", 2))
+
+    def test_cli_ack_read_order_id(self):
+        from nano_invoice import cli
+        path = os.path.join(self.tmp.name, "acks.json")
+        v2a = {"version": 2, "verdict": "failed", "signed_at": T + 99,
+               "signature": nano_sig.sign_delivery_ack_v2(SK, OUTPUT, BLOCK, "failed", T + 99)}
+        with open(path, "w") as fh:
+            json.dump([ack3(ORDER, BLOCK, "delivered", T), v2a], fh)
+        for extra, want in ((["--order-id", ORDER], "delivered"),
+                            (["--order-id", ORDER, "--acceptance-rule", RULE], "delivered"),
+                            ([], "failed")):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = cli.main(["ack-read", PAYER, OUTPUT, BLOCK, path] + extra)
+            self.assertEqual((code, json.loads(buf.getvalue())["verdict"]), (0, want), extra)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cli.main(["ack-read", PAYER, OUTPUT, BLOCK, path, "--acceptance-rule", RULE])
+        self.assertEqual(code, 2)
