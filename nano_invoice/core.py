@@ -777,6 +777,9 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
         if row["send_block"] not in in_window:
             ob = {k: row[k] for k in ("send_block", "receive_block", "merchant", "sender",
                                       "amount_raw", "block_ts")}
+            # The store does not keep which clock block_ts came from: say so
+            # rather than leave the keys out.
+            ob.update(block_ts_source=None, receive_ts=None)
             short.append((ob, dict(ob, amount_raw=str(ob["amount_raw"]), remembered=True)))
     short.sort(key=lambda x: (x[0]["block_ts"], x[0]["send_block"]))
     for ob, view in short:

@@ -55,6 +55,18 @@ class TestLatencyFields(unittest.TestCase):
         self.assertEqual(ob["block_ts_source"], "send")
         self.assertIsNone(ob["receive_ts"])
 
+    def test_remembered_short_send_names_no_clock(self):
+        inv = ni.create_invoice(MERCHANT, XNO // 2, "order-3", 3600, store=self.store, now=T0)
+        self.ledger.send(BUYER, MERCHANT, inv.pay_raw - ni.TAG_MODULUS, T0 + 10, receive_ts=T0 + 13)
+        first = ni.check_invoice(inv, rpc=self.ledger, store=self.store, now=T0 + 20)
+        self.assertEqual(first["observations"][0]["outcome"], "short")
+        res = ni.check_invoice(inv, rpc=FakeLedger(), store=self.store, now=T0 + 3600 + 10 ** 4)
+        self.assertEqual(res["invoice"]["state"], "underpaid")
+        ob = res["observations"][0]
+        self.assertTrue(ob["remembered"])
+        self.assertIsNone(ob["block_ts_source"])
+        self.assertIsNone(ob["receive_ts"])
+
 
 if __name__ == "__main__":
     unittest.main()
