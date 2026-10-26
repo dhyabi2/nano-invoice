@@ -626,7 +626,9 @@ def _resolve_send(rpc, merchant, send_hash, receive_hash=None, receive_ts=0):
         problems.append(f"block is a {_subtype(info)}, not a send")
     if not dest or acct.normalise(dest) != merchant:
         problems.append("send is not addressed to the merchant")
-    ts = int(info.get("local_timestamp") or 0) or int(receive_ts or 0)
+    send_ts = int(info.get("local_timestamp") or 0)
+    recv_ts = int(receive_ts or 0)
+    ts = send_ts or recv_ts
     return {
         "send_block": send_hash.upper(),
         "receive_block": receive_hash.upper() if receive_hash else None,
@@ -635,6 +637,11 @@ def _resolve_send(rpc, merchant, send_hash, receive_hash=None, receive_ts=0):
         "amount_raw": int(info["amount"]),
         "confirmed": str(info.get("confirmed")).lower() == "true",
         "block_ts": ts,
+        # Which node clock block_ts is: the send's own local_timestamp, or the
+        # receive's when the node reported none for the send. Two clocks must
+        # never be mixed silently in a latency figure.
+        "block_ts_source": "send" if send_ts else ("receive" if recv_ts else None),
+        "receive_ts": recv_ts or None,
         "problems": problems,
     }
 
@@ -800,6 +807,7 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
             current = store.get(inv.id)
     return {
         "invoice": current.to_dict(),
+        "checked_at": now,
         "observations": observations,
         "refunds": refund_hints(store, inv.id),
     }
