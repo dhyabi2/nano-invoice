@@ -646,18 +646,27 @@ def _resolve_send(rpc, merchant, send_hash, receive_hash=None, receive_ts=0):
     }
 
 
-def scan(rpc, merchant, tag, since, max_blocks=1000):
+def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None):
     """Every incoming send to merchant whose amount ends in this tag, with its
-    sender, amount, confirmation and timestamp read from the ledger."""
+    sender, amount, confirmation and timestamp read from the ledger.
+
+    With `untagged_min`, also every send of at least that many raw whose amount
+    does NOT end in the tag (e.g. an overpayment by an excess that is not a
+    multiple of TAG_MODULUS). Each result carries `tag_match`."""
     rpc = as_rpc(rpc)
     found = {}
+
+    def wanted(amount):
+        return amount % TAG_MODULUS == tag or (untagged_min is not None and amount >= untagged_min)
+
     pending = _blocks_field(rpc.call("receivable", account=merchant, count=str(max_blocks), source="true"))
     for h, info in pending.items():
         amount = int(info["amount"]) if isinstance(info, dict) else (int(info) if info is not None else None)
-        if amount is not None and amount % TAG_MODULUS != tag:
+        if amount is not None and not wanted(amount):
             continue
         ob = _resolve_send(rpc, merchant, h)
-        if ob["amount_raw"] % TAG_MODULUS == tag:
+        if wanted(ob["amount_raw"]):
+            ob["tag_match"] = ob["amount_raw"] % TAG_MODULUS == tag
             found[ob["send_block"]] = ob
     head, seen = None, 0
     while seen < max_blocks:
@@ -672,7 +681,7 @@ def scan(rpc, merchant, tag, since, max_blocks=1000):
             if ts and ts < since:
                 older = True
                 break
-            if _subtype(e) != "receive" or int(e["amount"]) % TAG_MODULUS != tag:
+            if _subtype(e) != "receive" or not wanted(int(e["amount"])):
                 continue
             rinfo = rpc.call("block_info", json_block="true", hash=e["hash"])
             link = (rinfo.get("contents") or {}).get("link") or (rinfo.get("contents") or {}).get("source")
@@ -680,6 +689,9 @@ def scan(rpc, merchant, tag, since, max_blocks=1000):
                 continue
             ob = _resolve_send(rpc, merchant, link, receive_hash=e["hash"], receive_ts=ts)
             ob["confirmed"] = ob["confirmed"] and str(rinfo.get("confirmed")).lower() == "true"
+            if not wanted(ob["amount_raw"]):
+                continue
+            ob["tag_match"] = ob["amount_raw"] % TAG_MODULUS == tag
             found.setdefault(ob["send_block"], ob)
         nxt = data.get("previous")
         if older or not nxt:
@@ -718,6 +730,16 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
     closes it as underpaid and any others are duplicates, so every short send
     is refunded in full. A short send first seen after the invoice was closed
     expired is a duplicate (refunded), never `late`: it was sent in time.
+
+    A send of at least pay_raw whose amount does NOT end in the tag (an
+    overpayment by an excess that is not a multiple of TAG_MODULUS) carries no
+    tag, so nothing in it says which order it is for: it is bound to nothing
+    and settles nothing, but it is no longer invisible. It is listed under
+    `unmatched_candidates` with its excess over this invoice, every invoice of
+    the merchant it could equally be for (`candidate_invoices`, `ambiguous`)
+    and a refund instruction for the whole amount to the ledger sender. A send
+    whose low six digits equal another open or quarantined tag is left to that
+    tag: it is that invoice's payment (or overpayment), not this one's.
     """
     store = _require_store(store)
     inv = store.get(invoice)
@@ -726,7 +748,11 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
     excluded = {acct.normalise(k): v for k, v in (not_income or {}).items()}
     observations = []
     short = []
-    for ob in scan(rpc, inv.merchant, inv.tag, inv.created_at - skew_s, max_blocks):
+    unmatched = []
+    for ob in scan(rpc, inv.merchant, inv.tag, inv.created_at - skew_s, max_blocks, untagged_min=inv.pay_raw):
+        if not ob.pop("tag_match", True):
+            unmatched.append(ob)
+            continue
         view = {k: (str(v) if k == "amount_raw" else v) for k, v in ob.items() if k != "problems"}
         if ob["problems"]:
             observations.append(dict(view, outcome="ignored", reason="; ".join(ob["problems"])))
@@ -813,7 +839,44 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
         "checked_at": now,
         "observations": observations,
         "refunds": refund_hints(store, inv.id),
+        "unmatched_candidates": _unmatched_candidates(store, inv, unmatched, own, excluded, now, skew_s),
     }
+
+
+UNMATCHED_REASON = (
+    "at least pay_raw but its lowest six raw digits are not this invoice's tag: an overpayment by an "
+    "excess that is not a multiple of 10**6 raw carries no tag, so it cannot be attributed to an order "
+    "and settles nothing; refund it in full, or settle it with the buyer by hand")
+
+
+def _unmatched_candidates(store, inv, unmatched, own, excluded, now, skew_s):
+    """Untagged sends >= pay_raw that could be an overpayment of `inv`. Bound to
+    nothing; reported so the merchant can see and refund them."""
+    if not unmatched:
+        return []
+    rows = [Store._invoice(r) for r in store.conn.execute(
+        "SELECT * FROM invoices WHERE merchant = ?", (inv.merchant,))]
+    busy = {r.tag for r in rows if r.state == "open" or (r.closed_at or 0) > now - TAG_QUARANTINE_S}
+    out = []
+    for ob in unmatched:
+        amount, ts = ob["amount_raw"], ob["block_ts"]
+        if (ob["problems"] or not ob["confirmed"] or not ts
+                or not (inv.created_at - skew_s <= ts <= inv.expires_at)
+                or amount % TAG_MODULUS in busy  # another tag's payment: that invoice's check decides it
+                or ob["sender"] in own or ob["sender"] in excluded
+                or store.payment(ob["send_block"]) is not None):
+            continue
+        candidates = sorted(r.id for r in rows
+                            if r.pay_raw <= amount and r.created_at - skew_s <= ts <= r.expires_at)
+        view = {k: (str(v) if k == "amount_raw" else v) for k, v in ob.items() if k != "problems"}
+        out.append(dict(
+            view, outcome="unmatched", reason=UNMATCHED_REASON,
+            excess_raw=str(amount - inv.pay_raw),
+            candidate_invoices=candidates, ambiguous=len(candidates) > 1,
+            refund={"to": ob["sender"], "amount_raw": str(amount), "reason": "unmatched",
+                    "source_block": ob["send_block"], "invoice_id": None,
+                    "note": "instruction only: nano-invoice never sends; pay it from the merchant wallet"}))
+    return out
 
 
 def _record(store, ob, kind, inv_id, reason, now, view):
