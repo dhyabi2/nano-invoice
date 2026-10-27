@@ -771,7 +771,7 @@ class _LookupFailed:
 
 
 def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged_notes=None,
-         untagged_skip_tags=(), untagged_skip=None, untagged_cache=None):
+         untagged_skip_tags=(), untagged_skip=None, untagged_cache=None, split_min=None):
     """Every incoming send to merchant whose amount ends in this tag, with its
     sender, amount, confirmation and timestamp read from the ledger. Each
     result carries `tag_match` (True for these).
@@ -803,10 +803,20 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
     pay_raw + 7) is returned with `tag_match` False, so it is never bound or settled
     by the listed amount and at most reported as an untagged candidate.
     `untagged_cache` entries are keyed by (merchant, block hash), so a cache shared
-    across merchants never serves one merchant's answer to another."""
+    across merchants never serves one merchant's answer to another.
+
+    With `split_min` (below `untagged_min`), also untagged sends of at least
+    `split_min` and below `untagged_min` (the possible parts of a payment split
+    over several sends), on the same terms but with their own cap of
+    UNTAGGED_LOOKUP_CAP, so small unrelated income can never use up the lookups
+    that report an untagged overpayment."""
     rpc = as_rpc(rpc)
     found = {}
-    budget = [UNTAGGED_LOOKUP_CAP]
+    budget = {"full": UNTAGGED_LOOKUP_CAP, "split": UNTAGGED_LOOKUP_CAP}
+    lowest = split_min if split_min is not None else untagged_min
+
+    def pool(amount):
+        return "split" if untagged_min is None or amount < untagged_min else "full"
 
     def tagged(amount):
         return amount % TAG_MODULUS == tag
@@ -820,7 +830,7 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
         return busy[0]
 
     def untagged_candidate(amount):
-        return (untagged_min is not None and not tagged(amount) and amount >= untagged_min
+        return (lowest is not None and not tagged(amount) and amount >= lowest
                 and amount % TAG_MODULUS not in skip_tags())
 
     def wanted(amount):
@@ -838,8 +848,8 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
         if untagged_notes is not None:
             untagged_notes.append(msg)
 
-    def untagged_lookup(key, h, fn):
-        """Run fn() for an untagged send `h` within the cap; None if skipped."""
+    def untagged_lookup(key, h, fn, listed_amount):
+        """Run fn() for an untagged send `h` within its cap; None if skipped."""
         if untagged_cache is not None:
             hit, value = untagged_cache.get(key)
             if hit:
@@ -847,10 +857,12 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
                     note(value.message)
                     return None
                 return value
-        if budget[0] <= 0:
-            note(f"{h.upper()}: untagged send not looked up (cap of {UNTAGGED_LOOKUP_CAP} per check reached)")
+        kind = pool(listed_amount)
+        if budget[kind] <= 0:
+            what = "untagged send" if kind == "full" else "untagged send below untagged_min"
+            note(f"{h.upper()}: {what} not looked up (cap of {UNTAGGED_LOOKUP_CAP} per check reached)")
             return None
-        budget[0] -= 1
+        budget[kind] -= 1
         try:
             value = fn()
         except Exception as e:  # noqa: BLE001 - any malformed node answer: skip and note
@@ -873,7 +885,8 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
             sender = info.get("source") if isinstance(info, dict) else None
             if skipped(h, sender):
                 continue
-            ob = untagged_lookup(("send", merchant, h.upper()), h, lambda h=h: _resolve_send(rpc, merchant, h))
+            ob = untagged_lookup(("send", merchant, h.upper()), h, lambda h=h: _resolve_send(rpc, merchant, h),
+                                 amount)
             # Tag-ness is decided by the node's list: a send listed as untagged is never
             # settled, even if block_info (or the untagged cache) says it ends in the tag.
             # A tagged send is always read fresh, below; this one is skipped, as before.
@@ -913,7 +926,8 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
 
             listed_tagged = tagged(int(e["amount"]))
             ob = (resolve() if listed_tagged
-                  else untagged_lookup(("receive", merchant, str(e["hash"]).upper()), e["hash"], resolve))
+                  else untagged_lookup(("receive", merchant, str(e["hash"]).upper()), e["hash"], resolve,
+                                       int(e["amount"])))
             if ob is None or not wanted(ob["amount_raw"]):
                 continue
             if not listed_tagged and tagged(ob["amount_raw"]):
@@ -975,6 +989,23 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
     failed lookup of one (a node error or any malformed answer) is skipped
     (listed in `unmatched_notes`), never raised, so it cannot stop this
     invoice's own payment being recorded.
+
+    A payment SPLIT over several sends carries the tag in none of them, so no
+    part of it can pay anything: it is bound to nothing and settles nothing,
+    but it is no longer invisible. Untagged sends below pay_raw are read too
+    (with their own lookup cap, so they never crowd out the overpayment
+    report), on the same filters. Two or more of them from ONE sending account
+    whose amounts sum exactly to pay_raw are listed under `split_candidates`
+    with every block, the sender, the sum and every OPEN invoice that sum
+    could equally be for (`candidate_invoices`, `ambiguous`), marked
+    `needs_merchant_confirmation` and `settled: false`: an exact sum is a
+    strong hint, never proof of which order it pays, so the merchant decides;
+    `refund_if_rejected` says what to refund if the merchant rejects it. Every
+    other such send is listed under `unmatched_candidates`, information only
+    like an untagged overpayment (no refund instruction: the same send is
+    listed on every check whose window holds it). Sends from different
+    accounts are never added together. A watch pass (`_report_unmatched=False`)
+    discards the report, so it does not look these sends up at all.
     """
     store = _require_store(store)
     inv = store.get(invoice)
@@ -1004,6 +1035,7 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
 
     for ob in scan(rpc, inv.merchant, inv.tag, inv.created_at - skew_s, max_blocks,
                    untagged_min=inv.pay_raw, untagged_notes=unmatched_notes,
+                   split_min=1 if _report_unmatched else None,
                    untagged_skip_tags=other_busy, untagged_skip=skip_untagged,
                    untagged_cache=untagged_cache if untagged_cache is not None else UntaggedLookups()):
         if not ob.pop("tag_match", True):
@@ -1098,8 +1130,8 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
         # A watch pass discards this report (`_report_unmatched=False`): building it
         # reads every invoice of the merchant, which once per open invoice made a
         # pass O(open x all).
-        "unmatched_candidates": (_unmatched_candidates(store, inv, unmatched, own, excluded, now, skew_s)
-                                 if _report_unmatched else []),
+        **(_untagged_report(store, inv, unmatched, own, excluded, now, skew_s)
+           if _report_unmatched else {"split_candidates": [], "unmatched_candidates": []}),
         "unmatched_notes": unmatched_notes,
     }
 
@@ -1138,6 +1170,131 @@ def _lazy_busy_tags(store, merchant, now):
     return tags
 
 
+def _untagged_eligible(store, inv, ob, busy, own, excluded, skew_s):
+    """The filters every reported untagged send passes: no problems, confirmed,
+    inside inv's window, not another open or quarantined tag (that invoice's
+    check decides it), not the merchant's own or not income, not recorded."""
+    ts = ob["block_ts"]
+    return not (ob["problems"] or not ob["confirmed"] or not ts
+                or not (inv.created_at - skew_s <= ts <= inv.expires_at)
+                or ob["amount_raw"] % TAG_MODULUS in busy
+                or ob["sender"] in own or ob["sender"] in excluded
+                or store.payment(ob["send_block"]) is not None)
+
+
+def _untagged_report(store, inv, unmatched, own, excluded, now, skew_s):
+    """Untagged sends of this check: at least pay_raw -> possible overpayments
+    (`_unmatched_candidates`); below pay_raw -> exact same-sender splits as
+    `split_candidates`, the rest as unmatched. Nothing here binds a block or
+    changes an invoice's state."""
+    over = [ob for ob in unmatched if ob["amount_raw"] >= inv.pay_raw]
+    under = [ob for ob in unmatched if ob["amount_raw"] < inv.pay_raw]
+    splits, rest = _split_candidates(store, inv, under, unmatched, own, excluded, now, skew_s)
+    return {"split_candidates": splits,
+            "unmatched_candidates": _unmatched_candidates(store, inv, over, own, excluded, now, skew_s) + rest}
+
+
+SPLIT_MAX_PARTS_SEARCHED = 12
+
+SPLIT_REASON = (
+    "two or more sends from one account, none carrying a tag, that sum exactly to pay_raw: probably "
+    "this order paid in parts, but an untagged amount names no order, so nothing is settled; the "
+    "merchant confirms it with the buyer, or refunds every part in full")
+
+UNMATCHED_PART_REASON = (
+    "below pay_raw, no tag in its lowest six raw digits and no exact split with other sends from the "
+    "same account: it cannot be attributed to an order and settles nothing. It may be part of a split "
+    "the buyer is still sending (check again later) or unrelated income; information only: no refund "
+    "instruction is issued for it, a human decides")
+
+
+def _whole_refund(ob, reason):
+    return {"to": ob["sender"], "amount_raw": str(ob["amount_raw"]), "reason": reason,
+            "source_block": ob["send_block"], "invoice_id": None,
+            "note": "instruction only, and only if the merchant rejects the split: nano-invoice never "
+                    "sends; pay it from the merchant wallet"}
+
+
+def _exact_subsets(parts, target):
+    """Every subset of two or more `parts` whose amounts sum exactly to target."""
+    out = []
+    n = len(parts)
+    for mask in range(1, 1 << n):
+        if mask & (mask - 1) == 0:
+            continue  # a single send: it would carry the tag if it were exact
+        chosen = [parts[i] for i in range(n) if mask >> i & 1]
+        if sum(p["amount_raw"] for p in chosen) == target:
+            out.append(chosen)
+    return out
+
+
+def _split_fits(r, chosen, ids, parts, inv, skew_s):
+    """Could these sends just as well be invoice r's split? Yes when they sum to
+    r.pay_raw inside r's window, or when some other exact split of r, from the
+    same sender, uses any of the same blocks."""
+    def in_window(p):
+        return r.created_at - skew_s <= p["block_ts"] <= r.expires_at
+    if r.pay_raw == inv.pay_raw and all(in_window(p) for p in chosen):
+        return True
+    if r.id == inv.id:
+        return False
+    mine = [p for p in parts if in_window(p) and p["amount_raw"] < r.pay_raw]
+    if len(mine) > SPLIT_MAX_PARTS_SEARCHED:
+        return False
+    return any(ids & {p["send_block"] for p in other} for other in _exact_subsets(mine, r.pay_raw))
+
+
+def _split_candidates(store, inv, under, untagged, own, excluded, now, skew_s):
+    """(split_candidates, unmatched) for untagged sends below pay_raw. `untagged`
+    (every untagged send of the check, `under` included) is searched too when
+    asking whether the same blocks could be another invoice's split: a send of at
+    least this pay_raw can still be part of a larger invoice's."""
+    if not under:
+        return [], []
+    rows = _merchant_invoices(store, inv.merchant)
+    busy = {r.tag for r in rows if _tag_busy(r, now)}
+
+    def by_sender_of(obs):
+        out = {}
+        for ob in sorted((o for o in obs if _untagged_eligible(store, inv, o, busy, own, excluded, skew_s)),
+                         key=lambda o: (o["block_ts"], o["send_block"])):
+            out.setdefault(ob["sender"], []).append(ob)
+        return out
+    by_sender, context = by_sender_of(under), by_sender_of(untagged)
+
+    def view(ob):
+        return {k: (str(v) if k == "amount_raw" else v) for k, v in ob.items() if k != "problems"}
+
+    splits, in_split, unmatched = [], set(), []
+    for sender, parts in by_sender.items():
+        if 2 <= len(parts) <= SPLIT_MAX_PARTS_SEARCHED:
+            for chosen in _exact_subsets(parts, inv.pay_raw):
+                ids = {p["send_block"] for p in chosen}
+                candidates = sorted(r.id for r in rows
+                                    if r.state == "open"   # open invoices only, as for overpayments
+                                    and _split_fits(r, chosen, ids, context[sender], inv, skew_s))
+                splits.append({
+                    "outcome": "split_candidate",
+                    "needs_merchant_confirmation": True,
+                    "settled": False,
+                    "reason": SPLIT_REASON,
+                    "sender": sender,
+                    "sum_raw": str(inv.pay_raw),
+                    "send_blocks": [p["send_block"] for p in chosen],
+                    "receive_blocks": [p["receive_block"] for p in chosen],
+                    "parts": [view(p) for p in chosen],
+                    "candidate_invoices": candidates,
+                    "ambiguous": len(candidates) > 1,
+                    "refund_if_rejected": [_whole_refund(p, "split_rejected") for p in chosen],
+                })
+                in_split.update(ids)
+        for ob in parts:
+            if ob["send_block"] not in in_split:
+                unmatched.append(dict(view(ob), outcome="unmatched", reason=UNMATCHED_PART_REASON,
+                                      short_raw=str(inv.pay_raw - ob["amount_raw"])))
+    return splits, unmatched
+
+
 def _unmatched_candidates(store, inv, unmatched, own, excluded, now, skew_s):
     """Untagged sends >= pay_raw that could be an overpayment of `inv`. Bound to
     nothing and informational only: no refund instruction, because the same
@@ -1150,11 +1307,7 @@ def _unmatched_candidates(store, inv, unmatched, own, excluded, now, skew_s):
     out = []
     for ob in unmatched:
         amount, ts = ob["amount_raw"], ob["block_ts"]
-        if (ob["problems"] or not ob["confirmed"] or not ts
-                or not (inv.created_at - skew_s <= ts <= inv.expires_at)
-                or amount % TAG_MODULUS in busy  # another tag's payment: that invoice's check decides it
-                or ob["sender"] in own or ob["sender"] in excluded
-                or store.payment(ob["send_block"]) is not None):
+        if not _untagged_eligible(store, inv, ob, busy, own, excluded, skew_s):
             continue
         candidates = sorted(r.id for r in rows
                             if r.state == "open"   # open invoices only; a paid one is never one
