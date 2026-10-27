@@ -238,6 +238,17 @@ CREATE TABLE IF NOT EXISTS short_sends(
   block_ts INTEGER,
   seen_at INTEGER NOT NULL
 );
+-- A refund the merchant's wallet has sent, read back from the ledger by
+-- record_refund. One row per refunded block, so refund_hints stops asking for
+-- it and no sweep can turn one owed refund into two.
+CREATE TABLE IF NOT EXISTS refunds(
+  source_block TEXT PRIMARY KEY REFERENCES payments(send_block),
+  refund_block TEXT NOT NULL UNIQUE,
+  invoice_id TEXT REFERENCES invoices(id),
+  to_account TEXT NOT NULL,
+  amount_raw TEXT NOT NULL,
+  recorded_at INTEGER NOT NULL
+);
 """
 
 
@@ -813,6 +824,7 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
         "checked_at": now,
         "observations": observations,
         "refunds": refund_hints(store, inv.id),
+        "refunds_sent": refunds_sent(store, inv.id),
     }
 
 
@@ -875,13 +887,72 @@ def refund_instruction(item, store=None, claimed_payer=None):
 
 
 def refund_hints(store, invoice_id):
+    """Refunds still owed: every refund instruction for this invoice whose
+    block has no refund recorded by record_refund."""
     hints = []
+    done = {r["source_block"] for r in refunds_sent(store, invoice_id)}
     for p in store.payments_for(invoice_id):
+        if p["send_block"] in done:
+            continue
         r = refund_instruction(p, store=store)
         if r:
             r = dict(r, amount_raw=str(r["amount_raw"]))
             hints.append(r)
     return hints
+
+
+def refunds_sent(store, invoice_id):
+    rows = store.conn.execute(
+        "SELECT source_block, refund_block, invoice_id, to_account AS 'to', amount_raw, recorded_at"
+        " FROM refunds WHERE invoice_id = ? ORDER BY recorded_at, source_block", (invoice_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def record_refund(source_block, refund_block, rpc=None, store=None, now=None):
+    """Record that the merchant's wallet sent the refund owed for source_block.
+
+    nano-invoice still never sends. This reads refund_block from the ledger and
+    records it only if it is a confirmed send from the merchant to the
+    instruction's `to` for exactly its amount_raw. Once recorded, refund_hints
+    (and so check_invoice's `refunds`) no longer lists it; it appears under
+    `refunds_sent`. A block can settle one refund, and a refund is recorded once."""
+    store = _require_store(store)
+    now = int(time.time()) if now is None else now
+    pay = store.payment(source_block.upper())
+    if pay is None:
+        raise NotFound(f"no recorded block {source_block}")
+    owed = refund_instruction(pay, store=store)
+    if owed is None:
+        raise InvoiceError(f"block {pay['send_block']} is recorded as {pay['kind']}: no refund is owed")
+    info = as_rpc(rpc).call("block_info", json_block="true", hash=refund_block)
+    contents = info.get("contents") or {}
+    dest = contents.get("link_as_account") or contents.get("destination")
+    problems = []
+    if _subtype(info) != "send":
+        problems.append(f"block is a {_subtype(info)}, not a send")
+    if acct.normalise(info["block_account"]) != pay["merchant"]:
+        problems.append("not sent from the merchant's account")
+    if not dest or acct.normalise(dest) != owed["to"]:
+        problems.append("not sent to the account the refund is owed to")
+    if int(info["amount"]) != owed["amount_raw"]:
+        problems.append(f"amount {info['amount']} is not the {owed['amount_raw']} raw owed")
+    if str(info.get("confirmed")).lower() != "true":
+        problems.append("not confirmed yet")
+    if problems:
+        raise InvoiceError(f"{refund_block} is not the refund for {pay['send_block']}: "
+                           + "; ".join(problems))
+    try:
+        with store.tx() as c:
+            c.execute("INSERT INTO refunds(source_block, refund_block, invoice_id, to_account, amount_raw,"
+                      " recorded_at) VALUES (?,?,?,?,?,?)",
+                      (pay["send_block"], refund_block.upper(), pay["invoice_id"], owed["to"],
+                       str(owed["amount_raw"]), now))
+    except sqlite3.IntegrityError as e:
+        raise BlockAlreadyBound(f"refund for {pay['send_block']} or block {refund_block} "
+                                f"already recorded: {e}") from e
+    return {"source_block": pay["send_block"], "refund_block": refund_block.upper(),
+            "invoice_id": pay["invoice_id"], "to": owed["to"], "amount_raw": str(owed["amount_raw"]),
+            "recorded_at": now}
 
 
 # ---------------------------------------------------------------- receipts

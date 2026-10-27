@@ -478,6 +478,33 @@ class TestRefund(Base):
         self.check(inv)
         self.assertIsNone(ni.refund_instruction(inv, store=self.store))
 
+    def test_a_sent_refund_is_recorded_and_not_asked_for_again(self):
+        inv = self.invoice(amount=XNO)
+        send, _ = self.ledger.send(BUYER, MERCHANT, inv.pay_raw + 10 ** 29, T0 + 10)
+        res = self.check(inv)
+        self.assertEqual([r["source_block"] for r in res["refunds"]], [send])
+        back, _ = self.ledger.send(MERCHANT, BUYER, 10 ** 29, T0 + 100, received=False)
+        rec = ni.record_refund(send, back, rpc=self.ledger, store=self.store, now=T0 + 120)
+        self.assertEqual((rec["source_block"], rec["refund_block"], rec["to"], rec["amount_raw"]),
+                         (send, back, BUYER, str(10 ** 29)))
+        res = self.check(inv, now=T0 + 200)
+        self.assertEqual(res["refunds"], [], "a refund already sent must not be issued twice")
+        self.assertEqual([r["refund_block"] for r in res["refunds_sent"]], [back])
+        with self.assertRaises(ni.BlockAlreadyBound):
+            ni.record_refund(send, back, rpc=self.ledger, store=self.store)
+
+    def test_a_refund_block_that_does_not_match_the_instruction_is_refused(self):
+        inv = self.invoice(amount=XNO)
+        send, _ = self.ledger.send(BUYER, MERCHANT, inv.pay_raw + 10 ** 29, T0 + 10)
+        self.check(inv)
+        wrong_amount, _ = self.ledger.send(MERCHANT, BUYER, 10 ** 28, T0 + 100, received=False)
+        wrong_to, _ = self.ledger.send(MERCHANT, OTHER, 10 ** 29, T0 + 101, received=False)
+        not_ours, _ = self.ledger.send(OTHER, BUYER, 10 ** 29, T0 + 102, received=False)
+        for block in (wrong_amount, wrong_to, not_ours):
+            with self.assertRaises(ni.InvoiceError):
+                ni.record_refund(send, block, rpc=self.ledger, store=self.store)
+        self.assertEqual(len(self.check(inv, now=T0 + 200)["refunds"]), 1)
+
 
 class TestReceipt(Base):
     def paid(self):
