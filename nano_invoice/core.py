@@ -646,19 +646,32 @@ def _resolve_send(rpc, merchant, send_hash, receive_hash=None, receive_ts=0):
     }
 
 
-def scan(rpc, merchant, tag, since, max_blocks=1000):
+def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None):
     """Every incoming send to merchant whose amount ends in this tag, with its
-    sender, amount, confirmation and timestamp read from the ledger."""
+    sender, amount, confirmation and timestamp read from the ledger.
+
+    With `untagged_min`, also every send of at least that many raw whose amount
+    does NOT end in the tag (e.g. one part of a payment split over several
+    sends). Each result then carries `tag_match`."""
     rpc = as_rpc(rpc)
     found = {}
+
+    def wanted(amount):
+        return amount % TAG_MODULUS == tag or (untagged_min is not None and amount >= untagged_min)
+
+    def mark(ob):
+        if untagged_min is not None:
+            ob["tag_match"] = ob["amount_raw"] % TAG_MODULUS == tag
+        return ob
+
     pending = _blocks_field(rpc.call("receivable", account=merchant, count=str(max_blocks), source="true"))
     for h, info in pending.items():
         amount = int(info["amount"]) if isinstance(info, dict) else (int(info) if info is not None else None)
-        if amount is not None and amount % TAG_MODULUS != tag:
+        if amount is not None and not wanted(amount):
             continue
         ob = _resolve_send(rpc, merchant, h)
-        if ob["amount_raw"] % TAG_MODULUS == tag:
-            found[ob["send_block"]] = ob
+        if wanted(ob["amount_raw"]):
+            found[ob["send_block"]] = mark(ob)
     head, seen = None, 0
     while seen < max_blocks:
         data = rpc.call("account_history", account=merchant, count=str(min(200, max_blocks - seen)), head=head)
@@ -672,7 +685,7 @@ def scan(rpc, merchant, tag, since, max_blocks=1000):
             if ts and ts < since:
                 older = True
                 break
-            if _subtype(e) != "receive" or int(e["amount"]) % TAG_MODULUS != tag:
+            if _subtype(e) != "receive" or not wanted(int(e["amount"])):
                 continue
             rinfo = rpc.call("block_info", json_block="true", hash=e["hash"])
             link = (rinfo.get("contents") or {}).get("link") or (rinfo.get("contents") or {}).get("source")
@@ -680,7 +693,9 @@ def scan(rpc, merchant, tag, since, max_blocks=1000):
                 continue
             ob = _resolve_send(rpc, merchant, link, receive_hash=e["hash"], receive_ts=ts)
             ob["confirmed"] = ob["confirmed"] and str(rinfo.get("confirmed")).lower() == "true"
-            found.setdefault(ob["send_block"], ob)
+            if not wanted(ob["amount_raw"]):
+                continue
+            found.setdefault(ob["send_block"], mark(ob))
         nxt = data.get("previous")
         if older or not nxt:
             break
@@ -718,6 +733,19 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
     closes it as underpaid and any others are duplicates, so every short send
     is refunded in full. A short send first seen after the invoice was closed
     expired is a duplicate (refunded), never `late`: it was sent in time.
+
+    A payment SPLIT over several sends carries the tag in none of them, so no
+    part of it can pay anything: it is bound to nothing and settles nothing,
+    but it is no longer invisible. Confirmed, in-window sends whose amount
+    ends in no open or quarantined tag are read too. Two or more of them from
+    ONE sending account whose amounts sum exactly to pay_raw are listed under
+    `split_candidates` with every block, the sender, the sum and every invoice
+    that sum could equally be for (`candidate_invoices`, `ambiguous`), marked
+    `needs_merchant_confirmation`: an exact sum is a strong hint, never proof
+    of which order it pays, so the merchant decides. Every other such send is
+    listed under `unmatched_candidates` with a refund instruction for its
+    whole amount to the ledger sender. Sends from different accounts are never
+    added together.
     """
     store = _require_store(store)
     inv = store.get(invoice)
@@ -726,7 +754,11 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
     excluded = {acct.normalise(k): v for k, v in (not_income or {}).items()}
     observations = []
     short = []
-    for ob in scan(rpc, inv.merchant, inv.tag, inv.created_at - skew_s, max_blocks):
+    untagged = []
+    for ob in scan(rpc, inv.merchant, inv.tag, inv.created_at - skew_s, max_blocks, untagged_min=1):
+        if not ob.pop("tag_match", True):
+            untagged.append(ob)
+            continue
         view = {k: (str(v) if k == "amount_raw" else v) for k, v in ob.items() if k != "problems"}
         if ob["problems"]:
             observations.append(dict(view, outcome="ignored", reason="; ".join(ob["problems"])))
@@ -813,7 +845,111 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
         "checked_at": now,
         "observations": observations,
         "refunds": refund_hints(store, inv.id),
+        **_untagged_report(store, inv, untagged, own, excluded, now, skew_s),
     }
+
+
+SPLIT_MAX_PARTS_SEARCHED = 12
+
+SPLIT_REASON = (
+    "two or more sends from one account, none carrying a tag, that sum exactly to pay_raw: probably "
+    "this order paid in parts, but an untagged amount names no order, so nothing is settled; the "
+    "merchant confirms it with the buyer, or refunds every part in full")
+
+UNMATCHED_REASON = (
+    "no tag in its lowest six raw digits and no exact split with other sends from the same account: "
+    "it cannot be attributed to an order and settles nothing; refund it in full, or settle it with "
+    "the buyer by hand. If the buyer is still sending the rest of a split, check again later")
+
+
+def _whole_refund(ob, reason):
+    return {"to": ob["sender"], "amount_raw": str(ob["amount_raw"]), "reason": reason,
+            "source_block": ob["send_block"], "invoice_id": None,
+            "note": "instruction only: nano-invoice never sends; pay it from the merchant wallet"}
+
+
+def _exact_subsets(parts, target):
+    """Every subset of two or more `parts` whose amounts sum exactly to target."""
+    out = []
+    n = len(parts)
+    for mask in range(1, 1 << n):
+        if mask & (mask - 1) == 0:
+            continue  # a single send: it would carry the tag if it were exact
+        chosen = [parts[i] for i in range(n) if mask >> i & 1]
+        if sum(p["amount_raw"] for p in chosen) == target:
+            out.append(chosen)
+    return out
+
+
+def _split_fits(r, chosen, ids, parts, inv, skew_s):
+    """Could these sends just as well be invoice r's split? Yes when they sum to
+    r.pay_raw inside r's window, or when some other exact split of r, from the
+    same sender, uses any of the same blocks."""
+    def in_window(p):
+        return r.created_at - skew_s <= p["block_ts"] <= r.expires_at
+    if r.pay_raw == inv.pay_raw and all(in_window(p) for p in chosen):
+        return True
+    if r.id == inv.id:
+        return False
+    mine = [p for p in parts if in_window(p)]
+    if len(mine) > SPLIT_MAX_PARTS_SEARCHED:
+        return False
+    return any(ids & {p["send_block"] for p in other} for other in _exact_subsets(mine, r.pay_raw))
+
+
+def _untagged_report(store, inv, untagged, own, excluded, now, skew_s):
+    """Untagged sends inside this invoice's window: exact same-sender splits as
+    candidates needing the merchant's confirmation, the rest as unmatched.
+    Nothing here binds a block or changes an invoice's state."""
+    if not untagged:
+        return {"split_candidates": [], "unmatched_candidates": []}
+    rows = [Store._invoice(r) for r in store.conn.execute(
+        "SELECT * FROM invoices WHERE merchant = ?", (inv.merchant,))]
+    busy = {r.tag for r in rows if r.state == "open" or (r.closed_at or 0) > now - TAG_QUARANTINE_S}
+    eligible = []
+    for ob in untagged:
+        ts = ob["block_ts"]
+        if (ob["problems"] or not ob["confirmed"] or not ts
+                or not (inv.created_at - skew_s <= ts <= inv.expires_at)
+                or ob["amount_raw"] % TAG_MODULUS in busy  # another tag's send: its own invoice decides it
+                or ob["sender"] in own or ob["sender"] in excluded
+                or store.payment(ob["send_block"]) is not None):
+            continue
+        eligible.append(ob)
+    by_sender = {}
+    for ob in sorted(eligible, key=lambda o: (o["block_ts"], o["send_block"])):
+        by_sender.setdefault(ob["sender"], []).append(ob)
+
+    def view(ob):
+        return {k: (str(v) if k == "amount_raw" else v) for k, v in ob.items() if k != "problems"}
+
+    splits, in_split, unmatched = [], set(), []
+    for sender, parts in by_sender.items():
+        if 2 <= len(parts) <= SPLIT_MAX_PARTS_SEARCHED:
+            for chosen in _exact_subsets(parts, inv.pay_raw):
+                ids = {p["send_block"] for p in chosen}
+                candidates = sorted(r.id for r in rows if _split_fits(r, chosen, ids, parts, inv, skew_s))
+                splits.append({
+                    "outcome": "split_candidate",
+                    "needs_merchant_confirmation": True,
+                    "settled": False,
+                    "reason": SPLIT_REASON,
+                    "sender": sender,
+                    "sum_raw": str(inv.pay_raw),
+                    "send_blocks": [p["send_block"] for p in chosen],
+                    "receive_blocks": [p["receive_block"] for p in chosen],
+                    "parts": [view(p) for p in chosen],
+                    "candidate_invoices": candidates,
+                    "ambiguous": len(candidates) > 1,
+                    "refund_if_rejected": [_whole_refund(p, "split_rejected") for p in chosen],
+                })
+                in_split.update(p["send_block"] for p in chosen)
+        for ob in parts:
+            if ob["send_block"] in in_split:
+                continue
+            unmatched.append(dict(view(ob), outcome="unmatched", reason=UNMATCHED_REASON,
+                                  refund=_whole_refund(ob, "unmatched")))
+    return {"split_candidates": splits, "unmatched_candidates": unmatched}
 
 
 def _record(store, ob, kind, inv_id, reason, now, view):
