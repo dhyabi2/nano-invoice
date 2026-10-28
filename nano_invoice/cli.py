@@ -45,7 +45,10 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     c = sub.add_parser("create", help="create (or return the existing) invoice for an order")
-    c.add_argument("--merchant", required=True)
+    merchant = c.add_argument("--merchant", required=True)
+    # `--m` was an unambiguous prefix of --merchant before the --min-/--max- flags
+    # existed; keep it working as an exact alias, left out of --help.
+    c._option_string_actions["--m"] = merchant
     amt = c.add_mutually_exclusive_group(required=True)
     amt.add_argument("--amount-raw", help="price in raw, an integer (1 XNO = 10**30 raw)")
     amt.add_argument("--amount-xno", help="price in XNO as an exact decimal string, e.g. 0.25")

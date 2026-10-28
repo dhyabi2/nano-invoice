@@ -500,6 +500,18 @@ class ReviewFixes(CliCase):
         finally:
             store.close()
 
+    def test_m_still_means_merchant(self):
+        # `--m` expanded to --merchant on main; the --min-/--max- flags must not break it.
+        for argv in (["--m", MERCHANT], [f"--m={MERCHANT}"]):
+            rc, out, err = run_cli(["--db", self.db, "create", *argv, "--amount-xno", "0.25",
+                                    "--order-key", "k1"])
+            self.assertEqual(rc, 0, err)
+            self.assertEqual(out["merchant"], MERCHANT)
+        rc, _, err = run_cli(["--db", self.db, "create", "--amount-xno", "0.25", "--order-key", "k2"])
+        self.assertEqual(rc, 2, err)
+        create = cli.build_parser()._subparsers._group_actions[0].choices["create"]
+        self.assertNotIn("--m ", create.format_help())
+
 
 if __name__ == "__main__":
     unittest.main()
