@@ -449,5 +449,57 @@ class UsdComparedAsDecimal(unittest.TestCase):
                 store.close()
 
 
+class ReviewFixes(CliCase):
+    """Huge quote timestamp, a raced USD create on a terms-bound order, and a
+    row with a column this version does not know."""
+
+    def test_huge_future_timestamp_is_a_price_error_not_a_crash(self):
+        for ts in (10 ** 400, 10 ** 18, 10 ** 5000):
+            with self.assertRaises(price.PriceError):
+                price.read_usd_per_xno(PriceNode({**GOOD, "timestamp_unix": ts}),
+                                       now=lambda: 1_800_000_000.5)
+
+    def test_huge_future_timestamp_exits_2_and_creates_nothing(self):
+        rc, out, _ = self.create("--amount-usd", "1", node=PriceNode({**GOOD, "timestamp_unix": 10 ** 400}))
+        self.assertEqual(rc, 2, out)
+        self.assertEqual(out["error"], "PriceError")
+
+    def test_raced_usd_create_with_terms_returns_the_winner(self):
+        from tests.test_receipt_v2 import terms
+        now = int(time.time())
+        t = terms(not_before=now - 60, not_after=now + 3600)
+        store = ni.Store(self.db)
+        try:
+            first = price.create_invoice_usd(MERCHANT, "0.01", "race", store=store, usd_per_xno="0.5",
+                                             terms=t, idempotency_key="k1")
+            # The loser read another rate, so it converts to another raw amount,
+            # and reaches core with the same USD amount and the same terms.
+            loser_raw = first.amount_raw // 2 // core.TAG_MODULUS * core.TAG_MODULUS
+            raced = core.create_invoice(MERCHANT, loser_raw, "race", store=store, terms=t,
+                                        idempotency_key="k1",
+                                        quote={"usd": "0.01", "usd_per_xno": "1", "source": "s",
+                                               "read_at": "t"})
+            self.assertEqual(raced.id, first.id)
+            self.assertEqual(raced.binding_sha256, first.binding_sha256)
+            # Different terms on the same USD amount are still refused.
+            with self.assertRaises(core.IdempotencyConflict):
+                core.create_invoice(MERCHANT, loser_raw, "race", store=store, terms=t,
+                                    idempotency_key="k2",
+                                    quote={"usd": "0.01", "usd_per_xno": "1", "source": "s",
+                                           "read_at": "t"})
+        finally:
+            store.close()
+
+    def test_row_with_an_unknown_column_still_loads(self):
+        store = ni.Store(self.db)
+        try:
+            inv = price.create_invoice_usd(MERCHANT, "0.01", "cols", store=store, usd_per_xno="0.5")
+            store.conn.execute("ALTER TABLE invoices ADD COLUMN added_later TEXT")
+            store.conn.commit()
+            self.assertEqual(store.get(inv.id).quote_usd, "0.01")
+        finally:
+            store.close()
+
+
 if __name__ == "__main__":
     unittest.main()

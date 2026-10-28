@@ -101,7 +101,11 @@ def _quote_time(reply, now, max_age_s):
     if isinstance(ts, bool) or not isinstance(ts, int) or ts <= 0:
         raise PriceError(f"price: the node's reply has no usable timestamp_unix: {ts!r}"[:300])
     if ts > now + MAX_QUOTE_SKEW_S:
-        raise PriceError(f"price: the quote's timestamp {ts} is {ts - now:.0f}s in the future")
+        # Integer arithmetic only: a huge int minus a float overflows (and a
+        # huge int may not even print), and either must be a refusal, not a crash.
+        if ts >= 10**18:
+            raise PriceError("price: the quote's timestamp_unix is implausibly far in the future")
+        raise PriceError(f"price: the quote's timestamp {ts} is {ts - int(now)}s in the future")
     if now - ts > max_age_s:
         raise PriceError(f"price: the quote is {now - ts:.0f}s old (timestamp {ts}); "
                          f"refusing anything older than {max_age_s}s")

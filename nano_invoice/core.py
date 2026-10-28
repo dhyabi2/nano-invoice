@@ -172,6 +172,9 @@ class Invoice:
         return json.loads(self.terms_json) if self.terms_json else None
 
 
+_INVOICE_FIELDS = frozenset(f.name for f in dataclasses.fields(Invoice))
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS invoices(
   id TEXT PRIMARY KEY,
@@ -322,7 +325,7 @@ class Store:
         for k in ("amount_raw", "pay_raw", "received_raw"):
             if d[k] is not None:
                 d[k] = int(d[k])
-        return Invoice(**d)
+        return Invoice(**{k: v for k, v in d.items() if k in _INVOICE_FIELDS})
 
     def get(self, invoice):
         inv_id = invoice.id if isinstance(invoice, Invoice) else invoice
@@ -521,11 +524,11 @@ def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, stor
     okh = order_key_hash(order_key)
     inv_id = invoice_id_for(merchant, okh)
 
-    def binding_for(inv_id_, tag_, pay_raw_, created_at_, expires_at_):
+    def binding_for(inv_id_, tag_, pay_raw_, created_at_, expires_at_, amount_raw_=amount_raw):
         try:
             return v2.bound_document(
                 invoice_id=inv_id_, merchant=merchant, order_key_sha256=okh,
-                amount_raw=amount_raw, tag=tag_, pay_raw=pay_raw_, created_at=created_at_,
+                amount_raw=amount_raw_, tag=tag_, pay_raw=pay_raw_, created_at=created_at_,
                 expires_at=expires_at_, intent_hash=intent_hash,
                 idempotency_key=idempotency_key, terms=normalised_terms)
         except v2.TermsError as e:
@@ -541,7 +544,14 @@ def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, stor
                 raise OrderConflict(
                     f"order already invoiced as {existing.id} for {existing.amount_raw} raw; "
                     f"refusing a second invoice for {amount_raw} raw")
-            _same_binding(existing, normalised_terms, binding_for)
+            if same_usd:
+                # The same USD request re-quoted at another rate (e.g. a
+                # concurrent creator lost the race): the bound amount is the
+                # one already issued, not this caller's conversion of it.
+                _same_binding(existing, normalised_terms,
+                              lambda *a: binding_for(*a, amount_raw_=existing.amount_raw))
+            else:
+                _same_binding(existing, normalised_terms, binding_for)
             return existing
         if idempotency_key is not None:
             prior = c.execute(
