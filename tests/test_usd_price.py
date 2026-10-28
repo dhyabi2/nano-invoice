@@ -9,6 +9,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from decimal import Decimal
 from unittest import mock
@@ -41,8 +42,10 @@ class PriceNode:
         return self.reply
 
 
-GOOD = {"symbol": "xno", "currency": "usd", "price": 0.335793, "timestamp_unix": 1793150632,
+# timestamp_unix is "now": a quote older than the max age (default 600 s) is refused.
+GOOD = {"symbol": "xno", "currency": "usd", "price": 0.335793, "timestamp_unix": int(time.time()),
         "source": "coingecko.com"}
+SOURCE = "https://rpc.nano.to price action"  # the URL we queried, not the reply's "source"
 
 
 def run_cli(argv, node=None):
@@ -100,12 +103,16 @@ class ReadRate(unittest.TestCase):
     def test_reads_price_and_names_source(self):
         q = price.read_usd_per_xno(PriceNode(GOOD))
         self.assertEqual(q["usd_per_xno"], Decimal("0.335793"))
-        self.assertEqual(q["source"], "rpc.nano.to price (coingecko.com)")
+        self.assertEqual(q["source"], SOURCE)
         self.assertTrue(q["read_at"].endswith("Z"))
 
     def test_bad_replies_never_invent_a_price(self):
-        for reply in [{"price": 0}, {"price": -1}, {"price": "abc"}, {"price": None}, {},
-                      {"price": True}, {"price": float("nan")}, ["price", 1], "oops"]:
+        for bad in [{"price": 0}, {"price": -1}, {"price": "abc"}, {"price": None}, {},
+                    {"price": True}, {"price": float("nan")}]:
+            reply = dict(GOOD, **bad) if bad else {}
+            with self.assertRaises(price.PriceError, msg=repr(reply)):
+                price.read_usd_per_xno(PriceNode(reply))
+        for reply in [["price", 1], "oops"]:
             with self.assertRaises(price.PriceError, msg=repr(reply)):
                 price.read_usd_per_xno(PriceNode(reply))
 
@@ -117,7 +124,9 @@ class ReadRate(unittest.TestCase):
         self.assertIn("price", __import__("nano_invoice.rpc", fromlist=["x"]).READ_ACTIONS)
 
 
-class Cli(unittest.TestCase):
+class CliCase(unittest.TestCase):
+    """A temporary database and a `create` helper; holds no tests itself."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.db = os.path.join(self.tmp.name, "c.db")
@@ -129,6 +138,8 @@ class Cli(unittest.TestCase):
         return run_cli(["--db", self.db, "create", "--merchant", MERCHANT, "--order-key", key, *extra],
                        node=node)
 
+
+class Cli(CliCase):
     def test_amount_usd_records_and_prints_the_quote(self):
         node = PriceNode(GOOD)
         rc, out, _ = self.create("--amount-usd", "0.01", node=node)
@@ -138,7 +149,7 @@ class Cli(unittest.TestCase):
         q = out["usd_quote"]
         self.assertEqual(q["usd"], "0.01")
         self.assertEqual(q["usd_per_xno"], "0.335793")
-        self.assertEqual(q["source"], "rpc.nano.to price (coingecko.com)")
+        self.assertEqual(q["source"], SOURCE)
         self.assertRegex(q["read_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
 
     def test_idempotent_rerun_keeps_the_first_quote_and_does_not_requote(self):
@@ -158,7 +169,7 @@ class Cli(unittest.TestCase):
         self.assertEqual(out["error"], "OrderConflict")
 
     def test_bad_price_exits_nonzero_and_creates_nothing(self):
-        for reply in [{"price": 0}, {"price": "n/a"}, ni.RpcError("price: HTTP 503")]:
+        for reply in [dict(GOOD, price=0), dict(GOOD, price="n/a"), ni.RpcError("price: HTTP 503")]:
             rc, out, _ = self.create("--amount-usd", "0.01", node=PriceNode(reply), key="bad")
             self.assertNotEqual(rc, 0, repr(reply))
             self.assertIn("message", out)
@@ -211,6 +222,231 @@ class Cli(unittest.TestCase):
             self.assertNotIn("usd_quote", inv.to_dict())
         finally:
             store.close()
+
+
+
+class BindingOnRerun(CliCase):
+    """A re-run of a USD order gets the same binding check as the XNO path:
+    different terms / idempotency key / intent hash is IdempotencyConflict, not
+    the old invoice with exit 0."""
+
+    def terms_file(self, name="t.json", **over):
+        from tests.test_receipt_v2 import terms
+        now = int(time.time())
+        over.setdefault("not_before", now - 86400)
+        over.setdefault("not_after", now + 86400)
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w") as fh:
+            json.dump(terms(**over), fh)
+        return path
+
+    def first(self, *extra):
+        rc, out, _ = self.create("--amount-usd", "0.01", "--usd-per-xno", "0.5", *extra)
+        self.assertEqual(rc, 0, out)
+        return out
+
+    def rerun(self, *extra):
+        return self.create("--amount-usd", "0.01", "--usd-per-xno", "0.5", *extra)
+
+    def test_same_binding_rerun_returns_the_same_invoice(self):
+        t = self.terms_file()
+        first = self.first("--terms-file", t, "--idempotency-key", "k1")
+        rc, out, _ = self.rerun("--terms-file", t, "--idempotency-key", "k1")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out["id"], first["id"])
+        self.assertEqual(out["binding_sha256"], first["binding_sha256"])
+
+    def test_different_terms_file_is_refused(self):
+        self.first("--terms-file", self.terms_file(), "--idempotency-key", "k1")
+        other = self.terms_file("t2.json", policy_version=4)
+        rc, out, _ = self.rerun("--terms-file", other, "--idempotency-key", "k1")
+        self.assertEqual(rc, 2, out)
+        self.assertEqual(out["error"], "IdempotencyConflict")
+
+    def test_different_idempotency_key_is_refused(self):
+        t = self.terms_file()
+        self.first("--terms-file", t, "--idempotency-key", "k1")
+        rc, out, _ = self.rerun("--terms-file", t, "--idempotency-key", "k2")
+        self.assertEqual(rc, 2, out)
+        self.assertEqual(out["error"], "IdempotencyConflict")
+
+    def test_different_intent_hash_is_refused(self):
+        t = self.terms_file()
+        self.first("--terms-file", t, "--intent-hash", "a" * 64)
+        rc, out, _ = self.rerun("--terms-file", t, "--intent-hash", "b" * 64)
+        self.assertEqual(rc, 2, out)
+        self.assertEqual(out["error"], "IdempotencyConflict")
+
+    def test_v1_usd_order_rerun_with_terms_is_refused(self):
+        self.first()
+        rc, out, _ = self.rerun("--terms-file", self.terms_file())
+        self.assertEqual(rc, 2, out)
+        self.assertEqual(out["error"], "IdempotencyConflict")
+
+    def test_v2_usd_order_rerun_without_terms_is_refused(self):
+        self.first("--terms-file", self.terms_file())
+        rc, out, _ = self.rerun()
+        self.assertEqual(rc, 2, out)
+        self.assertEqual(out["error"], "IdempotencyConflict")
+
+    def test_library_path_raises_too(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = ni.Store(os.path.join(d, "s.db"))
+            try:
+                price.create_invoice_usd(MERCHANT, "0.01", "lib", store=store, usd_per_xno="0.5")
+                from tests.test_receipt_v2 import terms
+                now = int(time.time())
+                with self.assertRaises(core.IdempotencyConflict):
+                    price.create_invoice_usd(MERCHANT, "0.01", "lib", store=store, usd_per_xno="0.5",
+                                             terms=terms(not_before=now - 60, not_after=now + 60))
+            finally:
+                store.close()
+
+
+class QuoteChecks(unittest.TestCase):
+    """The node's reply is checked, not trusted: currency, age, band, source."""
+
+    NOW = 1_800_000_000
+
+    def read(self, reply, **kw):
+        return price.read_usd_per_xno(PriceNode(reply), now=lambda: self.NOW, **kw)
+
+    def good(self, **over):
+        return {**GOOD, "timestamp_unix": self.NOW - 5, **over}
+
+    def test_fresh_usd_quote_is_accepted(self):
+        q = self.read(self.good())
+        self.assertEqual(q["usd_per_xno"], Decimal("0.335793"))
+        self.assertEqual(self.read(self.good(currency="USD"))["usd_per_xno"], Decimal("0.335793"))
+
+    def test_missing_or_other_currency_refused(self):
+        r = self.good()
+        del r["currency"]
+        for reply in (r, self.good(currency="eur"), self.good(currency=None), self.good(currency=1)):
+            with self.assertRaises(price.PriceError, msg=repr(reply)):
+                self.read(reply)
+
+    def test_missing_zero_stale_or_future_timestamp_refused(self):
+        r = self.good()
+        del r["timestamp_unix"]
+        for reply in (r, self.good(timestamp_unix=0), self.good(timestamp_unix=None),
+                      self.good(timestamp_unix=True), self.good(timestamp_unix="soon"),
+                      self.good(timestamp_unix=self.NOW - 601),
+                      self.good(timestamp_unix=self.NOW + 3600)):
+            with self.assertRaises(price.PriceError, msg=repr(reply)):
+                self.read(reply)
+
+    def test_max_age_is_configurable(self):
+        old = self.good(timestamp_unix=self.NOW - 1000)
+        with self.assertRaises(price.PriceError):
+            self.read(old)
+        self.assertEqual(self.read(old, max_age_s=2000)["usd_per_xno"], Decimal("0.335793"))
+        with self.assertRaises(price.PriceError):
+            self.read(self.good(), max_age_s=1)
+        self.read(self.good(timestamp_unix=self.NOW - 1), max_age_s=1)
+
+    def test_source_is_the_url_queried_not_the_reply(self):
+        q = self.read(self.good(source="trust-me.example"))
+        self.assertEqual(q["source"], SOURCE)
+        self.assertNotIn("trust-me", q["source"])
+
+    def test_sanity_band(self):
+        self.read(self.good(), min_usd_per_xno="0.1", max_usd_per_xno="1")
+        with self.assertRaises(price.PriceError):
+            self.read(self.good(), min_usd_per_xno="0.5")
+        with self.assertRaises(price.PriceError):
+            self.read(self.good(), max_usd_per_xno="0.3")
+        with self.assertRaises(core.AmountError):
+            self.read(self.good(), min_usd_per_xno="2", max_usd_per_xno="1")
+
+    def test_price_error_is_an_invoice_error(self):
+        self.assertTrue(issubclass(price.PriceError, core.InvoiceError))
+
+
+class QuoteChecksCli(CliCase):
+    def test_stale_quote_exits_2_and_creates_nothing(self):
+        rc, out, _ = self.create("--amount-usd", "0.01",
+                                 node=PriceNode(dict(GOOD, timestamp_unix=int(time.time()) - 3600)))
+        self.assertEqual(rc, 2, out)
+        self.assertEqual(out["error"], "PriceError")
+        conn = sqlite3.connect(self.db)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM invoices").fetchone()[0], 0)
+        conn.close()
+
+    def test_missing_currency_exits_2(self):
+        r = dict(GOOD)
+        del r["currency"]
+        rc, out, _ = self.create("--amount-usd", "0.01", node=PriceNode(r))
+        self.assertEqual((rc, out["error"]), (2, "PriceError"))
+
+    def test_band_flags(self):
+        rc, out, _ = self.create("--amount-usd", "0.01", "--max-usd-per-xno", "0.2",
+                                 node=PriceNode(GOOD))
+        self.assertEqual((rc, out["error"]), (2, "PriceError"))
+        rc, out, _ = self.create("--amount-usd", "0.01", "--usd-per-xno", "5",
+                                 "--max-usd-per-xno", "1")
+        self.assertEqual((rc, out["error"]), (2, "PriceError"))
+        rc, out, _ = self.create("--amount-usd", "0.01", "--min-usd-per-xno", "0.1",
+                                 "--max-usd-per-xno", "1", node=PriceNode(GOOD))
+        self.assertEqual(rc, 0, out)
+        rc, out, _ = self.create("--amount-xno", "0.25", "--max-usd-per-xno", "1", key="x")
+        self.assertEqual(rc, 2)
+
+    def test_max_quote_age_flag(self):
+        node = PriceNode(dict(GOOD, timestamp_unix=int(time.time()) - 1200))
+        rc, out, _ = self.create("--amount-usd", "0.01", node=node)
+        self.assertEqual(rc, 2, out)
+        rc, out, _ = self.create("--amount-usd", "0.01", "--max-quote-age-s", "3600", node=node)
+        self.assertEqual(rc, 0, out)
+
+
+class NumberInput(CliCase):
+    def test_huge_exponent_is_a_clean_refusal(self):
+        rc, out, _ = self.create("--amount-usd", "1e999999", "--usd-per-xno", "1")
+        self.assertEqual(rc, 2, out)
+        self.assertEqual(out["error"], "AmountError")
+
+    def test_huge_exponent_refused_fast(self):
+        t = time.monotonic()
+        for usd in ("1e900000", Decimal("1e900000"), "1" + "0" * 100000, 10 ** 100000):
+            with self.assertRaises(core.AmountError):
+                price.usd_to_raw(usd, "1")
+        with self.assertRaises(core.AmountError):
+            price.usd_to_raw("1", Decimal("1e-900000"))
+        self.assertLess(time.monotonic() - t, 1.0)
+
+    def test_only_plain_ascii_decimals(self):
+        for usd in ("1_000", "\u0661", "\uff11", "1e2", "+1", "1.", ".5", "0x10", "1,5"):
+            with self.assertRaises(core.AmountError, msg=repr(usd)):
+                price.usd_to_raw(usd, "1")
+        self.assertEqual(price.usd_to_raw(" 1000 ", "1"), 1000 * RAW)
+
+    def test_cli_refuses_underscore_and_non_ascii(self):
+        for usd in ("1_000", "\u0661"):
+            rc, out, _ = self.create("--amount-usd", usd, "--usd-per-xno", "1")
+            self.assertEqual(rc, 2, (usd, out))
+
+
+class UsdComparedAsDecimal(unittest.TestCase):
+    def test_core_and_price_agree_that_1_equals_1_00(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = ni.Store(os.path.join(d, "s.db"))
+            try:
+                first = price.create_invoice_usd(MERCHANT, "1.00", "dec", store=store, usd_per_xno="2")
+                self.assertEqual(first.quote_usd, "1.00")
+                # price side: "1" is the same USD amount
+                again = price.create_invoice_usd(MERCHANT, "1", "dec", store=store, usd_per_xno="3")
+                self.assertEqual(again.id, first.id)
+                # core side (the concurrent-creator path): a different raw at the same USD
+                # amount written as "1" returns the first invoice, as price.py does.
+                raced = core.create_invoice(MERCHANT, first.amount_raw // 2 // core.TAG_MODULUS
+                                            * core.TAG_MODULUS, "dec", store=store,
+                                            quote={"usd": "1", "usd_per_xno": "4", "source": "s",
+                                                   "read_at": "t"})
+                self.assertEqual(raced.id, first.id)
+                self.assertEqual(raced.amount_raw, first.amount_raw)
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":

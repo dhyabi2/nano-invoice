@@ -55,8 +55,8 @@ nano-invoice role-check --receipt receipt.json --history-file payer_history.json
 
 ### Pricing in USD
 
-`create --amount-usd 0.01` reads the USD price of XNO once, from the node's `price` action (rpc.nano.to names its source, e.g. coingecko), converts with exact decimals and rounds *down* to a whole 10^6 raw so the tag fits. Pass `--usd-per-xno 0.34` to use your own rate and make no network call.
-The rate is a reference read at creation, not a swap quote: nobody is bound to it, and a missing or non-positive price is an error, never a guess. The invoice records `usd_quote` (usd, usd_per_xno, source, read_at) and its XNO amount never changes afterwards; re-running the same order key returns the same invoice and first quote without reading the rate again.
+`create --amount-usd 0.01` reads the USD price of XNO once, from the node's `price` action, converts with exact decimals and rounds *down* to a whole 10^6 raw so the tag fits. Pass `--usd-per-xno 0.34` to use your own rate and make no network call. The amount is a plain ASCII decimal (`0.01`, `12.5`): no exponent, sign, underscore or non-ASCII digit.
+The rate is a reference read at creation, not a swap quote: nobody is bound to it. The node's reply is checked, never guessed around: a missing or non-positive price, a `currency` that is missing or not `usd`, or a `timestamp_unix` that is missing, zero, in the future, or older than `--max-quote-age-s` (default 600) is refused with exit 2. `--min-usd-per-xno` / `--max-usd-per-xno` set an optional sanity band, also enforced on `--usd-per-xno`. The invoice records `usd_quote` (usd, usd_per_xno, source, read_at), where `source` is the node URL that was queried, and its XNO amount never changes afterwards; re-running the same order key returns the same invoice and first quote without reading the rate again, after the same binding check as an XNO invoice (different terms, intent hash or idempotency key is `IdempotencyConflict`).
 
 ## Use with an x402 seller
 

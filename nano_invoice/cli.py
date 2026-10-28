@@ -54,6 +54,11 @@ def build_parser():
                                           "recorded on the invoice; a re-run of the order keeps it")
     c.add_argument("--usd-per-xno", help="with --amount-usd: the USD-per-XNO rate to use, from "
                                          "your own source; no network call")
+    c.add_argument("--min-usd-per-xno", help="with --amount-usd: refuse a rate below this (sanity band)")
+    c.add_argument("--max-usd-per-xno", help="with --amount-usd: refuse a rate above this (sanity band)")
+    c.add_argument("--max-quote-age-s", type=int, default=price.DEFAULT_MAX_QUOTE_AGE_S,
+                   help="with --amount-usd: refuse a node quote whose timestamp is older than this "
+                        f"(default {price.DEFAULT_MAX_QUOTE_AGE_S})")
     c.add_argument("--order-key", required=True)
     c.add_argument("--expires-s", type=int, default=3600)
     # Receipt v2. Supplying --terms-file makes this a bound invoice; without it
@@ -232,8 +237,12 @@ def main(argv=None):
             return 0 if result["ok"] else 1
         store = core.Store(args.db)
         if args.cmd == "create":
-            if args.usd_per_xno is not None and args.amount_usd is None:
-                raise core.InvoiceError("--usd-per-xno needs --amount-usd")
+            if args.amount_usd is None:
+                for flag, val in (("--usd-per-xno", args.usd_per_xno),
+                                  ("--min-usd-per-xno", args.min_usd_per_xno),
+                                  ("--max-usd-per-xno", args.max_usd_per_xno)):
+                    if val is not None:
+                        raise core.InvoiceError(f"{flag} needs --amount-usd")
             raw = (None if args.amount_usd is not None
                    else int(args.amount_raw) if args.amount_raw is not None
                    else core.xno_to_raw(args.amount_xno))
@@ -252,7 +261,9 @@ def main(argv=None):
             if raw is None:
                 inv = price.create_invoice_usd(args.merchant, args.amount_usd, args.order_key,
                                                args.expires_s, store=store, usd_per_xno=args.usd_per_xno,
-                                               rpc=rpc, **bound)
+                                               rpc=rpc, max_age_s=args.max_quote_age_s,
+                                               min_usd_per_xno=args.min_usd_per_xno,
+                                               max_usd_per_xno=args.max_usd_per_xno, **bound)
             else:
                 inv = core.create_invoice(args.merchant, raw, args.order_key, args.expires_s, store=store,
                                           **bound)

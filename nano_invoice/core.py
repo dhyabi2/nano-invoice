@@ -15,6 +15,7 @@ sends. Refunds come out as instructions for the merchant's own wallet.
 """
 import contextlib
 import dataclasses
+import decimal
 import hashlib
 import json
 import secrets
@@ -535,7 +536,7 @@ def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, stor
         if row is not None:
             existing = Store._invoice(row)
             same_usd = (quote is not None and existing.quote_usd is not None
-                        and existing.quote_usd == quote.get("usd"))
+                        and _same_decimal(existing.quote_usd, quote.get("usd")))
             if existing.amount_raw != amount_raw and not same_usd:
                 raise OrderConflict(
                     f"order already invoiced as {existing.id} for {existing.amount_raw} raw; "
@@ -584,6 +585,15 @@ def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, stor
             "terms_sha256": binding["terms_sha256"],
         })
     return store.get(inv_id)
+
+
+def _same_decimal(a, b):
+    """Two recorded USD amounts compared as numbers ("1" == "1.00"), as
+    price._same_usd does; anything unparseable is simply not the same."""
+    try:
+        return a is not None and b is not None and decimal.Decimal(str(a)) == decimal.Decimal(str(b))
+    except decimal.DecimalException:
+        return False
 
 
 def _same_binding(existing, normalised_terms, binding_for):
