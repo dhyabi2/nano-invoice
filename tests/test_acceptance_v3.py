@@ -206,8 +206,9 @@ class FourFields(Base):
     def test_given_output_commitment_is_validated_and_empty_means_not_given(self):
         with self.assertRaises(ni.InvoiceError):
             ni.acceptance_fields(self.inv, store=self.store, output_commitment="zz")
-        with self.assertRaises(ni.InvoiceError):
-            ni.acceptance_fields(self.inv, store=self.store, output_commitment=OUTPUT.upper())
+        # Upper-case hex is read in lower case, as ack-read reads it.
+        f = ni.acceptance_fields(self.inv, store=self.store, output_commitment=OUTPUT.upper())
+        self.assertEqual(f["delivered_evidence"], {"output_commitment": OUTPUT, "source": "given"})
         ni.append_tombstone(self.inv, "retracted", asserted_by="merchant", asserted_at=T0 + 550,
                             store=self.store)
         f = ni.acceptance_fields(self.inv, store=self.store, output_commitment="",
@@ -290,3 +291,117 @@ class ReadV3OrderScoped(Base):
         with contextlib.redirect_stdout(buf):
             code = cli.main(["ack-read", PAYER, OUTPUT, BLOCK, path, "--acceptance-rule", RULE])
         self.assertEqual(code, 2)
+
+
+class ReviewFixes(Base):
+    """Review findings on #19: bad acks, empty rules and missing files are clean usage
+    errors (exit 2), a given output_commitment cannot override a withdrawn verdict, and
+    both commands read upper-case hex. Same fixture as FourFields."""
+
+    def setUp(self):
+        super().setUp()
+        self.inv = self.v2_invoice()
+        self.first, _ = self.ledger.send(PAYER, MERCHANT, self.inv.pay_raw, T0 + 10)
+        self.retry, _ = self.ledger.send(PAYER, MERCHANT, self.inv.pay_raw, T0 + 20)
+        ni.check_invoice(self.inv, rpc=self.ledger, store=self.store, now=T0 + 60)
+        self.inv = self.store.get(self.inv.id)
+        ni.append_verdict(self.inv, "delivered", output_commitment=OUTPUT, asserted_by="merchant",
+                          asserted_at=T0 + 300, store=self.store)
+
+    def cli(self, *argv, stdin=None):
+        from unittest import mock
+        from nano_invoice import cli
+        self.store.close()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), mock.patch("sys.stdin", stdin or io.StringIO("")):
+                code = cli.main(["--db", self.db, *argv])
+        finally:
+            self.store = ni.Store(self.db)
+        return code, json.loads(buf.getvalue())
+
+    def write(self, obj, name="acks.json"):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w") as fh:
+            json.dump(obj, fh)
+        return path
+
+    # 1. acceptance_fields refuses acks that are not a list/tuple of objects
+    def test_acks_not_a_list_of_objects_is_refused(self):
+        for acks in (5, "xyz", {"version": 3}, [5], ["xyz"], [ack3(self.inv.id, self.first), None]):
+            with self.assertRaises(ni.InvoiceError, msg=repr(acks)):
+                ni.acceptance_fields(self.inv, store=self.store, acks=acks)
+        for acks in (None, (), []):
+            self.assertEqual(ni.acceptance_fields(self.inv, store=self.store, acks=acks)
+                             ["payer_acceptance"]["reason"], "no_v3_ack")
+        f = ni.acceptance_fields(self.inv, store=self.store, acks=(ack3(self.inv.id, self.first),))
+        self.assertEqual(f["payer_acceptance"]["state"], "delivered")
+
+    def test_empty_acceptance_rule_is_refused_by_the_library(self):
+        for rule in ("", None):
+            with self.assertRaises(ni.InvoiceError):
+                ni.acceptance_fields(self.inv, store=self.store, acceptance_rule=rule)
+
+    # 2. ack-read
+    def test_ack_read_non_list_acks_file_exits_2(self):
+        for obj in (5, "xyz", {"version": 3}):
+            code, out = self.cli("ack-read", PAYER, OUTPUT, self.first, self.write(obj))
+            self.assertEqual(code, 2, (obj, out))
+            self.assertEqual(out["error"], "InvoiceError")
+
+    def test_ack_read_empty_acceptance_rule_is_refused(self):
+        path = self.write([ack3(self.inv.id, self.first)])
+        code, out = self.cli("ack-read", PAYER, OUTPUT, self.first, path, "--order-id", self.inv.id,
+                             "--acceptance-rule", "")
+        self.assertEqual(code, 2, out)
+        self.assertIn("empty", out["message"])
+        code, out = self.cli("ack-read", PAYER, OUTPUT, self.first, path, "--order-id", self.inv.id)
+        self.assertEqual((code, out["verdict"]), (0, "delivered"))
+
+    def test_acceptance_empty_rule_exits_2(self):
+        code, out = self.cli("acceptance", "--invoice", self.inv.id, "--acceptance-rule", "")
+        self.assertEqual(code, 2, out)
+
+    # 3. a missing acks file is a usage error, not an RPC failure
+    def test_missing_acks_file_exits_2(self):
+        missing = os.path.join(self.tmp.name, "nonexistent.json")
+        code, out = self.cli("acceptance", "--invoice", self.inv.id, "--acks", missing)
+        self.assertEqual(code, 2, out)
+        code, out = self.cli("ack-read", PAYER, OUTPUT, self.first, missing)
+        self.assertEqual(code, 2, out)
+
+    # 4. a given output_commitment does not override a withdrawn verdict
+    def test_given_commitment_refused_after_failed_verdict(self):
+        ni.append_verdict(self.inv, "failed", output_commitment=OUTPUT, asserted_by="merchant",
+                          asserted_at=T0 + 400, store=self.store)
+        with self.assertRaises(ni.InvoiceError) as cm:
+            ni.acceptance_fields(self.inv, store=self.store, output_commitment=OUTPUT,
+                                 acks=[ack3(self.inv.id, self.first)])
+        self.assertIn("withdrawn", str(cm.exception))
+        code, out = self.cli("acceptance", "--invoice", self.inv.id, "--output-commitment", OUTPUT)
+        self.assertEqual(code, 2, out)
+
+    def test_given_commitment_refused_after_tombstone(self):
+        ni.append_tombstone(self.inv, "retracted", asserted_by="merchant", asserted_at=T0 + 550,
+                            store=self.store)
+        with self.assertRaises(ni.InvoiceError):
+            ni.acceptance_fields(self.inv, store=self.store, output_commitment=OUTPUT,
+                                 acks=[ack3(self.inv.id, self.first)])
+
+    def test_given_commitment_accepted_after_delivered_verdict(self):
+        f = ni.acceptance_fields(self.inv, store=self.store, output_commitment=OUTPUT,
+                                 acks=[ack3(self.inv.id, self.first)])
+        self.assertEqual(f["delivered_evidence"]["source"], "given")
+        self.assertEqual(f["payer_acceptance"]["state"], "delivered")
+
+    # 5. upper-case hex accepted by both commands
+    def test_acceptance_cli_accepts_upper_case_commitment(self):
+        path = self.write([ack3(self.inv.id, self.first)])
+        code, out = self.cli("acceptance", "--invoice", self.inv.id, "--acks", path,
+                             "--output-commitment", OUTPUT.upper())
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out["delivered_evidence"]["output_commitment"], OUTPUT)
+        self.assertEqual(out["payer_acceptance"]["state"], "delivered")
+        code, out = self.cli("ack-read", PAYER, OUTPUT.upper(), self.first, path,
+                             "--order-id", self.inv.id)
+        self.assertEqual((code, out["verdict"]), (0, "delivered"))

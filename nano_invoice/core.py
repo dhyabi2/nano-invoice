@@ -888,9 +888,15 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
     - `duplicates`: every later transfer bound to this invoice as duplicate/late, each with
       its refund disposition. A duplicate's hash is never evidence of work: it appears here
       and nowhere else.
-    - `delivered_evidence`: the output_commitment (given as 64 lowercase hex; "" reads as not
-      given), or else the newest log verdict's when that verdict is "delivered" and no
-      tombstone follows it; otherwise None.
+    - `delivered_evidence`: the output_commitment (given as 64 hex, either case, read in
+      lower case; "" reads as not given), or else the newest log verdict's when that verdict
+      is "delivered" and no tombstone follows it; otherwise None. A given output_commitment
+      never overrides the log: when the invoice's newest verdict-or-tombstone record is a
+      tombstone or a verdict other than "delivered", giving one is refused (InvoiceError).
+
+    `acks` must be a list or tuple of JSON objects; anything else is refused with
+    InvoiceError rather than read as "no v3 ack". `acceptance_rule` must be a non-empty
+    string.
     - `payer_acceptance`: the verdict of the payer's current delivery-ack/v3 bound to THIS
       invoice id, the settling send block, that output_commitment and `acceptance_rule`.
       With no such ack, or none that verifies, or an invoice not `paid`/`overpaid` (an
@@ -898,6 +904,17 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
       "failed". v1/v2 acks bind no order or rule and are listed as not counted.
     """
     store = _require_store(store)
+    if acks is None:
+        acks = ()
+    if not isinstance(acks, (list, tuple)):
+        raise InvoiceError(f"acks_not_a_list: acks must be a list of ack objects, got "
+                           f"{type(acks).__name__}")
+    bad = [i for i, a in enumerate(acks) if not isinstance(a, dict)]
+    if bad:
+        raise InvoiceError(f"ack_not_an_object: acks must be JSON objects; index {bad[0]} is "
+                           f"{type(acks[bad[0]]).__name__}")
+    if not isinstance(acceptance_rule, str) or not acceptance_rule:
+        raise InvoiceError("acceptance_rule_empty: the acceptance rule must be a non-empty string")
     inv = store.get(invoice)
     payments = store.payments_for(inv.id)
     settling = [p for p in payments if p["kind"] in SETTLING_KINDS]
@@ -924,30 +941,44 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
         })
     if output_commitment == "":
         output_commitment = None
+    if isinstance(output_commitment, str):
+        output_commitment = output_commitment.lower()
     if output_commitment is not None and not v2.is_sha256(output_commitment):
         raise InvoiceError(f"output_commitment_not_sha256: {output_commitment!r}: expected 64 "
-                           f"lowercase hex characters")
-    evidence, source = output_commitment, "given" if output_commitment else None
-    if evidence is None:
-        # The newest verdict or tombstone decides: only a "delivered" verdict with an
-        # output_commitment is delivered evidence; a later failed/indeterminate verdict
-        # or a tombstone withdraws an earlier one.
-        for rec in reversed(store.log(inv)):
-            if rec.get("kind") == "tombstone":
-                break
-            if rec.get("kind") != "verdict":
-                continue
-            body = rec.get("body") or {}
-            oc = body.get("output_commitment")
-            if body.get("verdict") == "delivered" and v2.is_sha256(oc):
-                evidence, source = oc, f"log verdict seq {rec.get('seq')}"
+                           f"hex characters")
+    # The newest verdict or tombstone decides: only a "delivered" verdict with an
+    # output_commitment is delivered evidence; a later failed/indeterminate verdict
+    # or a tombstone withdraws an earlier one.
+    newest, logged = None, None
+    for rec in reversed(store.log(inv)):
+        if rec.get("kind") == "tombstone":
+            newest = rec
             break
+        if rec.get("kind") != "verdict":
+            continue
+        newest = rec
+        body = rec.get("body") or {}
+        oc = body.get("output_commitment")
+        if body.get("verdict") == "delivered" and v2.is_sha256(oc):
+            logged = (oc, f"log verdict seq {rec.get('seq')}")
+        break
+    if output_commitment is not None:
+        if newest is not None and (newest.get("kind") == "tombstone"
+                                   or (newest.get("body") or {}).get("verdict") != "delivered"):
+            what = ("a tombstone" if newest.get("kind") == "tombstone" else
+                    f"verdict {(newest.get('body') or {}).get('verdict')!r}")
+            raise InvoiceError(
+                f"output_commitment_withdrawn: the newest log record for {inv.id} is {what} "
+                f"(seq {newest.get('seq')}); a given output_commitment does not override it")
+        evidence, source = output_commitment, "given"
+    else:
+        evidence, source = logged if logged else (None, None)
     delivered_evidence = ({"output_commitment": evidence, "source": source}
                           if evidence else None)
 
     counted, not_counted = [], []
-    for i, a in enumerate(acks or ()):
-        if isinstance(a, dict) and a.get("version") == 3:
+    for i, a in enumerate(acks):
+        if a.get("version") == 3:
             counted.append((i, a))
         else:
             not_counted.append({"index": i, "reason": "not_v3: binds no order id or acceptance rule"})

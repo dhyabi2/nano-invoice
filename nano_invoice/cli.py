@@ -6,8 +6,12 @@ verify, 2 on a usage or document error, 3 on an RPC failure - and, for
 for `ack-read` (offline), 3 when no ack in the list verifies under the payer.
 `acceptance` (offline, reads the store) exits 0 whatever it reports - a missing or
 invalid payer ack reads "unknown", which is an answer, not a failure - and 2 on a
-usage or document error (unknown invoice, unreadable JSON, an --acks file whose top
-level is not a list, an --output-commitment that is not 64 lowercase hex).
+usage or document error (unknown invoice, a missing or unreadable --acks file,
+unreadable JSON, an --acks file whose top level is not a list of objects, an
+--output-commitment that is not 64 hex characters (either case) or that the newest
+log record - a tombstone or a verdict other than "delivered" - has withdrawn, an
+empty --acceptance-rule). `ack-read` likewise exits 2 on a missing or unreadable
+acks file, one whose top level is not a list, or an empty --acceptance-rule.
 `rep-check` exits 0 only when the representative matches and the block is
 confirmed (before --delivered-at, when given), 1 otherwise."""
 import argparse
@@ -170,6 +174,20 @@ def build_parser():
     return p
 
 
+def _load_acks(path):
+    """A JSON list of acks from a file (or - for stdin). A missing or unreadable file,
+    or a top level that is not a list, is a document error (exit 2), not an RPC one."""
+    try:
+        src = sys.stdin if path == "-" else open(path)
+        with src:
+            acks = json.load(src)
+    except OSError as e:
+        raise core.InvoiceError(f"acks_unreadable: {path}: {e.strerror or e}") from e
+    if not isinstance(acks, list):
+        raise core.InvoiceError(f"--acks must hold a JSON list of acks, got {type(acks).__name__}")
+    return acks
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     rpc = Rpc(args.rpc)
@@ -195,13 +213,13 @@ def main(argv=None):
             _out(result)
             return 0 if result["ok"] else 1
         if args.cmd == "ack-read":
-            src = sys.stdin if args.acks == "-" else open(args.acks)
-            with src:
-                acks = json.load(src)
+            acks = _load_acks(args.acks)
             if args.acceptance_rule is not None and args.order_id is None:
                 raise core.InvoiceError("--acceptance-rule needs --order-id")
-            rule = (args.acceptance_rule or nano_sig.ACCEPTANCE_RULE_V1
-                    if args.order_id is not None else None)
+            if args.acceptance_rule == "":
+                raise core.InvoiceError("--acceptance-rule must not be empty")
+            rule = ((nano_sig.ACCEPTANCE_RULE_V1 if args.acceptance_rule is None
+                     else args.acceptance_rule) if args.order_id is not None else None)
             result = nano_sig.read_payer_acks(args.payer_address, args.output_commitment,
                                               args.block_hash, acks, order_id=args.order_id,
                                               acceptance_rule=rule)
@@ -298,13 +316,7 @@ def main(argv=None):
                         h["ignored_claimed_payer"] = args.claimed_payer
             _out({"invoice_id": args.invoice, "refunds": hints})
         elif args.cmd == "acceptance":
-            acks = ()
-            if args.acks:
-                src = sys.stdin if args.acks == "-" else open(args.acks)
-                with src:
-                    acks = json.load(src)
-                if not isinstance(acks, list):
-                    raise core.InvoiceError("--acks must hold a JSON list of acks")
+            acks = _load_acks(args.acks) if args.acks else ()
             _out(core.acceptance_fields(args.invoice, store=store, acks=acks,
                                         output_commitment=args.output_commitment,
                                         acceptance_rule=args.acceptance_rule))
