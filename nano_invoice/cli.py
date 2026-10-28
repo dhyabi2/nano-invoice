@@ -322,7 +322,7 @@ def main(argv=None):
                         h["ignored_claimed_payer"] = args.claimed_payer
             _out({"invoice_id": args.invoice, "refunds": hints})
         elif args.cmd == "acceptance":
-            acks = _load_acks(args.acks) if args.acks else ()
+            acks = _load_acks(args.acks) if args.acks is not None else ()
             _out(core.acceptance_fields(args.invoice, store=store, acks=acks,
                                         output_commitment=args.output_commitment,
                                         acceptance_rule=args.acceptance_rule))

@@ -488,3 +488,10 @@ class ReviewFixesRun2(Base):
         code, out = self.cli("ack-read", PAYER, OUTPUT, self.first, path, "--order-id", "")
         self.assertEqual(code, 2, out)
         self.assertIn("--order-id", out["message"])
+
+    def test_acceptance_empty_acks_path_is_refused_like_a_missing_file(self):
+        code, out = self.cli("acceptance", "--invoice", self.inv.id, "--acks", "")
+        self.assertEqual(code, 2, out)
+        self.assertIn("acks_unreadable", out["message"])
+        code, out = self.cli("ack-read", PAYER, OUTPUT, self.first, "")
+        self.assertEqual(code, 2, out)
