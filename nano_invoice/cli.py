@@ -183,6 +183,10 @@ def _load_acks(path):
             acks = json.load(src)
     except OSError as e:
         raise core.InvoiceError(f"acks_unreadable: {path}: {e.strerror or e}") from e
+    except RecursionError as e:
+        raise core.InvoiceError(f"acks_not_json: {path}: nested too deeply to read") from e
+    except ValueError as e:
+        raise core.InvoiceError(f"acks_not_json: {path}: {e}") from e
     if not isinstance(acks, list):
         raise core.InvoiceError(f"--acks must hold a JSON list of acks, got {type(acks).__name__}")
     return acks
@@ -218,6 +222,8 @@ def main(argv=None):
                 raise core.InvoiceError("--acceptance-rule needs --order-id")
             if args.acceptance_rule == "":
                 raise core.InvoiceError("--acceptance-rule must not be empty")
+            if args.order_id == "":
+                raise core.InvoiceError("--order-id must not be empty")
             rule = ((nano_sig.ACCEPTANCE_RULE_V1 if args.acceptance_rule is None
                      else args.acceptance_rule) if args.order_id is not None else None)
             result = nano_sig.read_payer_acks(args.payer_address, args.output_commitment,

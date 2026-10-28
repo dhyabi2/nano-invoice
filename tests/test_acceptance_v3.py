@@ -405,3 +405,86 @@ class ReviewFixes(Base):
         code, out = self.cli("ack-read", PAYER, OUTPUT.upper(), self.first, path,
                              "--order-id", self.inv.id)
         self.assertEqual((code, out["verdict"]), (0, "delivered"))
+
+
+class ReviewFixesRun2(Base):
+    """Second review on #19: a given output_commitment cannot replace a logged delivered
+    verdict for another one, a superseded tombstone stays withdrawn, deeply nested acks
+    JSON and an empty --order-id are usage errors (exit 2)."""
+
+    OTHER = hashlib.sha256(b"another artifact").hexdigest()
+
+    def setUp(self):
+        super().setUp()
+        self.inv = self.v2_invoice()
+        self.first, _ = self.ledger.send(PAYER, MERCHANT, self.inv.pay_raw, T0 + 10)
+        ni.check_invoice(self.inv, rpc=self.ledger, store=self.store, now=T0 + 60)
+        self.inv = self.store.get(self.inv.id)
+        ni.append_verdict(self.inv, "delivered", output_commitment=OUTPUT, asserted_by="merchant",
+                          asserted_at=T0 + 300, store=self.store)
+
+    cli = ReviewFixes.cli
+    write = ReviewFixes.write
+
+    def test_given_commitment_does_not_override_a_delivered_verdict_for_another(self):
+        with self.assertRaises(ni.InvoiceError) as cm:
+            ni.acceptance_fields(self.inv, store=self.store, output_commitment=self.OTHER,
+                                 acks=[ack3(self.inv.id, self.first, output=self.OTHER)])
+        self.assertIn("output_commitment_conflicts", str(cm.exception))
+        code, out = self.cli("acceptance", "--invoice", self.inv.id,
+                             "--output-commitment", self.OTHER.upper())
+        self.assertEqual(code, 2, out)
+        # the logged commitment itself, given, is still read
+        f = ni.acceptance_fields(self.inv, store=self.store, output_commitment=OUTPUT,
+                                 acks=[ack3(self.inv.id, self.first)])
+        self.assertEqual(f["payer_acceptance"]["state"], "delivered")
+
+    def test_superseded_tombstone_is_not_revived_by_a_later_verdict(self):
+        ni.append_tombstone(self.inv, "replaced", superseded_by="inv_" + "cd" * 16,
+                            asserted_by="merchant", asserted_at=T0 + 400, store=self.store)
+        with self.assertRaises(ni.InvoiceError) as cm:
+            ni.append_verdict(self.inv, "delivered", output_commitment=OUTPUT,
+                              asserted_by="merchant", asserted_at=T0 + 500, store=self.store)
+        self.assertIn("receipt_superseded", str(cm.exception))
+        self.assertIsNone(ni.acceptance_fields(self.inv, store=self.store)["delivered_evidence"])
+
+    def test_superseded_tombstone_withdraws_a_later_verdict_already_in_the_log(self):
+        from nano_invoice import receipt_v2 as v2
+        ni.append_tombstone(self.inv, "replaced", superseded_by="inv_" + "cd" * 16,
+                            asserted_by="merchant", asserted_at=T0 + 400, store=self.store)
+        # a log written before append_verdict refused this
+        self.store.append(self.inv.id, "verdict", v2.verdict_body("delivered", output_commitment=OUTPUT),
+                          asserted_by="merchant", asserted_at=T0 + 500)
+        f = ni.acceptance_fields(self.inv, store=self.store, acks=[ack3(self.inv.id, self.first)])
+        self.assertIsNone(f["delivered_evidence"])
+        self.assertEqual(f["payer_acceptance"]["state"], "unknown")
+        with self.assertRaises(ni.InvoiceError):
+            ni.acceptance_fields(self.inv, store=self.store, output_commitment=OUTPUT)
+
+    def test_unsuperseded_tombstone_can_still_be_followed_by_a_verdict(self):
+        ni.append_tombstone(self.inv, "retracted", asserted_by="merchant", asserted_at=T0 + 400,
+                            store=self.store)
+        ni.append_verdict(self.inv, "delivered", output_commitment=OUTPUT, asserted_by="merchant",
+                          asserted_at=T0 + 500, store=self.store)
+        self.assertEqual(ni.acceptance_fields(self.inv, store=self.store)["delivered_evidence"]
+                         ["output_commitment"], OUTPUT)
+
+    def test_deeply_nested_or_invalid_acks_json_exits_2(self):
+        deep = os.path.join(self.tmp.name, "deep.json")
+        with open(deep, "w") as fh:
+            fh.write("[" * 200000 + "]" * 200000)
+        bad = os.path.join(self.tmp.name, "bad.json")
+        with open(bad, "w") as fh:
+            fh.write("[{")
+        for path in (deep, bad):
+            code, out = self.cli("acceptance", "--invoice", self.inv.id, "--acks", path)
+            self.assertEqual(code, 2, out)
+            self.assertIn("acks_not_json", out["message"])
+            code, out = self.cli("ack-read", PAYER, OUTPUT, self.first, path)
+            self.assertEqual(code, 2, out)
+
+    def test_ack_read_empty_order_id_is_refused(self):
+        path = self.write([ack3(self.inv.id, self.first)])
+        code, out = self.cli("ack-read", PAYER, OUTPUT, self.first, path, "--order-id", "")
+        self.assertEqual(code, 2, out)
+        self.assertIn("--order-id", out["message"])

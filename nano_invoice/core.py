@@ -892,7 +892,9 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
       lower case; "" reads as not given), or else the newest log verdict's when that verdict
       is "delivered" and no tombstone follows it; otherwise None. A given output_commitment
       never overrides the log: when the invoice's newest verdict-or-tombstone record is a
-      tombstone or a verdict other than "delivered", giving one is refused (InvoiceError).
+      tombstone or a verdict other than "delivered", or a "delivered" verdict for a different
+      output_commitment, giving one is refused (InvoiceError). A tombstone with
+      superseded_by set withdraws the invoice for good: no later verdict revives it.
 
     `acks` must be a list or tuple of JSON objects; anything else is refused with
     InvoiceError rather than read as "no v3 ack". `acceptance_rule` must be a non-empty
@@ -950,7 +952,10 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
     # output_commitment is delivered evidence; a later failed/indeterminate verdict
     # or a tombstone withdraws an earlier one.
     newest, logged = None, None
-    for rec in reversed(store.log(inv)):
+    log = store.log(inv)
+    superseded = next((rec for rec in log if rec.get("kind") == "tombstone"
+                       and (rec.get("body") or {}).get("superseded_by") is not None), None)
+    for rec in reversed(log):
         if rec.get("kind") == "tombstone":
             newest = rec
             break
@@ -962,6 +967,9 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
         if body.get("verdict") == "delivered" and v2.is_sha256(oc):
             logged = (oc, f"log verdict seq {rec.get('seq')}")
         break
+    if superseded is not None:
+        # fail closed: a superseded receipt stays withdrawn, whatever follows it
+        newest, logged = superseded, None
     if output_commitment is not None:
         if newest is not None and (newest.get("kind") == "tombstone"
                                    or (newest.get("body") or {}).get("verdict") != "delivered"):
@@ -970,6 +978,11 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
             raise InvoiceError(
                 f"output_commitment_withdrawn: the newest log record for {inv.id} is {what} "
                 f"(seq {newest.get('seq')}); a given output_commitment does not override it")
+        if logged is not None and logged[0] != output_commitment:
+            raise InvoiceError(
+                f"output_commitment_conflicts: the newest log record for {inv.id} is a delivered "
+                f"verdict for {logged[0]} ({logged[1]}); a given output_commitment "
+                f"{output_commitment} does not override it")
         evidence, source = output_commitment, "given"
     else:
         evidence, source = logged if logged else (None, None)
@@ -1080,6 +1093,12 @@ def append_verdict(invoice, verdict, output_commitment=None, asserted_by=None, a
     if inv.state == "open":
         raise InvoiceError(
             f"{inv.id} is open: a delivery verdict is appended after settlement, not before it")
+    for rec in store.log(inv):
+        sup = (rec.get("body") or {}).get("superseded_by") if rec.get("kind") == "tombstone" else None
+        if sup is not None:
+            raise InvoiceError(
+                f"receipt_superseded: {inv.id} was tombstoned as superseded by {sup} "
+                f"(seq {rec.get('seq')}); a later verdict would revive it")
     try:
         body = v2.verdict_body(verdict, output_commitment=output_commitment,
                                accept_token=accept_token, note=note, payer_ack=payer_ack)
