@@ -15,6 +15,7 @@ import time
 from . import account as acct
 from . import core
 from . import nano_sig
+from . import price
 from . import rep_binding
 from .rpc import DEFAULT_RPC, Rpc
 
@@ -48,6 +49,11 @@ def build_parser():
     amt = c.add_mutually_exclusive_group(required=True)
     amt.add_argument("--amount-raw", help="price in raw, an integer (1 XNO = 10**30 raw)")
     amt.add_argument("--amount-xno", help="price in XNO as an exact decimal string, e.g. 0.25")
+    amt.add_argument("--amount-usd", help="price in USD, e.g. 0.01: converted to a fixed XNO amount "
+                                          "at a rate read ONCE now (the node's price action) and "
+                                          "recorded on the invoice; a re-run of the order keeps it")
+    c.add_argument("--usd-per-xno", help="with --amount-usd: the USD-per-XNO rate to use, from "
+                                         "your own source; no network call")
     c.add_argument("--order-key", required=True)
     c.add_argument("--expires-s", type=int, default=3600)
     # Receipt v2. Supplying --terms-file makes this a bound invoice; without it
@@ -226,7 +232,11 @@ def main(argv=None):
             return 0 if result["ok"] else 1
         store = core.Store(args.db)
         if args.cmd == "create":
-            raw = int(args.amount_raw) if args.amount_raw is not None else core.xno_to_raw(args.amount_xno)
+            if args.usd_per_xno is not None and args.amount_usd is None:
+                raise core.InvoiceError("--usd-per-xno needs --amount-usd")
+            raw = (None if args.amount_usd is not None
+                   else int(args.amount_raw) if args.amount_raw is not None
+                   else core.xno_to_raw(args.amount_xno))
             terms = None
             if args.terms_file:
                 tsrc = sys.stdin if args.terms_file == "-" else open(args.terms_file)
@@ -238,9 +248,14 @@ def main(argv=None):
                 if not isinstance(terms, dict):
                     raise core.InvoiceError("terms_not_an_object: the terms file must hold an object")
                 terms = dict(terms, counterparty_role=args.counterparty_role)
-            inv = core.create_invoice(args.merchant, raw, args.order_key, args.expires_s, store=store,
-                                      terms=terms, intent_hash=args.intent_hash,
-                                      idempotency_key=args.idempotency_key)
+            bound = dict(terms=terms, intent_hash=args.intent_hash, idempotency_key=args.idempotency_key)
+            if raw is None:
+                inv = price.create_invoice_usd(args.merchant, args.amount_usd, args.order_key,
+                                               args.expires_s, store=store, usd_per_xno=args.usd_per_xno,
+                                               rpc=rpc, **bound)
+            else:
+                inv = core.create_invoice(args.merchant, raw, args.order_key, args.expires_s, store=store,
+                                          **bound)
             _out(dict(inv.to_dict(), instruction=f"send exactly {inv.pay_raw} raw to {inv.merchant}"))
         elif args.cmd == "verdict":
             _out(core.append_verdict(

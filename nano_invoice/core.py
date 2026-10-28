@@ -116,6 +116,9 @@ def invoice_id_for(merchant, order_key_sha256):
     return "inv_" + hashlib.sha256(f"{ID_PREFIX}|{merchant}|{order_key_sha256}".encode()).hexdigest()[:32]
 
 
+QUOTE_FIELDS = ("quote_usd", "quote_usd_per_xno", "quote_source", "quote_read_at")
+
+
 @dataclasses.dataclass(frozen=True)
 class Invoice:
     id: str
@@ -141,6 +144,13 @@ class Invoice:
     terms_json: str = None
     terms_sha256: str = None
     binding_sha256: str = None
+    # USD quote (2026-10-28), set only by an invoice priced with --amount-usd:
+    # the reference rate read ONCE at creation. Nullable, so older invoices load
+    # unchanged; the raw amount above is what the invoice asks for, not these.
+    quote_usd: str = None
+    quote_usd_per_xno: str = None
+    quote_source: str = None
+    quote_read_at: str = None
 
     def to_dict(self):
         d = dataclasses.asdict(self)
@@ -150,6 +160,10 @@ class Invoice:
         d.pop("terms_json", None)
         if self.terms_json:
             d["terms"] = json.loads(self.terms_json)
+        quote = {k[len("quote_"):]: d.pop(k) for k in QUOTE_FIELDS}
+        if self.quote_usd is not None:
+            d["usd_quote"] = dict(quote, note="reference rate read once when the invoice was created; "
+                                              "not a swap quote; the XNO amount does not change")
         return d
 
     @property
@@ -275,6 +289,11 @@ class Store:
         ("invoices", "terms_json", "TEXT"),
         ("invoices", "terms_sha256", "TEXT"),
         ("invoices", "binding_sha256", "TEXT"),
+        # USD quote, 2026-10-28: nullable and additive like the rest.
+        ("invoices", "quote_usd", "TEXT"),
+        ("invoices", "quote_usd_per_xno", "TEXT"),
+        ("invoices", "quote_source", "TEXT"),
+        ("invoices", "quote_read_at", "TEXT"),
     )
 
     def _migrate(self):
@@ -445,7 +464,7 @@ def _require_store(store):
 
 def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, store=None, now=None,
                    witness_at=None, terms=None, intent_hash=None, idempotency_key=None,
-                   _rand=secrets.randbelow):
+                   quote=None, _rand=secrets.randbelow):
     """Idempotent: the same (merchant, order_key) always returns the same invoice.
     The same order key with a different amount raises OrderConflict.
 
@@ -461,7 +480,13 @@ def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, stor
     `policy_version` lives in the terms, and a binding missing it would claim
     to bind an authorisation version it does not carry. Without `terms` nothing
     changes: the invoice has no binding and `receipt()` emits v1 exactly as
-    before."""
+    before.
+
+    `quote` ({usd, usd_per_xno, source, read_at}, strings) records the USD
+    reference rate an amount was converted at (see price.create_invoice_usd).
+    It is stored beside the invoice and binds nothing: the amount is amount_raw.
+    An existing invoice whose recorded USD amount equals quote["usd"] is
+    returned as it is, with its first quote."""
     store = _require_store(store)
     merchant = acct.normalise(merchant_account)
     require_raw(amount_raw, "amount_raw", minimum=TAG_MODULUS)
@@ -509,7 +534,9 @@ def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, stor
         row = c.execute("SELECT * FROM invoices WHERE id = ?", (inv_id,)).fetchone()
         if row is not None:
             existing = Store._invoice(row)
-            if existing.amount_raw != amount_raw:
+            same_usd = (quote is not None and existing.quote_usd is not None
+                        and existing.quote_usd == quote.get("usd"))
+            if existing.amount_raw != amount_raw and not same_usd:
                 raise OrderConflict(
                     f"order already invoiced as {existing.id} for {existing.amount_raw} raw; "
                     f"refusing a second invoice for {amount_raw} raw")
@@ -534,14 +561,17 @@ def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, stor
         c.execute(
             "INSERT INTO invoices(id, merchant, order_key_sha256, amount_raw, tag, pay_raw, created_at,"
             " expires_at, witness_at, state, intent_hash, idempotency_key, policy_version, terms_json,"
-            " terms_sha256, binding_sha256) VALUES (?,?,?,?,?,?,?,?,?, 'open',?,?,?,?,?,?)",
+            " terms_sha256, binding_sha256, quote_usd, quote_usd_per_xno, quote_source, quote_read_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?, 'open',?,?,?,?,?,?,?,?,?,?)",
             (inv_id, merchant, okh, str(amount_raw), tag, str(pay_raw), now, now + expires_s, witness_at,
              intent_hash, idempotency_key,
              None if normalised_terms is None else normalised_terms["policy_version"],
              None if binding is None else json.dumps(
                  normalised_terms, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
              None if binding is None else binding["terms_sha256"],
-             None if binding is None else v2.digest(binding)))
+             None if binding is None else v2.digest(binding),
+             *((None,) * 4 if quote is None else
+               (str(quote["usd"]), str(quote["usd_per_xno"]), str(quote["source"]), str(quote["read_at"])))))
     if normalised_terms is not None:
         # Record 0 of the append-only log. Written outside the invoice INSERT's
         # transaction on purpose: `Store.append` opens its own BEGIN IMMEDIATE
