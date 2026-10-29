@@ -9,9 +9,11 @@ invalid payer ack reads "unknown", which is an answer, not a failure - and 2 on 
 usage or document error (unknown invoice, a missing or unreadable --acks file,
 unreadable JSON, an --acks file whose top level is not a list of objects, an
 --output-commitment that is not 64 hex characters (either case) or that the newest
-log record - a tombstone or a verdict other than "delivered" - has withdrawn, an
-empty --acceptance-rule). `ack-read` likewise exits 2 on a missing or unreadable
-acks file, one whose top level is not a list, or an empty --acceptance-rule.
+log record - a tombstone or a verdict other than "delivered" - has withdrawn, or
+that differs from the output_commitment of a newest "delivered" verdict
+(output_commitment_conflicts), an empty --acceptance-rule). `ack-read` likewise
+exits 2 on a missing or unreadable acks file, one whose top level is not a list,
+an empty --order-id, or an empty --acceptance-rule (or one given without --order-id).
 `rep-check` exits 0 only when the representative matches and the block is
 confirmed (before --delivered-at, when given), 1 otherwise."""
 import argparse
@@ -124,7 +126,7 @@ def build_parser():
     ac.add_argument("--invoice", required=True)
     ac.add_argument("--acks", help="JSON file (or - for stdin): a list of payer acks; only "
                                    "delivery-ack/v3 counts as acceptance")
-    ac.add_argument("--output-commitment", help="sha256 of what was delivered, 64 lowercase hex "
+    ac.add_argument("--output-commitment", help="sha256 of what was delivered, 64 hex, either case "
                                                 "(default: the newest log verdict's, when it is "
                                                 "delivered and not tombstoned)")
     ac.add_argument("--acceptance-rule", default=nano_sig.ACCEPTANCE_RULE_V1,
