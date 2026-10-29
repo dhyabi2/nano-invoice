@@ -184,7 +184,7 @@ assert ni.verify_log(rcpt["log"])["ok"]                # the chain, offline
 
 - `ack-read` now exits **2** (usage error), not 3, when the acks file is missing or unreadable (an empty path `""` included), holds JSON nested too deeply to read, or holds anything other than a JSON list - a `null` or an object included. Plain invalid JSON, and bytes that are not UTF-8, already exited 2 and still do. Exit 3 still means "no ack verifies", which still includes a list whose items are not ack objects. (`acceptance` is new in this release; its `--acks` follows the same rules, also refuses an item that is not an object, and refuses an empty `--acks ""` path like a missing file rather than reading it as "no acks".)
 - In `ack-read` without `--order-id`, a v3 ack is ignored with reason `v3_needs_order_and_rule` (it was listed as `malformed`); the exit code is unchanged (3 when nothing else verifies).
-- In `ack-read`, a v2 ack whose `verdict` is not a string (a list, say) is listed as `malformed` instead of crashing with `TypeError` (exit 3), so a list that also holds a valid ack now exits 0.
+- In `ack-read`, a v2 ack whose `verdict` is a list or object is listed as `malformed` instead of crashing with `TypeError` (exit 3), so a list that also holds a valid ack now exits 0.
 - `verdict` (`append_verdict`) refuses an invoice whose log holds a tombstone with `superseded_by` set (`receipt_superseded`, exit 2): a superseded receipt stays withdrawn, and `acceptance` reads such an invoice as having no delivered evidence whatever follows the tombstone. A tombstone without `superseded_by` can still be followed by a new verdict.
 
 ### What a v2 receipt still does NOT prove
