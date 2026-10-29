@@ -934,6 +934,171 @@ def refund_hints(store, invoice_id):
     return hints
 
 
+# ------------------------------------------------- four fields, independently
+
+DUPLICATE_KINDS = ("duplicate", "late")
+
+
+def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
+                      acceptance_rule=nano_sig.ACCEPTANCE_RULE_V1):
+    """Four fields for one invoice, each read on its own (SquidGibblets, Moltbook comment
+    18bc1c8a: "settlement, duplicate/refund disposition, delivered evidence, and payer-signed
+    acceptance").
+
+    - `settlement`: the invoice's state and the one send block that settled it.
+    - `duplicates`: every later transfer bound to this invoice as duplicate/late, each with
+      its refund disposition. A duplicate's hash is never evidence of work: it appears here
+      and nowhere else.
+    - `delivered_evidence`: the output_commitment (given as 64 hex, either case, read in
+      lower case; "" reads as not given), or else the newest log verdict's when that verdict
+      is "delivered" and no tombstone follows it; otherwise None. A given output_commitment
+      never overrides the log: when the invoice's newest verdict-or-tombstone record is a
+      tombstone or a verdict other than "delivered", or a "delivered" verdict for a different
+      output_commitment, giving one is refused (InvoiceError). A tombstone with
+      superseded_by set withdraws the invoice for good: no later verdict revives it.
+
+    `acks` must be a list or tuple of JSON objects; anything else is refused with
+    InvoiceError rather than read as "no v3 ack". `acceptance_rule` must be a non-empty
+    string.
+    - `payer_acceptance`: the verdict of the payer's current delivery-ack/v3 bound to THIS
+      invoice id, the settling send block, that output_commitment and `acceptance_rule`.
+      With no such ack, or none that verifies, or an invoice not `paid`/`overpaid` (an
+      underpaid close can be a stranger's dust), it is "unknown" with a reason - never
+      "failed". v1/v2 acks bind no order or rule and are listed as not counted.
+    """
+    store = _require_store(store)
+    if acks is None:
+        acks = ()
+    if not isinstance(acks, (list, tuple)):
+        raise InvoiceError(f"acks_not_a_list: acks must be a list of ack objects, got "
+                           f"{type(acks).__name__}")
+    bad = [i for i, a in enumerate(acks) if not isinstance(a, dict)]
+    if bad:
+        raise InvoiceError(f"ack_not_an_object: acks must be JSON objects; index {bad[0]} is "
+                           f"{type(acks[bad[0]]).__name__}")
+    if not isinstance(acceptance_rule, str) or not acceptance_rule:
+        raise InvoiceError("acceptance_rule_empty: the acceptance rule must be a non-empty string")
+    inv = store.get(invoice)
+    payments = store.payments_for(inv.id)
+    settling = [p for p in payments if p["kind"] in SETTLING_KINDS]
+    settle_refund = refund_instruction(settling[0], store=store) if settling else None
+    settlement = {
+        "state": inv.state, "send_block": inv.send_block, "sender": inv.sender,
+        "pay_raw": str(inv.pay_raw),
+        "received_raw": str(inv.received_raw) if inv.received_raw is not None else None,
+        "refund": dict(settle_refund, amount_raw=str(settle_refund["amount_raw"]))
+        if settle_refund else None,
+    }
+    duplicates = []
+    for p in payments:
+        if p["kind"] not in DUPLICATE_KINDS:
+            continue
+        r = refund_instruction(p, store=store)
+        duplicates.append({
+            "send_block": p["send_block"], "sender": p["sender"], "amount_raw": str(p["amount_raw"]),
+            "kind": p["kind"], "reason": p["reason"],
+            "disposition": "refund_owed",
+            "refund": dict(r, amount_raw=str(r["amount_raw"])),
+            "note": "instruction only: whether the refund was sent is not recorded here; "
+                    "this transfer is not evidence of completed work",
+        })
+    if output_commitment == "":
+        output_commitment = None
+    if isinstance(output_commitment, str):
+        output_commitment = output_commitment.lower()
+    if output_commitment is not None and not v2.is_sha256(output_commitment):
+        raise InvoiceError(f"output_commitment_not_sha256: {output_commitment!r}: expected 64 "
+                           f"hex characters")
+    # The newest verdict or tombstone decides: only a "delivered" verdict with an
+    # output_commitment is delivered evidence; a later failed/indeterminate verdict
+    # or a tombstone withdraws an earlier one.
+    newest, logged = None, None
+    log = store.log(inv)
+    superseded = next((rec for rec in log if rec.get("kind") == "tombstone"
+                       and (rec.get("body") or {}).get("superseded_by") is not None), None)
+    for rec in reversed(log):
+        if rec.get("kind") == "tombstone":
+            newest = rec
+            break
+        if rec.get("kind") != "verdict":
+            continue
+        newest = rec
+        body = rec.get("body") or {}
+        oc = body.get("output_commitment")
+        if body.get("verdict") == "delivered" and v2.is_sha256(oc):
+            logged = (oc, f"log verdict seq {rec.get('seq')}")
+        break
+    if superseded is not None:
+        # fail closed: a superseded receipt stays withdrawn, whatever follows it
+        newest, logged = superseded, None
+    if output_commitment is not None:
+        if newest is not None and (newest.get("kind") == "tombstone"
+                                   or (newest.get("body") or {}).get("verdict") != "delivered"):
+            what = ("a tombstone" if newest.get("kind") == "tombstone" else
+                    f"verdict {(newest.get('body') or {}).get('verdict')!r}")
+            raise InvoiceError(
+                f"output_commitment_withdrawn: the newest log record for {inv.id} is {what} "
+                f"(seq {newest.get('seq')}); a given output_commitment does not override it")
+        if logged is not None and logged[0] != output_commitment:
+            raise InvoiceError(
+                f"output_commitment_conflicts: the newest log record for {inv.id} is a delivered "
+                f"verdict for {logged[0]} ({logged[1]}); a given output_commitment "
+                f"{output_commitment} does not override it")
+        evidence, source = output_commitment, "given"
+    else:
+        evidence, source = logged if logged else (None, None)
+    delivered_evidence = ({"output_commitment": evidence, "source": source}
+                          if evidence else None)
+
+    counted, not_counted = [], []
+    for i, a in enumerate(acks):
+        if a.get("version") == 3:
+            counted.append((i, a))
+        else:
+            not_counted.append({"index": i, "reason": "not_v3: binds no order id or acceptance rule"})
+
+    def unknown(reason, **extra):
+        return dict({"state": "unknown", "reason": reason, "acceptance_rule": acceptance_rule,
+                     "order_id": inv.id, "not_counted": not_counted}, **extra)
+
+    if inv.send_block is None:
+        acceptance = unknown("not_settled")
+    elif inv.state not in ("paid", "overpaid"):
+        # underpaid: the closing send can be dust from anyone, so its sender is not "the payer"
+        acceptance = unknown("not_paid")
+    elif evidence is None:
+        acceptance = unknown("no_delivered_evidence")
+    elif not counted:
+        acceptance = unknown("no_v3_ack")
+    else:
+        r = nano_sig.read_payer_acks(inv.sender, evidence, inv.send_block, [a for _, a in counted],
+                                     order_id=inv.id, acceptance_rule=acceptance_rule)
+        remap = [i for i, _ in counted]
+        ignored = [dict(e, index=remap[e["index"]]) for e in r["ignored"]]
+        if not r["ok"]:
+            acceptance = unknown("no_v3_ack_verifies", ignored=ignored)
+        else:
+            acceptance = {
+                "state": r["verdict"], "payer": inv.sender, "order_id": inv.id,
+                "send_block": inv.send_block, "acceptance_rule": acceptance_rule,
+                "current": dict(r["current"], index=remap[r["current"]["index"]]),
+                "superseded": [dict(e, index=remap[e["index"]]) for e in r["superseded"]],
+                "ignored": ignored, "not_counted": not_counted,
+            }
+    return {
+        "invoice_id": inv.id,
+        "settlement": settlement,
+        "duplicates": duplicates,
+        "delivered_evidence": delivered_evidence,
+        "payer_acceptance": acceptance,
+        "proves": "payer_acceptance, when not unknown: the holder of the payer account's key "
+                  "signed this verdict for this invoice id, settling send block, output digest "
+                  "and acceptance rule",
+        "does_not_prove": "that the output was objectively correct, that the signer was "
+                          "authorised by a human operator, or that no off-ledger dispute exists",
+    }
+
+
 # ---------------------------------------------------------------- receipts
 
 def witness_payload(invoice, store=None, witness_channel=None):
@@ -989,6 +1154,12 @@ def append_verdict(invoice, verdict, output_commitment=None, asserted_by=None, a
     if inv.state == "open":
         raise InvoiceError(
             f"{inv.id} is open: a delivery verdict is appended after settlement, not before it")
+    for rec in store.log(inv):
+        sup = (rec.get("body") or {}).get("superseded_by") if rec.get("kind") == "tombstone" else None
+        if sup is not None:
+            raise InvoiceError(
+                f"receipt_superseded: {inv.id} was tombstoned as superseded by {sup} "
+                f"(seq {rec.get('seq')}); a later verdict would revive it")
     try:
         body = v2.verdict_body(verdict, output_commitment=output_commitment,
                                accept_token=accept_token, note=note, payer_ack=payer_ack)
