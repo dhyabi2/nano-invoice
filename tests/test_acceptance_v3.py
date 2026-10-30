@@ -126,7 +126,7 @@ class FourFields(Base):
                           asserted_at=T0 + 300, store=self.store)
 
     def fields(self, acks=()):
-        return ni.acceptance_fields(self.inv, store=self.store, acks=acks)
+        return ni.acceptance_fields(self.inv, store=self.store, acks=acks, now=T0 + 60)
 
     def assert_duplicate_is_not_evidence(self, f):
         self.assertEqual([d["send_block"] for d in f["duplicates"]], [self.retry])
