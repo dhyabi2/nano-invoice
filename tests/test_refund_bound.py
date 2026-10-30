@@ -51,6 +51,23 @@ class RefundBound(Base):
                          ("refunded", False, REFUND))
         self.assertIn("not checked on chain", d["note"])
 
+    def test_overdue_is_not_terminal(self):
+        """prismdeadlines (Moltbook c384bbf8): is refund_overdue terminal, or does a late
+        refund block still flip it to refunded? It flips: overdue is a fact about the time,
+        never a final disposition, and the lateness stays readable as refunded_late."""
+        due = T0 + 20 + DAY
+        d = self.dup(due + 1)
+        self.assertEqual((d["disposition"], d["refund_overdue"], d["refunded_late"]),
+                         ("refund_owed", True, False))
+        ni.record_refund(self.inv.id, self.retry, REFUND, store=self.store, at=due + 3600)
+        d = self.dup(due + 7200)
+        self.assertEqual((d["disposition"], d["refund_overdue"], d["refunded_late"],
+                          d["refund_block"], d["refund"]), ("refunded", False, True, REFUND, None))
+
+    def test_refund_in_time_is_not_late(self):
+        ni.record_refund(self.inv.id, self.retry, REFUND, store=self.store, at=T0 + 500)
+        self.assertIs(self.dup(T0 + 10 * DAY)["refunded_late"], False)
+
     def test_record_refused_for_a_non_duplicate_block(self):
         for block in (self.first, "CD" * 32):  # the settling payment; an unknown block
             with self.subTest(block=block), self.assertRaises(ni.InvoiceError):

@@ -1018,7 +1018,10 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
       (None, with `refund_due_by_reason`, when no block time was recorded). The
       disposition is `refunded` once `record_refund` holds its refund block, else
       `refund_owed` (as on earlier versions); `refund_overdue` is true when no refund is
-      recorded and `now` > refund_due_by, false otherwise (and with no deadline).
+      recorded and `now` > refund_due_by, false otherwise (and with no deadline). Overdue is
+      not terminal: a refund recorded after refund_due_by still reads `refunded`, with
+      `refunded_late` true (recorded_at > refund_due_by), so an integrator never treats
+      overdue as final and counts a late refund twice.
     - `delivered_evidence`: the output_commitment (given as 64 hex, either case, read in
       lower case; "" reads as not given), or else the newest log verdict's when that verdict
       is "delivered" and no tombstone follows it; otherwise None. A given output_commitment
@@ -1055,8 +1058,9 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
     now = int(time.time()) if now is None else _epoch_s(now, "now")
     inv = store.get(invoice)
     payments = store.payments_for(inv.id)
-    refunded = {r["send_block"]: r["refund_block"] for r in store.conn.execute(
-        "SELECT send_block, refund_block FROM refunds_sent WHERE invoice_id = ?", (inv.id,))}
+    refunded = {r["send_block"]: (r["refund_block"], r["recorded_at"]) for r in store.conn.execute(
+        "SELECT send_block, refund_block, recorded_at FROM refunds_sent WHERE invoice_id = ?",
+        (inv.id,))}
     settling = [p for p in payments if p["kind"] in SETTLING_KINDS]
     settle_refund = refund_instruction(settling[0], store=store) if settling else None
     settlement = {
@@ -1072,7 +1076,7 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
             continue
         r = refund_instruction(p, store=store)
         due = p["block_ts"] + refund_window_s if p["block_ts"] is not None else None
-        refund_block = refunded.get(p["send_block"])
+        refund_block, recorded_at = refunded.get(p["send_block"], (None, None))
         # `disposition` keeps main's value (`refund_owed`) until a refund is recorded, so a
         # job that refunds every `refund_owed` row never loses the late ones; lateness is
         # its own field.
@@ -1082,6 +1086,7 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
             "kind": p["kind"], "reason": p["reason"],
             "disposition": disposition, "refund_due_by": due,
             "refund_overdue": not refund_block and due is not None and now > due,
+            "refunded_late": bool(refund_block) and due is not None and recorded_at > due,
             "refund_block": refund_block,
             "refund": None if refund_block else dict(r, amount_raw=str(r["amount_raw"])),
             "note": "instruction only: nano-invoice never sends funds; refund_block is the "
