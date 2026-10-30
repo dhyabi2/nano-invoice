@@ -4,8 +4,9 @@ prismdeadlines (Moltbook): the duplicate case "needs a time bound, since a refun
 instruction the merchant never executes is indistinguishable from one it will."
 On main a duplicate reads `refund_owed` for ever: no deadline, and no way to say
 the refund went out. Here each duplicate/late transfer gets `refund_due_by` (its
-block time + refund_window_s) and reads `refund_owed`, `refund_overdue` or, once
-the merchant records its refund send block, `refunded`. No network: FakeLedger.
+block time + refund_window_s); `refund_overdue` turns true after it, while the
+disposition stays `refund_owed` (main's value) until the merchant records its refund
+send block, when it reads `refunded`. No network: FakeLedger.
 """
 import nano_invoice as ni
 from tests.test_acceptance_v3 import PAYER
@@ -30,14 +31,15 @@ class RefundBound(Base):
 
     def test_refund_owed_within_window(self):
         d = self.dup(T0 + 20 + DAY)
-        self.assertEqual((d["disposition"], d["refund_due_by"], d["refund_block"]),
-                         ("refund_owed", T0 + 20 + DAY, None))
+        self.assertEqual((d["disposition"], d["refund_overdue"], d["refund_due_by"],
+                          d["refund_block"]), ("refund_owed", False, T0 + 20 + DAY, None))
         d = self.dup(T0 + 80, refund_window_s=60)        # the deadline itself is still in time
         self.assertEqual((d["disposition"], d["refund_due_by"]), ("refund_owed", T0 + 80))
 
     def test_refund_overdue_after_window(self):
         d = self.dup(T0 + 20 + DAY + 1)
-        self.assertEqual((d["disposition"], d["refund_due_by"]), ("refund_overdue", T0 + 20 + DAY))
+        self.assertEqual((d["disposition"], d["refund_overdue"], d["refund_due_by"]),
+                         ("refund_owed", True, T0 + 20 + DAY))
 
     def test_refunded_after_record(self):
         rec = ni.record_refund(self.inv.id, self.retry.lower(), REFUND.lower(), store=self.store,
@@ -45,7 +47,8 @@ class RefundBound(Base):
         self.assertEqual((rec["send_block"], rec["refund_block"], rec["recorded_at"]),
                          (self.retry, REFUND, T0 + 500))
         d = self.dup(T0 + 10 * DAY)          # long after the deadline: recorded, not overdue
-        self.assertEqual((d["disposition"], d["refund_block"]), ("refunded", REFUND))
+        self.assertEqual((d["disposition"], d["refund_overdue"], d["refund_block"]),
+                         ("refunded", False, REFUND))
         self.assertIn("not checked on chain", d["note"])
 
     def test_record_refused_for_a_non_duplicate_block(self):
@@ -96,7 +99,8 @@ class RefundBound(Base):
         self.store.conn.execute("UPDATE payments SET block_ts = 0 WHERE send_block = ?",
                                 (self.retry,))
         d = self.dup(DAY + 1, refund_window_s=DAY)
-        self.assertEqual((d["disposition"], d["refund_due_by"]), ("refund_overdue", DAY))
+        self.assertEqual((d["disposition"], d["refund_overdue"], d["refund_due_by"]),
+                         ("refund_owed", True, DAY))
 
     def test_no_block_time_is_said_not_invented(self):
         self.store.conn.execute("UPDATE payments SET block_ts = NULL WHERE send_block = ?",
@@ -134,3 +138,23 @@ class RefundBound(Base):
         self.store = ni.Store(self.db)
         d = json.loads(buf.getvalue())["duplicates"][0]
         self.assertEqual((code, d["refund_due_by"]), (0, T0 + 80))
+
+    def test_cli_record_refund(self):
+        import contextlib, io, json
+        from nano_invoice import cli
+        self.store.close()
+        def run(*argv):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = cli.main(["--db", self.db, *argv])
+            return code, json.loads(buf.getvalue())
+        code, out = run("record-refund", "--invoice", self.inv.id, "--duplicate-block",
+                        self.retry, "--refund-block", REFUND, "--at", str(T0 + 500))
+        self.assertEqual((code, out["refund_block"], out["recorded_at"]), (0, REFUND, T0 + 500))
+        code, _ = run("record-refund", "--invoice", self.inv.id, "--duplicate-block",
+                      self.retry, "--refund-block", "EF" * 32)
+        self.assertEqual(code, 2)
+        code, out = run("refund-hint", "--invoice", self.inv.id)
+        self.assertNotIn(self.retry, [h["source_block"] for h in out["refunds"]])
+        self.store = ni.Store(self.db)
+        self.assertEqual(self.dup(T0 + 10 * DAY)["disposition"], "refunded")

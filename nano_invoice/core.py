@@ -1017,8 +1017,8 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
       and nowhere else. `refund_due_by` is the transfer's block time + `refund_window_s`
       (None, with `refund_due_by_reason`, when no block time was recorded). The
       disposition is `refunded` once `record_refund` holds its refund block, else
-      `refund_owed` while `now` <= refund_due_by (or with no deadline), else
-      `refund_overdue`.
+      `refund_owed` (as on earlier versions); `refund_overdue` is true when no refund is
+      recorded and `now` > refund_due_by, false otherwise (and with no deadline).
     - `delivered_evidence`: the output_commitment (given as 64 hex, either case, read in
       lower case; "" reads as not given), or else the newest log verdict's when that verdict
       is "delivered" and no tombstone follows it; otherwise None. A given output_commitment
@@ -1073,12 +1073,16 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
         r = refund_instruction(p, store=store)
         due = p["block_ts"] + refund_window_s if p["block_ts"] is not None else None
         refund_block = refunded.get(p["send_block"])
-        disposition = ("refunded" if refund_block else
-                       "refund_overdue" if due is not None and now > due else "refund_owed")
+        # `disposition` keeps main's value (`refund_owed`) until a refund is recorded, so a
+        # job that refunds every `refund_owed` row never loses the late ones; lateness is
+        # its own field.
+        disposition = "refunded" if refund_block else "refund_owed"
         entry = {
             "send_block": p["send_block"], "sender": p["sender"], "amount_raw": str(p["amount_raw"]),
             "kind": p["kind"], "reason": p["reason"],
-            "disposition": disposition, "refund_due_by": due, "refund_block": refund_block,
+            "disposition": disposition, "refund_due_by": due,
+            "refund_overdue": not refund_block and due is not None and now > due,
+            "refund_block": refund_block,
             "refund": None if refund_block else dict(r, amount_raw=str(r["amount_raw"])),
             "note": "instruction only: nano-invoice never sends funds; refund_block is the "
                     "merchant's own record and is not checked on chain; "
