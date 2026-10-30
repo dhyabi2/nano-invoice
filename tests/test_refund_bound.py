@@ -66,6 +66,38 @@ class RefundBound(Base):
             ni.record_refund(self.inv.id, self.retry, "EF" * 32, store=self.store, at=T0 + 600)
         self.assertEqual(self.dup(T0 + 700)["refund_block"], REFUND)
 
+    def test_a_recorded_refund_is_no_longer_instructed(self):
+        def hinted():
+            return [h["source_block"] for h in ni.refund_hints(self.store, self.inv.id)]
+        self.assertIn(self.retry, hinted())
+        ni.record_refund(self.inv.id, self.retry, REFUND, store=self.store, at=T0 + 500)
+        self.assertNotIn(self.retry, hinted())
+        self.assertIsNone(self.dup(T0 + 600)["refund"])
+        res = ni.check_invoice(self.inv, rpc=self.ledger, store=self.store, now=T0 + 700)
+        self.assertNotIn(self.retry, [h["source_block"] for h in res["refunds"]])
+
+    def test_an_incoming_payment_is_not_a_refund_block(self):
+        other = self.v2_invoice("order-2", idempotency_key="idem-2")
+        paid, _ = self.ledger.send(PAYER, MERCHANT, other.pay_raw, T0 + 30)
+        ni.check_invoice(other, rpc=self.ledger, store=self.store, now=T0 + 60)
+        for block in (self.retry, self.first, paid):
+            with self.subTest(block=block), self.assertRaises(ni.InvoiceError):
+                ni.record_refund(self.inv.id, self.retry, block, store=self.store, at=T0 + 500)
+        self.assertEqual(self.dup(T0 + 600)["disposition"], "refund_owed")
+
+    def test_times_must_be_integer_epoch_seconds(self):
+        for bad in ("123", True, 1.5e9, -5):
+            with self.subTest(now=bad), self.assertRaises(ni.InvoiceError):
+                ni.acceptance_fields(self.inv.id, store=self.store, now=bad)
+            with self.subTest(at=bad), self.assertRaises(ni.InvoiceError):
+                ni.record_refund(self.inv.id, self.retry, REFUND, store=self.store, at=bad)
+
+    def test_block_time_zero_is_a_block_time(self):
+        self.store.conn.execute("UPDATE payments SET block_ts = 0 WHERE send_block = ?",
+                                (self.retry,))
+        d = self.dup(DAY + 1, refund_window_s=DAY)
+        self.assertEqual((d["disposition"], d["refund_due_by"]), ("refund_overdue", DAY))
+
     def test_no_block_time_is_said_not_invented(self):
         self.store.conn.execute("UPDATE payments SET block_ts = NULL WHERE send_block = ?",
                                 (self.retry,))

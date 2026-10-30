@@ -935,8 +935,14 @@ def refund_instruction(item, store=None, claimed_payer=None):
 
 
 def refund_hints(store, invoice_id):
+    """Refunds still to send. A duplicate/late transfer whose refund was recorded with
+    `record_refund` is left out: the instruction must never ask for a second payment."""
+    sent = {r["send_block"] for r in store.conn.execute(
+        "SELECT send_block FROM refunds_sent WHERE invoice_id = ?", (invoice_id,))}
     hints = []
     for p in store.payments_for(invoice_id):
+        if p["send_block"] in sent:
+            continue
         r = refund_instruction(p, store=store)
         if r:
             r = dict(r, amount_raw=str(r["amount_raw"]))
@@ -960,17 +966,27 @@ def _block_hash(value, name):
     return value.upper()
 
 
+def _epoch_s(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise InvoiceError(f"{name} must be a non-negative integer (epoch seconds), got {value!r}")
+    return value
+
+
 def record_refund(invoice, duplicate_send_block, refund_send_block, store=None, at=None):
     """Record that the merchant sent the refund owed for one duplicate/late transfer of
     this invoice, as the refund's own send block. Refused for a block that is not a
     duplicate/late transfer of this invoice, and for a second record of the same one.
-    The refund block is the merchant's statement: it is not checked on chain."""
+    The refund block is the merchant's statement: it is not checked on chain, but a block
+    the ledger already holds as an incoming payment is refused (it cannot be our refund)."""
     store = _require_store(store)
     inv = store.get(invoice)
     dup = _block_hash(duplicate_send_block, "duplicate_send_block")
     ref = _block_hash(refund_send_block, "refund_send_block")
-    at = int(time.time()) if at is None else at
+    at = int(time.time()) if at is None else _epoch_s(at, "at")
     with store.tx() as c:
+        if c.execute("SELECT 1 FROM payments WHERE send_block = ?", (ref,)).fetchone():
+            raise InvoiceError(f"refund_block_is_incoming: {ref} is a payment this ledger "
+                               f"received, not a refund sent")
         p = c.execute("SELECT invoice_id, kind FROM payments WHERE send_block = ?", (dup,)).fetchone()
         if p is None or p["invoice_id"] != inv.id or p["kind"] not in DUPLICATE_KINDS:
             raise InvoiceError(f"not_a_duplicate: {dup} is not a duplicate or late transfer "
@@ -1036,7 +1052,7 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
             or refund_window_s < 0:
         raise InvoiceError(f"refund_window_s must be a non-negative integer, got "
                            f"{refund_window_s!r}")
-    now = int(time.time()) if now is None else now
+    now = int(time.time()) if now is None else _epoch_s(now, "now")
     inv = store.get(invoice)
     payments = store.payments_for(inv.id)
     refunded = {r["send_block"]: r["refund_block"] for r in store.conn.execute(
@@ -1055,7 +1071,7 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
         if p["kind"] not in DUPLICATE_KINDS:
             continue
         r = refund_instruction(p, store=store)
-        due = p["block_ts"] + refund_window_s if p["block_ts"] else None
+        due = p["block_ts"] + refund_window_s if p["block_ts"] is not None else None
         refund_block = refunded.get(p["send_block"])
         disposition = ("refunded" if refund_block else
                        "refund_overdue" if due is not None and now > due else "refund_owed")
@@ -1063,7 +1079,7 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
             "send_block": p["send_block"], "sender": p["sender"], "amount_raw": str(p["amount_raw"]),
             "kind": p["kind"], "reason": p["reason"],
             "disposition": disposition, "refund_due_by": due, "refund_block": refund_block,
-            "refund": dict(r, amount_raw=str(r["amount_raw"])),
+            "refund": None if refund_block else dict(r, amount_raw=str(r["amount_raw"])),
             "note": "instruction only: nano-invoice never sends funds; refund_block is the "
                     "merchant's own record and is not checked on chain; "
                     "this transfer is not evidence of completed work",
