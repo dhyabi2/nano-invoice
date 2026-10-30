@@ -146,6 +146,9 @@ def build_parser():
     ac.add_argument("--acceptance-rule", default=nano_sig.ACCEPTANCE_RULE_V1,
                     help=f"the rule-version string a v3 ack must bind "
                          f"(default {nano_sig.ACCEPTANCE_RULE_V1})")
+    ac.add_argument("--refund-window-s", type=int, default=core.REFUND_WINDOW_S,
+                    help="seconds after a duplicate's block time before its unrecorded refund "
+                         f"reads refund_overdue (default {core.REFUND_WINDOW_S})")
 
     rc = sub.add_parser("rep-check", help="hold a block's representative to "
                                           "nano_address(sha256(scope)), read-only")
@@ -356,7 +359,8 @@ def main(argv=None):
             acks = _load_acks(args.acks) if args.acks is not None else ()
             _out(core.acceptance_fields(args.invoice, store=store, acks=acks,
                                         output_commitment=args.output_commitment,
-                                        acceptance_rule=args.acceptance_rule))
+                                        acceptance_rule=args.acceptance_rule,
+                                        refund_window_s=args.refund_window_s))
         elif args.cmd == "show":
             inv = store.get(args.invoice)
             _out({"invoice": inv.to_dict(),
