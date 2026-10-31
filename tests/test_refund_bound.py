@@ -179,6 +179,46 @@ class RefundBound(Base):
         f = ni.acceptance_fields(other.id, store=self.store, now=T0 + 600)
         self.assertEqual([d["disposition"] for d in f["duplicates"]], ["refunded"])
 
+    def test_same_block_in_two_cases_on_two_invoices_stays_per_invoice(self):
+        """Break review 10-31 09Z: the refunds_sent and payments lookups ignored the
+        invoice, so recording invoice A's refund hid B's hint while B still read
+        refund_owed, and B's own refund could not be recorded."""
+        a = self.v2_invoice("order-4", idempotency_key="idem-4")
+        b = self.v2_invoice("order-5", idempotency_key="idem-5")
+        for inv, block in ((a, "cc" * 32), (b, "CC" * 32)):
+            self.store.record({"send_block": block, "receive_block": None, "sender": PAYER,
+                               "merchant": MERCHANT, "amount_raw": inv.pay_raw,
+                               "block_ts": T0 + 30}, "duplicate", invoice_id=inv.id,
+                              reason="test", now=T0 + 40)
+        ni.record_refund(a.id, "CC" * 32, "A2" * 32, store=self.store, at=T0 + 500)
+        self.assertEqual([h["source_block"] for h in ni.refund_hints(self.store, b.id)],
+                         ["CC" * 32])
+        ni.record_refund(b.id, "CC" * 32, "A1" * 32, store=self.store, at=T0 + 500)
+        for inv in (a, b):
+            f = ni.acceptance_fields(inv.id, store=self.store, now=T0 + 600)
+            self.assertEqual([d["disposition"] for d in f["duplicates"]], ["refunded"])
+            self.assertEqual(ni.refund_hints(self.store, inv.id), [])
+
+    def test_a_lower_case_stored_block_found_by_its_hash(self):
+        other = self.v2_invoice("order-6", idempotency_key="idem-6")
+        self.store.record({"send_block": "ee" * 32, "receive_block": None, "sender": PAYER,
+                           "merchant": MERCHANT, "amount_raw": other.pay_raw,
+                           "block_ts": T0 + 30}, "duplicate", invoice_id=other.id,
+                          reason="test", now=T0 + 40)
+        self.assertEqual(ni.refund_instruction("ee" * 32, store=self.store)["source_block"],
+                         "ee" * 32)
+        ni.record_refund(other.id, "EE" * 32, REFUND, store=self.store, at=T0 + 500)
+        self.assertIsNone(ni.refund_instruction("EE" * 32, store=self.store))
+
+    def test_a_null_block_hash_does_not_crash_acceptance(self):
+        other = self.v2_invoice("order-7", idempotency_key="idem-7")
+        self.store.record({"send_block": None, "receive_block": None, "sender": PAYER,
+                           "merchant": MERCHANT, "amount_raw": other.pay_raw,
+                           "block_ts": T0 + 30}, "duplicate", invoice_id=other.id,
+                          reason="test", now=T0 + 40)
+        f = ni.acceptance_fields(other.id, store=self.store, now=T0 + 600)
+        self.assertEqual([d["disposition"] for d in f["duplicates"]], ["refund_owed"])
+
     def test_no_block_time_is_said_not_invented(self):
         self.store.conn.execute("UPDATE payments SET block_ts = NULL WHERE send_block = ?",
                                 (self.retry,))

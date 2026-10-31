@@ -900,6 +900,10 @@ def refund_instruction(item, store=None, claimed_payer=None):
         pay = None
         if isinstance(item, str) and not item.startswith("inv_"):
             pay = store.payment(item.upper())
+            if pay is None:     # a row stored in lower case through Store.record
+                row = store.conn.execute("SELECT * FROM payments WHERE UPPER(send_block) = ?"
+                                         " ORDER BY send_block LIMIT 1", (item.upper(),)).fetchone()
+                pay = _payment(row) if row else None
             if pay is None:
                 raise NotFound(f"no recorded block {item}")
         else:
@@ -913,8 +917,8 @@ def refund_instruction(item, store=None, claimed_payer=None):
     if pay["kind"] not in REFUND_KINDS:
         return None
     if store is not None and pay["kind"] in DUPLICATE_KINDS and store.conn.execute(
-            "SELECT 1 FROM refunds_sent WHERE UPPER(send_block) = ?",
-            (str(pay["send_block"]).upper(),)).fetchone():
+            "SELECT 1 FROM refunds_sent WHERE UPPER(send_block) = ? AND invoice_id = ?",
+            (str(pay["send_block"]).upper(), pay["invoice_id"])).fetchone():
         return None         # refunded with record_refund: never instruct it a second time
     amount = pay["amount_raw"]
     if pay["kind"] == "overpaid":
@@ -994,12 +998,12 @@ def record_refund(invoice, duplicate_send_block, refund_send_block, store=None, 
             raise InvoiceError(f"refund_block_is_incoming: {ref} is a payment this ledger "
                                f"received, not a refund sent")
         p = c.execute("SELECT invoice_id, kind, send_block FROM payments"
-                      " WHERE UPPER(send_block) = ?", (dup,)).fetchone()
+                      " WHERE UPPER(send_block) = ? AND invoice_id = ?", (dup, inv.id)).fetchone()
         if p is None or p["invoice_id"] != inv.id or p["kind"] not in DUPLICATE_KINDS:
             raise InvoiceError(f"not_a_duplicate: {dup} is not a duplicate or late transfer "
                                f"of {inv.id}")
-        prior = c.execute("SELECT refund_block FROM refunds_sent WHERE UPPER(send_block) = ?",
-                          (dup,)).fetchone()
+        prior = c.execute("SELECT refund_block FROM refunds_sent WHERE UPPER(send_block) = ?"
+                          " AND invoice_id = ?", (dup, inv.id)).fetchone()
         if prior is not None:
             raise InvoiceError(f"refund_already_recorded: {dup} was refunded by "
                                f"{prior['refund_block']}")
@@ -1085,9 +1089,9 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
         # Decide from the one `refunded` snapshot read above, never a second query: a refund
         # recorded by another process in between must not leave refund_block None with no
         # instruction (TypeError). Without store=, a duplicate's instruction needs no lookup.
-        r = None if p["send_block"].upper() in refunded_upper else refund_instruction(p)
+        r = None if str(p["send_block"]).upper() in refunded_upper else refund_instruction(p)
         due = p["block_ts"] + refund_window_s if p["block_ts"] is not None else None
-        refund_block, recorded_at = refunded_upper.get(p["send_block"].upper(), (None, None))
+        refund_block, recorded_at = refunded_upper.get(str(p["send_block"]).upper(), (None, None))
         # `disposition` keeps main's value (`refund_owed`) until a refund is recorded, so a
         # job that refunds every `refund_owed` row never loses the late ones; lateness is
         # its own field.
