@@ -139,6 +139,46 @@ class RefundBound(Base):
         self.assertEqual((d["disposition"], d["refund_overdue"], d["refund_due_by"]),
                          ("refund_owed", True, DAY))
 
+    def test_a_refund_recorded_mid_read_does_not_crash(self):
+        """Break review 10-31 08Z: acceptance_fields read refunds_sent, then
+        refund_instruction read it again; a refund recorded in between left
+        refund_block None and no instruction (TypeError). One snapshot decides."""
+        real = ni.core.refund_instruction
+
+        def racing(item, *a, **kw):
+            if not self.recorded:
+                self.recorded = True
+                ni.record_refund(self.inv.id, self.retry, REFUND, store=self.store, at=T0 + 90)
+            return real(item, *a, **kw)
+        self.recorded = False
+        ni.core.refund_instruction = racing
+        try:
+            d = self.dup(T0 + 100)
+        finally:
+            ni.core.refund_instruction = real
+        self.assertTrue(self.recorded)
+        self.assertEqual(d["disposition"], "refund_owed")     # the snapshot, read whole
+        self.assertEqual(d["refund"]["source_block"], self.retry)
+        self.assertEqual(self.dup(T0 + 100)["disposition"], "refunded")
+
+    def test_a_lower_case_stored_block_is_still_the_same_block(self):
+        """Break review 10-31 08Z: a payment stored in lower case through Store.record
+        was accepted as the refund block, and its dict still got an instruction after
+        its refund was recorded."""
+        other = self.v2_invoice("order-3", idempotency_key="idem-3")
+        low = "dd" * 32
+        self.store.record({"send_block": low, "receive_block": None, "sender": PAYER,
+                           "merchant": MERCHANT,
+                           "amount_raw": other.pay_raw, "block_ts": T0 + 30},
+                          "duplicate", invoice_id=other.id, reason="test", now=T0 + 40)
+        with self.assertRaises(ni.InvoiceError):
+            ni.record_refund(self.inv.id, self.retry, low.upper(), store=self.store, at=T0 + 500)
+        ni.record_refund(other.id, low, REFUND, store=self.store, at=T0 + 500)
+        self.assertIsNone(ni.refund_instruction(self.store.payment(low), store=self.store))
+        self.assertNotIn(low, [h["source_block"] for h in ni.refund_hints(self.store, other.id)])
+        f = ni.acceptance_fields(other.id, store=self.store, now=T0 + 600)
+        self.assertEqual([d["disposition"] for d in f["duplicates"]], ["refunded"])
+
     def test_no_block_time_is_said_not_invented(self):
         self.store.conn.execute("UPDATE payments SET block_ts = NULL WHERE send_block = ?",
                                 (self.retry,))

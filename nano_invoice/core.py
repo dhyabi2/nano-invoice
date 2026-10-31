@@ -913,7 +913,8 @@ def refund_instruction(item, store=None, claimed_payer=None):
     if pay["kind"] not in REFUND_KINDS:
         return None
     if store is not None and pay["kind"] in DUPLICATE_KINDS and store.conn.execute(
-            "SELECT 1 FROM refunds_sent WHERE send_block = ?", (pay["send_block"],)).fetchone():
+            "SELECT 1 FROM refunds_sent WHERE UPPER(send_block) = ?",
+            (str(pay["send_block"]).upper(),)).fetchone():
         return None         # refunded with record_refund: never instruct it a second time
     amount = pay["amount_raw"]
     if pay["kind"] == "overpaid":
@@ -940,11 +941,11 @@ def refund_instruction(item, store=None, claimed_payer=None):
 def refund_hints(store, invoice_id):
     """Refunds still to send. A duplicate/late transfer whose refund was recorded with
     `record_refund` is left out: the instruction must never ask for a second payment."""
-    sent = {r["send_block"] for r in store.conn.execute(
+    sent = {r["send_block"].upper() for r in store.conn.execute(
         "SELECT send_block FROM refunds_sent WHERE invoice_id = ?", (invoice_id,))}
     hints = []
     for p in store.payments_for(invoice_id):
-        if p["send_block"] in sent:
+        if str(p["send_block"]).upper() in sent:
             continue
         r = refund_instruction(p, store=store)
         if r:
@@ -985,23 +986,26 @@ def record_refund(invoice, duplicate_send_block, refund_send_block, store=None, 
     ref = _block_hash(refund_send_block, "refund_send_block")
     at = int(time.time()) if at is None else _epoch_s(at, "at")
     with store.tx() as c:
-        if c.execute("SELECT 1 FROM payments WHERE ? IN (send_block, receive_block) UNION ALL "
-                     "SELECT 1 FROM short_sends WHERE ? IN (send_block, receive_block)",
+        # UPPER(): a block stored in lower case through Store.record is still the same block.
+        if c.execute("SELECT 1 FROM payments WHERE ? IN (UPPER(send_block), UPPER(receive_block))"
+                     " UNION ALL SELECT 1 FROM short_sends"
+                     " WHERE ? IN (UPPER(send_block), UPPER(receive_block))",
                      (ref, ref)).fetchone():
             raise InvoiceError(f"refund_block_is_incoming: {ref} is a payment this ledger "
                                f"received, not a refund sent")
-        p = c.execute("SELECT invoice_id, kind FROM payments WHERE send_block = ?", (dup,)).fetchone()
+        p = c.execute("SELECT invoice_id, kind, send_block FROM payments"
+                      " WHERE UPPER(send_block) = ?", (dup,)).fetchone()
         if p is None or p["invoice_id"] != inv.id or p["kind"] not in DUPLICATE_KINDS:
             raise InvoiceError(f"not_a_duplicate: {dup} is not a duplicate or late transfer "
                                f"of {inv.id}")
-        prior = c.execute("SELECT refund_block FROM refunds_sent WHERE send_block = ?",
+        prior = c.execute("SELECT refund_block FROM refunds_sent WHERE UPPER(send_block) = ?",
                           (dup,)).fetchone()
         if prior is not None:
             raise InvoiceError(f"refund_already_recorded: {dup} was refunded by "
                                f"{prior['refund_block']}")
         try:
             c.execute("INSERT INTO refunds_sent(send_block, invoice_id, refund_block, recorded_at)"
-                      " VALUES (?,?,?,?)", (dup, inv.id, ref, at))
+                      " VALUES (?,?,?,?)", (p["send_block"], inv.id, ref, at))
         except sqlite3.IntegrityError as e:
             raise InvoiceError(f"refund_block_reused: {ref} already recorded: {e}") from e
     return {"invoice_id": inv.id, "send_block": dup, "refund_block": ref, "recorded_at": at}
@@ -1064,6 +1068,7 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
     refunded = {r["send_block"]: (r["refund_block"], r["recorded_at"]) for r in store.conn.execute(
         "SELECT send_block, refund_block, recorded_at FROM refunds_sent WHERE invoice_id = ?",
         (inv.id,))}
+    refunded_upper = {k.upper(): v for k, v in refunded.items()}
     settling = [p for p in payments if p["kind"] in SETTLING_KINDS]
     settle_refund = refund_instruction(settling[0], store=store) if settling else None
     settlement = {
@@ -1077,9 +1082,12 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
     for p in payments:
         if p["kind"] not in DUPLICATE_KINDS:
             continue
-        r = refund_instruction(p, store=store)
+        # Decide from the one `refunded` snapshot read above, never a second query: a refund
+        # recorded by another process in between must not leave refund_block None with no
+        # instruction (TypeError). Without store=, a duplicate's instruction needs no lookup.
+        r = None if p["send_block"].upper() in refunded_upper else refund_instruction(p)
         due = p["block_ts"] + refund_window_s if p["block_ts"] is not None else None
-        refund_block, recorded_at = refunded.get(p["send_block"], (None, None))
+        refund_block, recorded_at = refunded_upper.get(p["send_block"].upper(), (None, None))
         # `disposition` keeps main's value (`refund_owed`) until a refund is recorded, so a
         # job that refunds every `refund_owed` row never loses the late ones; lateness is
         # its own field.
