@@ -1,4 +1,4 @@
-"""nano-invoice create|check|receipt|verify|verify-log|verdict|tombstone|role-check|ack-verify|ack-read|acceptance|rep-check|refund-hint|show.
+"""nano-invoice create|check|receipt|verify|verify-log|verdict|tombstone|role-check|ack-verify|ack-read|acceptance|rep-check|refund-hint|record-refund|show.
 
 JSON on stdout. Exit 0 on a sound answer, 1 on a receipt or log that does not
 verify, 2 on a usage or document error, 3 on an RPC failure - and, for
@@ -146,6 +146,9 @@ def build_parser():
     ac.add_argument("--acceptance-rule", default=nano_sig.ACCEPTANCE_RULE_V1,
                     help=f"the rule-version string a v3 ack must bind "
                          f"(default {nano_sig.ACCEPTANCE_RULE_V1})")
+    ac.add_argument("--refund-window-s", type=int, default=core.REFUND_WINDOW_S,
+                    help="seconds after a duplicate's block time before its unrecorded refund "
+                         f"reads refund_overdue: true (default {core.REFUND_WINDOW_S})")
 
     rc = sub.add_parser("rep-check", help="hold a block's representative to "
                                           "nano_address(sha256(scope)), read-only")
@@ -184,6 +187,13 @@ def build_parser():
     h = sub.add_parser("refund-hint", help="refund instructions (never sends)")
     h.add_argument("--invoice", required=True)
     h.add_argument("--claimed-payer", help="shown only to say it was ignored")
+
+    rr = sub.add_parser("record-refund", help="record the send block of a refund you sent for "
+                                              "a duplicate/late transfer (never sends)")
+    rr.add_argument("--invoice", required=True)
+    rr.add_argument("--duplicate-block", required=True, help="the duplicate/late transfer's send block")
+    rr.add_argument("--refund-block", required=True, help="your refund's own send block")
+    rr.add_argument("--at", type=int, help="unix seconds the refund was sent (default now)")
 
     s = sub.add_parser("show", help="print the stored invoice and its recorded blocks")
     s.add_argument("--invoice", required=True)
@@ -356,7 +366,11 @@ def main(argv=None):
             acks = _load_acks(args.acks) if args.acks is not None else ()
             _out(core.acceptance_fields(args.invoice, store=store, acks=acks,
                                         output_commitment=args.output_commitment,
-                                        acceptance_rule=args.acceptance_rule))
+                                        acceptance_rule=args.acceptance_rule,
+                                        refund_window_s=args.refund_window_s))
+        elif args.cmd == "record-refund":
+            _out(core.record_refund(args.invoice, args.duplicate_block, args.refund_block,
+                                    store=store, at=args.at))
         elif args.cmd == "show":
             inv = store.get(args.invoice)
             _out({"invoice": inv.to_dict(),

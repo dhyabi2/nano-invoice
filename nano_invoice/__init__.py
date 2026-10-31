@@ -10,7 +10,7 @@ from .core import (
     NotFound, OrderConflict,
     Store, TagsExhausted, acceptance_fields, append_tombstone, append_verdict, check_counterparty_role, check_invoice,
     create_invoice,
-    invoice_id_for, order_key_hash, receipt, receipt_schema_of,
+    invoice_id_for, order_key_hash, receipt, receipt_schema_of, record_refund,
     refund_hints, refund_instruction, require_raw, scan, verify_log, verify_receipt, witness_payload,
     xno_to_raw,
 )
