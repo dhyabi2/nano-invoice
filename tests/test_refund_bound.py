@@ -105,6 +105,26 @@ class RefundBound(Base):
                 ni.record_refund(self.inv.id, self.retry, block, store=self.store, at=T0 + 500)
         self.assertEqual(self.dup(T0 + 600)["disposition"], "refund_owed")
 
+    def test_refund_instruction_skips_a_recorded_refund(self):
+        self.assertIsNotNone(ni.refund_instruction(self.retry, store=self.store))
+        ni.record_refund(self.inv.id, self.retry, REFUND, store=self.store, at=T0 + 500)
+        self.assertIsNone(ni.refund_instruction(self.retry, store=self.store))
+        self.assertIsNone(ni.refund_instruction(self.store.payment(self.retry), store=self.store))
+
+    def test_our_receive_block_is_not_a_refund_block(self):
+        for sent in (self.retry, self.first):
+            block = self.store.payment(sent)["receive_block"]
+            with self.subTest(block=block), self.assertRaises(ni.InvoiceError):
+                ni.record_refund(self.inv.id, self.retry, block, store=self.store, at=T0 + 500)
+        self.assertEqual(self.dup(T0 + 600)["disposition"], "refund_owed")
+
+    def test_hash_with_spaces_and_huge_time_are_refused(self):
+        with self.assertRaises(ni.InvoiceError):
+            ni.record_refund(self.inv.id, self.retry, "  " + "AB" * 31, store=self.store,
+                             at=T0 + 500)
+        with self.assertRaises(ni.InvoiceError):
+            ni.record_refund(self.inv.id, self.retry, REFUND, store=self.store, at=10 ** 20)
+
     def test_times_must_be_integer_epoch_seconds(self):
         for bad in ("123", True, 1.5e9, -5):
             with self.subTest(now=bad), self.assertRaises(ni.InvoiceError):

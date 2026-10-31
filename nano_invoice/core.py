@@ -912,6 +912,9 @@ def refund_instruction(item, store=None, claimed_payer=None):
         raise InvoiceError("pass a payment record, or a block hash / invoice with store=")
     if pay["kind"] not in REFUND_KINDS:
         return None
+    if store is not None and pay["kind"] in DUPLICATE_KINDS and store.conn.execute(
+            "SELECT 1 FROM refunds_sent WHERE send_block = ?", (pay["send_block"],)).fetchone():
+        return None         # refunded with record_refund: never instruct it a second time
     amount = pay["amount_raw"]
     if pay["kind"] == "overpaid":
         inv = store.get(pay["invoice_id"]) if store is not None else None
@@ -957,17 +960,14 @@ REFUND_WINDOW_S = 86400
 
 
 def _block_hash(value, name):
-    if not isinstance(value, str) or len(value) != 64:
+    if (not isinstance(value, str) or len(value) != 64
+            or not all(ch in "0123456789abcdefABCDEF" for ch in value)):
         raise InvoiceError(f"{name} must be 64 hex characters, got {value!r}")
-    try:
-        bytes.fromhex(value)
-    except ValueError:
-        raise InvoiceError(f"{name} must be 64 hex characters, got {value!r}") from None
     return value.upper()
 
 
 def _epoch_s(value, name):
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2 ** 63:
         raise InvoiceError(f"{name} must be a non-negative integer (epoch seconds), got {value!r}")
     return value
 
@@ -977,14 +977,17 @@ def record_refund(invoice, duplicate_send_block, refund_send_block, store=None, 
     this invoice, as the refund's own send block. Refused for a block that is not a
     duplicate/late transfer of this invoice, and for a second record of the same one.
     The refund block is the merchant's statement: it is not checked on chain, but a block
-    the ledger already holds as an incoming payment is refused (it cannot be our refund)."""
+    the ledger already holds as an incoming send, a short send, or one of our receive
+    blocks is refused (it cannot be our refund)."""
     store = _require_store(store)
     inv = store.get(invoice)
     dup = _block_hash(duplicate_send_block, "duplicate_send_block")
     ref = _block_hash(refund_send_block, "refund_send_block")
     at = int(time.time()) if at is None else _epoch_s(at, "at")
     with store.tx() as c:
-        if c.execute("SELECT 1 FROM payments WHERE send_block = ?", (ref,)).fetchone():
+        if c.execute("SELECT 1 FROM payments WHERE ? IN (send_block, receive_block) UNION ALL "
+                     "SELECT 1 FROM short_sends WHERE ? IN (send_block, receive_block)",
+                     (ref, ref)).fetchone():
             raise InvoiceError(f"refund_block_is_incoming: {ref} is a payment this ledger "
                                f"received, not a refund sent")
         p = c.execute("SELECT invoice_id, kind FROM payments WHERE send_block = ?", (dup,)).fetchone()
