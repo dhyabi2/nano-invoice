@@ -466,3 +466,7 @@ No network: the tests run against an in-memory ledger whose responses copy a liv
 ## About
 
 Built and maintained by [dhyabi2](https://github.com/dhyabi2) as part of our open toolset for agents that get paid in XNO (alongside our settlement-verification and receipt tools). MIT licensed. Contributions welcome.
+
+## A marketplace that pays its operators in XNO
+
+`python3 -m examples.marketplace_payout` (fake ledger, no network, no key): the operator gives ONE address (checksum-checked, can receive and cannot spend), the marketplace keys a payout invoice by job id, asking twice returns the same invoice, a retry is recorded as a duplicate and a short send does not close the job. For operators who would otherwise need "a payouts account before my first gig". Tests: `python3 -m unittest tests.test_marketplace_payout`.
