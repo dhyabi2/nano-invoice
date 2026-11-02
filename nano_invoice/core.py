@@ -152,6 +152,10 @@ class Invoice:
     quote_usd_per_xno: str = None
     quote_source: str = None
     quote_read_at: str = None
+    # The seller's own name for what this invoice pays for (2026-10-27), carried
+    # so a settlement event can say WHICH job it settled. Opaque to us: echoed,
+    # never parsed, never interpolated into a command, never used as a path.
+    job_ref: str = None
 
     def to_dict(self):
         d = dataclasses.asdict(self)
@@ -308,6 +312,10 @@ class Store:
         ("invoices", "quote_usd_per_xno", "TEXT"),
         ("invoices", "quote_source", "TEXT"),
         ("invoices", "quote_read_at", "TEXT"),
+        # The settlement observer, 2026-10-27. Additive and nullable like the
+        # rest: a store written before it existed opens unchanged and simply
+        # has no job_ref on its rows.
+        ("invoices", "job_ref", "TEXT"),
     )
 
     def _migrate(self):
@@ -478,9 +486,16 @@ def _require_store(store):
 
 def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, store=None, now=None,
                    witness_at=None, terms=None, intent_hash=None, idempotency_key=None,
-                   quote=None, _rand=secrets.randbelow):
+                   quote=None, job_ref=None, _rand=secrets.randbelow):
     """Idempotent: the same (merchant, order_key) always returns the same invoice.
     The same order key with a different amount raises OrderConflict.
+
+    `job_ref` is the seller's own opaque name for what this invoice pays for
+    (an order id, a tier, a request id). It is stored and echoed on the
+    settlement event so a stranger reading the event can tell WHICH job the
+    payment settled; nothing here parses it. It is set when the invoice is
+    created, so the idempotent return of an existing invoice keeps the job_ref
+    that invoice already had.
 
     `witness_at` is the unix time the merchant announced this invoice's binding
     (id + tagged amount) to a channel it does not control, before any payment.
@@ -581,11 +596,11 @@ def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, stor
                    if normalised_terms is not None else None)
         c.execute(
             "INSERT INTO invoices(id, merchant, order_key_sha256, amount_raw, tag, pay_raw, created_at,"
-            " expires_at, witness_at, state, intent_hash, idempotency_key, policy_version, terms_json,"
+            " expires_at, witness_at, state, job_ref, intent_hash, idempotency_key, policy_version, terms_json,"
             " terms_sha256, binding_sha256, quote_usd, quote_usd_per_xno, quote_source, quote_read_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?, 'open',?,?,?,?,?,?,?,?,?,?)",
+            " VALUES (?,?,?,?,?,?,?,?,?, 'open',?,?,?,?,?,?,?,?,?,?,?)",
             (inv_id, merchant, okh, str(amount_raw), tag, str(pay_raw), now, now + expires_s, witness_at,
-             intent_hash, idempotency_key,
+             job_ref, intent_hash, idempotency_key,
              None if normalised_terms is None else normalised_terms["policy_version"],
              None if binding is None else json.dumps(
                  normalised_terms, sort_keys=True, separators=(",", ":"), ensure_ascii=False),

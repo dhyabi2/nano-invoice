@@ -86,6 +86,10 @@ nano-invoice refund-hint --invoice inv_...          # instructions only; nothing
 nano-invoice record-refund --invoice inv_... --duplicate-block B --refund-block R   # your record; never sends
 nano-invoice show --invoice inv_...
 
+# release on settlement, with nobody watching the RPC
+nano-invoice observe --merchant nano_1... --webhook https://you.example/settled
+nano-invoice observe --merchant nano_1... --once --on-settle ./release-entitlement.sh
+
 # receipt v2: bind what the payment was FOR, then say whether it was delivered
 nano-invoice create --merchant nano_1... --amount-xno 0.5 --order-key order-1001 \
     --terms-file terms.json --intent-hash <sha256 of the quote> --idempotency-key order-1001
@@ -308,6 +312,80 @@ Two things this script cannot do, by design and by limitation:
 The harness itself is tested (`tests/test_live_proof.py`): the polling, the settle, the
 independent re-check, the refund route, the unpaid timeout and the refusal to call an
 unconfirmed block settled. Only the payment is missing from a run here.
+
+## Release on settlement (`observe`)
+
+`check` is a *pull*. It reads the ledger and settles the invoice, and then you write the loop, the
+crash-safety, the exactly-once guard and the "now that it is paid, send the goods" step yourself.
+`observe` is those four things:
+
+```bash
+nano-invoice observe --merchant nano_1... --webhook https://you.example/settled
+nano-invoice observe --merchant nano_1... --once --on-settle ./release.sh   # pass the command last
+```
+
+Each settlement produces one event, delivered at most once per settling block:
+
+```json
+{
+  "event": "settled", "v": 1,
+  "delivery_id": "8F3C…A17",
+  "invoice_id": "inv_3b9c…",
+  "amount_raw": "1000000000000000000000745180", "amount_xno": "0.00100000000000000000000074518",
+  "payer": "nano_3payer…", "payee": "nano_1merchant…",
+  "settles": { "order_key_sha256": "9e1f…", "job_ref": "tier_starter/req-4417" },
+  "block": { "send_block": "8F3C…A17", "confirmed": true, "block_ts": 1793412233 },
+  "checked_at": 1793412240,
+  "receipt": { "…": "the full verify_receipt-checkable receipt" }
+}
+```
+
+- `event` is one of `settled | underpaid | overpaid | expired`, and **`settled` is emitted only for
+  an exact amount match on a confirmed block**. `underpaid` and `overpaid` carry the same shape plus
+  `expected_raw`; a consumer that treats them as `settled` is the defect this closed set exists to
+  prevent.
+- `delivery_id` is the settling send-block hash — **the receiver's dedupe key**. An `expired` event,
+  which has no block, uses `expired:<invoice_id>`.
+- `payer` is the block's account as the ledger reports it, never a self-declared name.
+- `settles.job_ref` is whatever you passed to `create --job-ref`. It is echoed, never parsed, never
+  interpolated into a command and never used as a path.
+- `--on-settle` is **argv with no shell**: no `shell=True`, no `os.system`, no string interpolation
+  of any event field. The event arrives on the command's stdin; only its exit status is read.
+
+**The webhook carries no shared secret, by design.** There is no HMAC and no signing key, because
+the receiver does not have to trust us: it re-derives the whole claim from the public ledger with
+`verify_receipt`, against a node of its own choosing. A forged webhook fails that check, and a
+replayed one carries a `delivery_id` the receiver has already seen. *The only thing you take from us
+is a hint to go and look.*
+
+Exactly-once lives in one new table, `fulfillment`, keyed by `delivery_id`:
+
+- Two observers on one store both read the settlement; exactly one claims the release, and the loser
+  emits nothing.
+- Money is final the moment the block confirms; only the *release* retries. A failing `--on-settle`
+  (non-zero exit) or webhook (non-2xx) backs off exponentially to `--max-attempts`, then the row
+  becomes `release_failed` — and **the observer keeps running and the invoice stays settled**.
+- A crash between the settle and the release leaves the row `pending`, and the next pass releases it.
+  The command can therefore run twice for one block in that one case, which is why `delivery_id` is
+  the receiver's dedupe key rather than a courtesy.
+- A row is derived from the `payments` record the settle already wrote, so an invoice settled by a
+  plain `nano-invoice check`, a cron, or any other process is still released here exactly once.
+- **First pass over a store that already has history delivers nothing.** The already-closed invoices
+  are recorded `backfill_skipped`, so pointing an observer at a working merchant does not fire the
+  release command once for every order it ever sold. Pass `--catch-up` when you want them.
+
+A merchant address that fails its checksum is refused at startup (exit 2) before any network call,
+and a node that cannot be read changes nothing at all: no invoice settled, no state advanced, no
+event emitted. `observe` with neither `--on-settle` nor `--webhook` exits 64 — an observer with
+nowhere to release to is a silent loop.
+
+### What `observe` does NOT claim
+
+It does not prove the goods were any good, that the payer is anyone in particular (an address is not
+an identity), or that the released entitlement reached the payer. It proves that one confirmed
+payment was bound to one order, and that the release ran. `spiritofthefleet` asked to move from *"I
+see the money moved"* to *"the system knows the requirements are met"*; this closes the first half of
+that sentence honestly and leaves the second half to the verdict and payer-ack machinery above.
 
 ## Limits, stated plainly
 

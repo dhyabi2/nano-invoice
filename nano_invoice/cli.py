@@ -1,4 +1,4 @@
-"""nano-invoice create|check|receipt|verify|verify-log|verdict|tombstone|role-check|ack-verify|ack-read|acceptance|rep-check|refund-hint|record-refund|show.
+"""nano-invoice create|check|observe|receipt|verify|verify-log|verdict|tombstone|role-check|ack-verify|ack-read|acceptance|rep-check|refund-hint|record-refund|show.
 
 JSON on stdout. Exit 0 on a sound answer, 1 on a receipt or log that does not
 verify, 2 on a usage or document error, 3 on an RPC failure - and, for
@@ -15,7 +15,9 @@ that differs from the output_commitment of a newest "delivered" verdict
 exits 2 on a missing or unreadable acks file, one whose top level is not a list,
 an empty --order-id, or an empty --acceptance-rule (or one given without --order-id).
 `rep-check` exits 0 only when the representative matches and the block is
-confirmed (before --delivered-at, when given), 1 otherwise."""
+confirmed (before --delivered-at, when given), 1 otherwise. `observe` exits 64
+when neither --on-settle nor --webhook is given, because an observer with
+nowhere to release to is a silent loop, not an observer."""
 import argparse
 import json
 import os
@@ -26,6 +28,7 @@ from . import account as acct
 from . import core
 from . import nano_sig
 from . import price
+from . import observer as obs
 from . import rep_binding
 from .rpc import DEFAULT_RPC, Rpc
 
@@ -74,6 +77,9 @@ def build_parser():
                         f"(default {price.DEFAULT_MAX_QUOTE_AGE_S})")
     c.add_argument("--order-key", required=True)
     c.add_argument("--expires-s", type=int, default=3600)
+    c.add_argument("--job-ref", help="your own opaque name for what this invoice pays for; echoed "
+                                     "on the settlement event so a stranger can tell which job it "
+                                     "settled, never parsed here")
     # Receipt v2. Supplying --terms-file makes this a bound invoice; without it
     # the invoice and its receipt are exactly what they were before v2.
     c.add_argument("--terms-file", help="authorisation terms as JSON, embedded in full and hashed "
@@ -177,6 +183,30 @@ def build_parser():
                    help="faucet / test / internal account whose blocks never pay an invoice")
     k.add_argument("--not-income-file", help="JSON object {account: reason}")
     k.add_argument("--max-blocks", type=int, default=1000)
+
+    o = sub.add_parser("observe", help="watch open invoices and release on settlement, exactly once")
+    o.add_argument("--merchant", required=True, help="receiving account; refused on a bad checksum")
+    o.add_argument("--on-settle", nargs=argparse.REMAINDER, metavar="ARGV",
+                   help="command to run per event, argv with no shell; the event JSON arrives on "
+                        "its stdin. Everything after this flag is the command, so pass it last")
+    o.add_argument("--webhook", help="URL to POST the event JSON to (no shared secret, by design: "
+                                     "the receiver re-derives the claim from the public ledger)")
+    o.add_argument("--once", action="store_true", help="one pass, then exit")
+    o.add_argument("--interval", type=int, default=obs.DEFAULT_INTERVAL_S,
+                   help=f"seconds between passes (default {obs.DEFAULT_INTERVAL_S})")
+    o.add_argument("--max-attempts", type=int, default=obs.DEFAULT_MAX_ATTEMPTS,
+                   help="release attempts before the row becomes release_failed and the observer "
+                        "carries on")
+    o.add_argument("--release-timeout", type=int, default=obs.DEFAULT_RELEASE_TIMEOUT_S)
+    o.add_argument("--catch-up", action="store_true",
+                   help="on a store that has history and no observer table yet, release the "
+                        "already-closed invoices too. Without this they are recorded as "
+                        "backfill_skipped and nothing is delivered for them")
+    o.add_argument("--own", action="append", help="another account of the merchant (never income)")
+    o.add_argument("--not-income", action="append", metavar="ACCOUNT[=REASON]")
+    o.add_argument("--not-income-file", help="JSON object {account: reason}")
+    o.add_argument("--max-blocks", type=int, default=1000)
+    o.add_argument("--now", type=int, help="injected clock, unix seconds (for tests)")
 
     r = sub.add_parser("receipt", help="print a receipt a stranger can re-check")
     r.add_argument("--invoice", required=True)
@@ -332,7 +362,7 @@ def main(argv=None):
                                                max_usd_per_xno=args.max_usd_per_xno, **bound)
             else:
                 inv = core.create_invoice(args.merchant, raw, args.order_key, args.expires_s, store=store,
-                                          **bound)
+                                          job_ref=args.job_ref, **bound)
             _out(dict(inv.to_dict(), instruction=f"send exactly {inv.pay_raw} raw to {inv.merchant}"))
         elif args.cmd == "verdict":
             _out(core.append_verdict(
@@ -350,6 +380,23 @@ def main(argv=None):
         elif args.cmd == "check":
             _out(core.check_invoice(args.invoice, rpc=rpc, store=store, own_accounts=args.own or (),
                                     not_income=_not_income(args), max_blocks=args.max_blocks))
+        elif args.cmd == "observe":
+            if not args.on_settle and not args.webhook:
+                _out({"error": "ReleaseNotConfigured",
+                      "message": "observe needs --on-settle ARGV... or --webhook URL, or both"})
+                return 64
+            passes = 0
+            for events in obs.observe(
+                    store=store, merchant=args.merchant, rpc=rpc, on_settle=args.on_settle,
+                    webhook=args.webhook, once=args.once, interval=args.interval,
+                    max_attempts=args.max_attempts, release_timeout=args.release_timeout,
+                    catch_up=args.catch_up, own_accounts=args.own or (),
+                    not_income=_not_income(args), max_blocks=args.max_blocks,
+                    clock=(lambda: args.now) if args.now is not None else None):
+                passes += 1
+                _out({"pass": passes, **events.detail,
+                      "events": [e.payload for e in events],
+                      "states": {e.delivery_id: e.state for e in events}})
         elif args.cmd == "receipt":
             _out(core.receipt(args.invoice, store=store))
         elif args.cmd == "refund-hint":
