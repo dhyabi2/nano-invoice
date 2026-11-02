@@ -1,0 +1,12 @@
+{
+  "amount_raw": "100000000000000000000000000",
+  "asset": "XNO",
+  "digest": "55bfacd3e5cf097adf81bea0273a3607016ea8c5f947f025e28e72e8a5e863fb",
+  "expires_at": 1794212292,
+  "issued_at": 1793607492,
+  "order_id": "ord_bf85c6c3743bba8a",
+  "payee": "nano_3jgu8qqcikcxixkxeyfs5bnt1cbrmjidbf63s7fmh6oc5jfrudr5hiwcbsa8",
+  "signature": "9585D9F50D1F0834E3769588AF4B24D12FF13FE6E168A1D5227704E2C1DD81AF08068D9B4A3A3E131547906DBBF0D1428E704EC4BC671900414F7558692D0003",
+  "terms_sha256": "20aa48c1b7edb30c94ad5e2ce7398743fa1badaeb5708b0d1abae6478de30205",
+  "v": "prepay-binding/v1"
+}

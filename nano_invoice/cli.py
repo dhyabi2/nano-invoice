@@ -1,11 +1,23 @@
-"""nano-invoice create|check|receipt|verify|verify-log|verdict|tombstone|role-check|ack-verify|ack-read|rep-check|refund-hint|show.
+"""nano-invoice create|check|observe|receipt|verify|verify-log|verdict|tombstone|role-check|ack-verify|ack-read|acceptance|rep-check|refund-hint|record-refund|show.
 
 JSON on stdout. Exit 0 on a sound answer, 1 on a receipt or log that does not
 verify, 2 on a usage or document error, 3 on an RPC failure - and, for
 `ack-verify` (offline, no RPC), 3 on a payer acknowledgment that does not verify;
 for `ack-read` (offline), 3 when no ack in the list verifies under the payer.
+`acceptance` (offline, reads the store) exits 0 whatever it reports - a missing or
+invalid payer ack reads "unknown", which is an answer, not a failure - and 2 on a
+usage or document error (unknown invoice, a missing or unreadable --acks file,
+unreadable JSON, an --acks file whose top level is not a list of objects, an
+--output-commitment that is not 64 hex characters (either case) or that the newest
+log record - a tombstone or a verdict other than "delivered" - has withdrawn, or
+that differs from the output_commitment of a newest "delivered" verdict
+(output_commitment_conflicts), an empty --acceptance-rule). `ack-read` likewise
+exits 2 on a missing or unreadable acks file, one whose top level is not a list,
+an empty --order-id, or an empty --acceptance-rule (or one given without --order-id).
 `rep-check` exits 0 only when the representative matches and the block is
-confirmed (before --delivered-at, when given), 1 otherwise."""
+confirmed (before --delivered-at, when given), 1 otherwise. `observe` exits 64
+when neither --on-settle nor --webhook is given, because an observer with
+nowhere to release to is a silent loop, not an observer."""
 import argparse
 import json
 import os
@@ -15,7 +27,11 @@ import time
 from . import account as acct
 from . import core
 from . import nano_sig
+from . import price
+from . import observer as obs
 from . import rep_binding
+from . import prepay_binding
+from . import xno_receipt
 from .rpc import DEFAULT_RPC, Rpc
 
 
@@ -44,12 +60,28 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     c = sub.add_parser("create", help="create (or return the existing) invoice for an order")
-    c.add_argument("--merchant", required=True)
+    merchant = c.add_argument("--merchant", required=True)
+    # `--m` was an unambiguous prefix of --merchant before the --min-/--max- flags
+    # existed; keep it working as an exact alias, left out of --help.
+    c._option_string_actions["--m"] = merchant
     amt = c.add_mutually_exclusive_group(required=True)
     amt.add_argument("--amount-raw", help="price in raw, an integer (1 XNO = 10**30 raw)")
     amt.add_argument("--amount-xno", help="price in XNO as an exact decimal string, e.g. 0.25")
+    amt.add_argument("--amount-usd", help="price in USD, e.g. 0.01: converted to a fixed XNO amount "
+                                          "at a rate read ONCE now (the node's price action) and "
+                                          "recorded on the invoice; a re-run of the order keeps it")
+    c.add_argument("--usd-per-xno", help="with --amount-usd: the USD-per-XNO rate to use, from "
+                                         "your own source; no network call")
+    c.add_argument("--min-usd-per-xno", help="with --amount-usd: refuse a rate below this (sanity band)")
+    c.add_argument("--max-usd-per-xno", help="with --amount-usd: refuse a rate above this (sanity band)")
+    c.add_argument("--max-quote-age-s", type=int, default=price.DEFAULT_MAX_QUOTE_AGE_S,
+                   help="with --amount-usd: refuse a node quote whose timestamp is older than this "
+                        f"(default {price.DEFAULT_MAX_QUOTE_AGE_S})")
     c.add_argument("--order-key", required=True)
     c.add_argument("--expires-s", type=int, default=3600)
+    c.add_argument("--job-ref", help="your own opaque name for what this invoice pays for; echoed "
+                                     "on the settlement event so a stranger can tell which job it "
+                                     "settled, never parsed here")
     # Receipt v2. Supplying --terms-file makes this a bound invoice; without it
     # the invoice and its receipt are exactly what they were before v2.
     c.add_argument("--terms-file", help="authorisation terms as JSON, embedded in full and hashed "
@@ -99,11 +131,32 @@ def build_parser():
     av.add_argument("--reason", help="v2: the reason the payer signed (bound by sha256)")
 
     ar = sub.add_parser("ack-read", help="name the payer's current verdict from a list of "
-                                         "v1/v2 acks, offline")
+                                         "v1/v2/v3 acks, offline (v3 only with --order-id)")
     ar.add_argument("payer_address", help="the settling send block's block_account")
     ar.add_argument("output_commitment", help="sha256 of the delivered artifact, 64 hex")
     ar.add_argument("block_hash", help="the settling send block's hash, 64 hex")
     ar.add_argument("acks", help="JSON file (or - for stdin): a list of acks")
+    ar.add_argument("--order-id", help="the invoice id a v3 ack must bind; when given, only v3 "
+                                       "acks count")
+    ar.add_argument("--acceptance-rule", help=f"the rule-version string a v3 ack must bind "
+                                              f"(with --order-id; default "
+                                              f"{nano_sig.ACCEPTANCE_RULE_V1})")
+
+    ac = sub.add_parser("acceptance", help="settlement, duplicates, delivered evidence and payer "
+                                           "acceptance for one invoice, each reported on its own "
+                                           "(offline)")
+    ac.add_argument("--invoice", required=True)
+    ac.add_argument("--acks", help="JSON file (or - for stdin): a list of payer acks; only "
+                                   "delivery-ack/v3 counts as acceptance")
+    ac.add_argument("--output-commitment", help="sha256 of what was delivered, 64 hex, either case "
+                                                "(default: the newest log verdict's, when it is "
+                                                "delivered and not tombstoned)")
+    ac.add_argument("--acceptance-rule", default=nano_sig.ACCEPTANCE_RULE_V1,
+                    help=f"the rule-version string a v3 ack must bind "
+                         f"(default {nano_sig.ACCEPTANCE_RULE_V1})")
+    ac.add_argument("--refund-window-s", type=int, default=core.REFUND_WINDOW_S,
+                    help="seconds after a duplicate's block time before its unrecorded refund "
+                         f"reads refund_overdue: true (default {core.REFUND_WINDOW_S})")
 
     rc = sub.add_parser("rep-check", help="hold a block's representative to "
                                           "nano_address(sha256(scope)), read-only")
@@ -133,19 +186,81 @@ def build_parser():
     k.add_argument("--not-income-file", help="JSON object {account: reason}")
     k.add_argument("--max-blocks", type=int, default=1000)
 
+    o = sub.add_parser("observe", help="watch open invoices and release on settlement, exactly once")
+    o.add_argument("--merchant", required=True, help="receiving account; refused on a bad checksum")
+    o.add_argument("--on-settle", nargs=argparse.REMAINDER, metavar="ARGV",
+                   help="command to run per event, argv with no shell; the event JSON arrives on "
+                        "its stdin. Everything after this flag is the command, so pass it last")
+    o.add_argument("--webhook", help="URL to POST the event JSON to (no shared secret, by design: "
+                                     "the receiver re-derives the claim from the public ledger)")
+    o.add_argument("--once", action="store_true", help="one pass, then exit")
+    o.add_argument("--interval", type=int, default=obs.DEFAULT_INTERVAL_S,
+                   help=f"seconds between passes (default {obs.DEFAULT_INTERVAL_S})")
+    o.add_argument("--max-attempts", type=int, default=obs.DEFAULT_MAX_ATTEMPTS,
+                   help="release attempts before the row becomes release_failed and the observer "
+                        "carries on")
+    o.add_argument("--release-timeout", type=int, default=obs.DEFAULT_RELEASE_TIMEOUT_S)
+    o.add_argument("--catch-up", action="store_true",
+                   help="on a store that has history and no observer table yet, release the "
+                        "already-closed invoices too. Without this they are recorded as "
+                        "backfill_skipped and nothing is delivered for them")
+    o.add_argument("--own", action="append", help="another account of the merchant (never income)")
+    o.add_argument("--not-income", action="append", metavar="ACCOUNT[=REASON]")
+    o.add_argument("--not-income-file", help="JSON object {account: reason}")
+    o.add_argument("--max-blocks", type=int, default=1000)
+    o.add_argument("--now", type=int, help="injected clock, unix seconds (for tests)")
+
     r = sub.add_parser("receipt", help="print a receipt a stranger can re-check")
     r.add_argument("--invoice", required=True)
 
     v = sub.add_parser("verify", help="re-check a receipt from the public ledger alone")
     v.add_argument("--receipt", required=True, help="receipt JSON file, or - for stdin")
 
+    vg = sub.add_parser("verify-leg", help="walk the XNO payment-leg recipe for one send block "
+                                            "(hash recompute, payer/payee/amount, payee custody)")
+    vg.add_argument("--block", required=True)
+    vg.add_argument("--payer", required=True)
+    vg.add_argument("--payee", required=True)
+    vg.add_argument("--amount-raw", required=True, help="integer raw (1 XNO = 10**30 raw)")
+
+    bv = sub.add_parser("binding-verify", help="check a signed pre-payment binding, its witness chain and, "
+                                                "if given a block, that it was witnessed before the send")
+    bv.add_argument("--binding", required=True, help="binding JSON file")
+    bv.add_argument("--witness", required=True, help="witness chain JSON file (a list of entries)")
+    bv.add_argument("--block", help="the send block that paid it (omit before payment)")
+
     h = sub.add_parser("refund-hint", help="refund instructions (never sends)")
     h.add_argument("--invoice", required=True)
     h.add_argument("--claimed-payer", help="shown only to say it was ignored")
 
+    rr = sub.add_parser("record-refund", help="record the send block of a refund you sent for "
+                                              "a duplicate/late transfer (never sends)")
+    rr.add_argument("--invoice", required=True)
+    rr.add_argument("--duplicate-block", required=True, help="the duplicate/late transfer's send block")
+    rr.add_argument("--refund-block", required=True, help="your refund's own send block")
+    rr.add_argument("--at", type=int, help="unix seconds the refund was sent (default now)")
+
     s = sub.add_parser("show", help="print the stored invoice and its recorded blocks")
     s.add_argument("--invoice", required=True)
     return p
+
+
+def _load_acks(path):
+    """A JSON list of acks from a file (or - for stdin). A missing or unreadable file,
+    or a top level that is not a list, is a document error (exit 2), not an RPC one."""
+    try:
+        src = sys.stdin if path == "-" else open(path)
+        with src:
+            acks = json.load(src)
+    except OSError as e:
+        raise core.InvoiceError(f"acks_unreadable: {path}: {e.strerror or e}") from e
+    except RecursionError as e:
+        raise core.InvoiceError(f"acks_not_json: {path}: nested too deeply to read") from e
+    except ValueError as e:
+        raise core.InvoiceError(f"acks_not_json: {path}: {e}") from e
+    if not isinstance(acks, list):
+        raise core.InvoiceError(f"--acks must hold a JSON list of acks, got {type(acks).__name__}")
+    return acks
 
 
 def main(argv=None):
@@ -173,11 +288,18 @@ def main(argv=None):
             _out(result)
             return 0 if result["ok"] else 1
         if args.cmd == "ack-read":
-            src = sys.stdin if args.acks == "-" else open(args.acks)
-            with src:
-                acks = json.load(src)
+            acks = _load_acks(args.acks)
+            if args.acceptance_rule is not None and args.order_id is None:
+                raise core.InvoiceError("--acceptance-rule needs --order-id")
+            if args.acceptance_rule == "":
+                raise core.InvoiceError("--acceptance-rule must not be empty")
+            if args.order_id == "":
+                raise core.InvoiceError("--order-id must not be empty")
+            rule = ((nano_sig.ACCEPTANCE_RULE_V1 if args.acceptance_rule is None
+                     else args.acceptance_rule) if args.order_id is not None else None)
             result = nano_sig.read_payer_acks(args.payer_address, args.output_commitment,
-                                              args.block_hash, acks)
+                                              args.block_hash, acks, order_id=args.order_id,
+                                              acceptance_rule=rule)
             _out(result)
             return 0 if result["ok"] else 3
         if args.cmd == "ack-verify" and args.verdict is not None:
@@ -214,6 +336,22 @@ def main(argv=None):
                                                    delivered_at=args.delivered_at, rpc=rpc)
             _out(result)
             return 0 if result["ok"] else 1
+        if args.cmd == "binding-verify":
+            with open(args.binding) as fh:
+                binding = json.load(fh)
+            with open(args.witness) as fh:
+                chain = json.load(fh)
+            result = prepay_binding.verify_prepayment(binding, chain, block=args.block, rpc=rpc)
+            _out(result)
+            if args.block is None:  # before payment: the question is "bound and witnessed?"
+                return 0 if result["binding_signed"]["ok"] and result.get("witnessed", {}).get("ok") else 1
+            return 0 if result["ok"] else 1
+        if args.cmd == "verify-leg":
+            if not (args.amount_raw.isascii() and args.amount_raw.isdigit()):
+                raise core.AmountError("--amount-raw must be digits only (integer raw; 1 XNO = 10**30 raw)")
+            result = xno_receipt.verify_leg(args.block, args.payer, args.payee, int(args.amount_raw), rpc=rpc)
+            _out(result)
+            return xno_receipt.EXIT_CODES.get(result["verdict"], 3)
         if args.cmd in ("verify", "verify-log"):
             src = sys.stdin if args.receipt == "-" else open(args.receipt)
             with src:
@@ -226,7 +364,15 @@ def main(argv=None):
             return 0 if result["ok"] else 1
         store = core.Store(args.db)
         if args.cmd == "create":
-            raw = int(args.amount_raw) if args.amount_raw is not None else core.xno_to_raw(args.amount_xno)
+            if args.amount_usd is None:
+                for flag, val in (("--usd-per-xno", args.usd_per_xno),
+                                  ("--min-usd-per-xno", args.min_usd_per_xno),
+                                  ("--max-usd-per-xno", args.max_usd_per_xno)):
+                    if val is not None:
+                        raise core.InvoiceError(f"{flag} needs --amount-usd")
+            raw = (None if args.amount_usd is not None
+                   else int(args.amount_raw) if args.amount_raw is not None
+                   else core.xno_to_raw(args.amount_xno))
             terms = None
             if args.terms_file:
                 tsrc = sys.stdin if args.terms_file == "-" else open(args.terms_file)
@@ -238,9 +384,16 @@ def main(argv=None):
                 if not isinstance(terms, dict):
                     raise core.InvoiceError("terms_not_an_object: the terms file must hold an object")
                 terms = dict(terms, counterparty_role=args.counterparty_role)
-            inv = core.create_invoice(args.merchant, raw, args.order_key, args.expires_s, store=store,
-                                      terms=terms, intent_hash=args.intent_hash,
-                                      idempotency_key=args.idempotency_key)
+            bound = dict(terms=terms, intent_hash=args.intent_hash, idempotency_key=args.idempotency_key)
+            if raw is None:
+                inv = price.create_invoice_usd(args.merchant, args.amount_usd, args.order_key,
+                                               args.expires_s, store=store, usd_per_xno=args.usd_per_xno,
+                                               rpc=rpc, max_age_s=args.max_quote_age_s,
+                                               min_usd_per_xno=args.min_usd_per_xno,
+                                               max_usd_per_xno=args.max_usd_per_xno, **bound)
+            else:
+                inv = core.create_invoice(args.merchant, raw, args.order_key, args.expires_s, store=store,
+                                          job_ref=args.job_ref, **bound)
             _out(dict(inv.to_dict(), instruction=f"send exactly {inv.pay_raw} raw to {inv.merchant}"))
         elif args.cmd == "verdict":
             _out(core.append_verdict(
@@ -258,6 +411,23 @@ def main(argv=None):
         elif args.cmd == "check":
             _out(core.check_invoice(args.invoice, rpc=rpc, store=store, own_accounts=args.own or (),
                                     not_income=_not_income(args), max_blocks=args.max_blocks))
+        elif args.cmd == "observe":
+            if not args.on_settle and not args.webhook:
+                _out({"error": "ReleaseNotConfigured",
+                      "message": "observe needs --on-settle ARGV... or --webhook URL, or both"})
+                return 64
+            passes = 0
+            for events in obs.observe(
+                    store=store, merchant=args.merchant, rpc=rpc, on_settle=args.on_settle,
+                    webhook=args.webhook, once=args.once, interval=args.interval,
+                    max_attempts=args.max_attempts, release_timeout=args.release_timeout,
+                    catch_up=args.catch_up, own_accounts=args.own or (),
+                    not_income=_not_income(args), max_blocks=args.max_blocks,
+                    clock=(lambda: args.now) if args.now is not None else None):
+                passes += 1
+                _out({"pass": passes, **events.detail,
+                      "events": [e.payload for e in events],
+                      "states": {e.delivery_id: e.state for e in events}})
         elif args.cmd == "receipt":
             _out(core.receipt(args.invoice, store=store))
         elif args.cmd == "refund-hint":
@@ -270,6 +440,15 @@ def main(argv=None):
                     if h["to"] != claimed:
                         h["ignored_claimed_payer"] = args.claimed_payer
             _out({"invoice_id": args.invoice, "refunds": hints})
+        elif args.cmd == "acceptance":
+            acks = _load_acks(args.acks) if args.acks is not None else ()
+            _out(core.acceptance_fields(args.invoice, store=store, acks=acks,
+                                        output_commitment=args.output_commitment,
+                                        acceptance_rule=args.acceptance_rule,
+                                        refund_window_s=args.refund_window_s))
+        elif args.cmd == "record-refund":
+            _out(core.record_refund(args.invoice, args.duplicate_block, args.refund_block,
+                                    store=store, at=args.at))
         elif args.cmd == "show":
             inv = store.get(args.invoice)
             _out({"invoice": inv.to_dict(),

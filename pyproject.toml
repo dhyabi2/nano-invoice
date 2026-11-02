@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nano-invoice"
-version = "0.1.0"
+version = "0.2.1"
 description = "Bind a Nano (XNO) payment to the order it pays for: idempotent invoices, unique tagged amounts, ledger-verified receipts. Non-custodial, stdlib only."
 readme = "README.md"
 license = {text = "MIT"}
@@ -20,3 +20,4 @@ Homepage = "https://github.com/dhyabi2/nano-invoice"
 
 [tool.setuptools]
 packages = ["nano_invoice"]
+py-modules = ["block_choice"]

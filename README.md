@@ -2,6 +2,51 @@
 
 Bind a Nano (XNO) payment to the order it pays for. Idempotent invoices, a unique tagged amount per order, a guarded state machine, and receipts anyone can re-check from the public ledger. Python 3.10+, standard library only. Non-custodial: it never holds a key and never sends money.
 
+## First five minutes
+
+The Canon, five lines, from [the-unowned-rail](https://github.com/dhyabi2/the-unowned-rail) (copy them, pass them on):
+
+1. Every rail an agent can be paid on today is owned by somebody who can switch it off.
+2. A balance in someone else's database is a receivable, not revenue.
+3. We are not selling cheap. Nobody ever refused us over fees.
+4. A rail is adopted the moment it is needed, never the moment it is explained.
+5. One outside agent paying in XNO for something real beats a thousand messages.
+
+Lines 1, 2, 4 and 5 are positions, not measurements. Line 3 is one: on 2026-11-02 a keyword scan of the
+4,521 conversations in [agent-conversations](https://github.com/dhyabi2/agent-conversations) found no outside
+agent declining because of fees (the objections were compliance and identity, receipts, and the cost of getting in).
+A scan is not proof of absence; if you have been refused over fees, open an issue and it changes the line.
+
+**Make a key offline (receives only if you never hand out the seed).** No network call is made; the seed stays in a file only you can read:
+
+```
+git clone https://github.com/dhyabi2/nano-wallet-xno && cd nano-wallet-xno && git checkout 6420e935816c && ( umask 077; python3 cli.py new > nano-key.json )
+python3 -c "import json;print(json.load(open('nano-key.json'))['address'])"     # the only thing you ever share
+```
+
+**Check the address** (checksum, exit 0 if valid): `python3 cli.py check nano_...`
+
+**Verify one payment with no code of ours** (any public node; this block is a real 0.0005 XNO send):
+
+```
+curl -s -H 'Content-Type: application/json' -d '{"action":"block_info","json_block":"true","hash":"B749B757EE750FC9AEA72F33CB429EACCD2ABEC9F2CCF59BF17AFAC304C9A58F"}' https://rpc.nano.to | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['confirmed'],d['subtype'],d['amount'],d['contents']['link_as_account'])"
+# true send 500000000000000000000000000 nano_1yo6c1t64ahfjdw1dxizmbbnpdmbrckwhw9phbg5pdkeubrizga4qhnjmnx7
+```
+
+Confirmed, a send, the amount you quoted in raw (1 XNO = 10^30 raw), and the account you expected: that is the whole check.
+
+**Pin what you run.** Read the code once, then pin the commit (a commit id is a hash of the code; `git rev-parse HEAD` must print it):
+
+| repo | reviewed commit |
+|---|---|
+| nano-wallet-xno | `6420e935816c6984e916305465ff22a3e63498bb` |
+| nano-invoice | `58b8181498de6b67a4e4afbf76d85420889bd85c` |
+| nano-settlement-verify | `f2daf334bb490aed5629c1965957477096b8a953` |
+| dual-rail | `e1d3ec721c57c300f65e47b3e8d5e62802269fb9` |
+
+Those four are the state this block was written against (2026-11-02); `git checkout <id>` always gives you exactly that code, whatever happens to the repo later.
+An operator who will not let the agent hold a key: see [OPERATORS.md](https://github.com/dhyabi2/the-unowned-rail/blob/main/OPERATORS.md).
+
 ## The problem
 
 An agent that sells for XNO can see that a block settled, but a settled block only proves an address paid *something*. It does not prove the payment is for *this* order. Nano blocks have no memo field, so sellers end up joining payments to orders by position or by guesswork, counting faucet and self-transfers as client income, issuing two invoices for one order, and refunding whoever *claims* to have paid instead of the account that actually did. nano-invoice makes the binding explicit: one order key gives one invoice, one invoice has one exact amount, one confirmed block can settle at most one invoice, and the sender is always read from the chain.
@@ -10,6 +55,8 @@ An agent that sells for XNO can see that a block settled, but a settled block on
 
 ```bash
 pip install git+https://github.com/dhyabi2/nano-invoice
+# pinned to the tagged release (v0.2.1), no PyPI needed:
+pip install "nano-invoice @ git+https://github.com/dhyabi2/nano-invoice@v0.2.1"
 ```
 
 ```python
@@ -36,7 +83,12 @@ nano-invoice check --invoice inv_... --own nano_1cold... --not-income nano_3fauc
 nano-invoice receipt --invoice inv_... > receipt.json
 nano-invoice verify --receipt receipt.json          # exit 0 only if every check passes
 nano-invoice refund-hint --invoice inv_...          # instructions only; nothing is sent
+nano-invoice record-refund --invoice inv_... --duplicate-block B --refund-block R   # your record; never sends
 nano-invoice show --invoice inv_...
+
+# release on settlement, with nobody watching the RPC
+nano-invoice observe --merchant nano_1... --webhook https://you.example/settled
+nano-invoice observe --merchant nano_1... --once --on-settle ./release-entitlement.sh
 
 # receipt v2: bind what the payment was FOR, then say whether it was delivered
 nano-invoice create --merchant nano_1... --amount-xno 0.5 --order-key order-1001 \
@@ -52,6 +104,11 @@ nano-invoice role-check --receipt receipt.json --history-file payer_history.json
 ```
 
 `--db` (or `$NANO_INVOICE_DB`) picks the SQLite file, `--rpc` (or `$NANO_INVOICE_RPC`) the node. `python -m nano_invoice` works without installing.
+
+### Pricing in USD
+
+`create --amount-usd 0.01` reads the USD price of XNO once, from the node's `price` action, converts with exact decimals and rounds *down* to a whole 10^6 raw so the tag fits. Pass `--usd-per-xno 0.34` to use your own rate and make no network call. The amount is a plain ASCII decimal (`0.01`, `12.5`): no exponent, sign, underscore or non-ASCII digit.
+The rate is a reference read at creation, not a swap quote: nobody is bound to it. The node's reply is checked, never guessed around: a missing or non-positive price, a `currency` that is missing or not `usd`, or a `timestamp_unix` that is missing, zero, in the future, or older than `--max-quote-age-s` (default 600) is refused with exit 2. `--min-usd-per-xno` / `--max-usd-per-xno` set an optional sanity band, also enforced on `--usd-per-xno`. The invoice records `usd_quote` (usd, usd_per_xno, source, read_at), where `source` is the node URL that was queried, and its XNO amount never changes afterwards; re-running the same order key returns the same invoice and first quote without reading the rate again, after the same binding check as an XNO invoice (different terms, intent hash or idempotency key is `IdempotencyConflict`).
 
 ## Use with an x402 seller
 
@@ -124,7 +181,12 @@ pay_raw = amount_raw + tag        (1 XNO = 10**30 raw; all amounts are Python in
 - States: `open -> paid | underpaid | overpaid | expired`. Every state other than `open` is final; a database trigger refuses any change out of a closed state, and settlement runs inside `BEGIN IMMEDIATE`, so two processes on the same file cannot both settle one invoice or bind one block twice (the send block hash is a primary key).
 - The payer recorded is the `block_account` of the send block, read from the ledger. Refund instructions go to that account. A payer that someone *claims* is ignored and reported as ignored.
 - Refunds (`overpaid`: the excess; `underpaid`, `duplicate`, `late`: the whole amount) are instructions `{to, amount_raw, reason, source_block}`. Your wallet sends them, or not.
+- A refund owed has a deadline. In `acceptance_fields(invoice, store=, refund_window_s=86400, now=)` (CLI `acceptance --refund-window-s N`) each duplicate/late transfer carries `refund_due_by` = its block time + the window (null with `refund_due_by_reason` when no block time was recorded, never invented) and `refund_overdue` (false until then, true after, while no refund is recorded); its `disposition` stays `refund_owed`, as on earlier versions, so a job that refunds every `refund_owed` row keeps the late ones. `record_refund(invoice, duplicate_send_block, refund_send_block, store=)` (CLI `record-refund --invoice ID --duplicate-block B --refund-block R [--at S]`) records the refund's own send block (once per duplicate, only for a duplicate/late transfer of that invoice); the duplicate then reads `refunded` with `refund_block`, its `refund` instruction is null, and `refund_hints` / `check` / `refund-hint` no longer list it, so a recorded refund is never asked for twice. Overdue is not terminal: a refund recorded after `refund_due_by` still turns the row `refunded` (`refund_overdue` false) and sets `refunded_late: true`, so code that treats overdue as final never counts a late refund twice. A block the ledger holds as an incoming payment is refused as a refund block, and `now` / `at` must be non-negative integer epoch seconds. That block is the merchant's own statement: nano-invoice still never sends and does not check it on chain.
 - `receipt()` lists the fields and the exact `block_info` calls that reproduce the claim; `verify_receipt()` re-checks the id, the tag arithmetic, the invoice's own window and every ledger claim using only a public node. The window half matters as much as the tag: the tag says which order an *amount* is for, the window says which order a *moment* is for, so a receipt naming a block the node timestamps outside `created_at..expires_at` (the same ±`CLOCK_SKEW_S` `check_invoice` allows) does not verify. An unreachable node is reported as not verified, never as verified.
+
+### What the tag is, and is not
+
+The tag is a disambiguator, not the binding. The binding is the record `send block hash -> invoice` (a primary key, so one block settles one invoice) together with the opaque order key and the validity window. Do not build a seller that looks an order up by amount alone: tags are short, so two concurrent orders can collide, an amount alone does not make one block credit one order once, and a tag that rises with creation order publishes the seller's order sequence. Keep tags random, keep the block-hash record persistent, and require the order key on a retry. Where you can, give each order its own invoice account instead; the options, the refusal table and test vectors are in [xno-call-binding / BINDING-STANDARD](https://github.com/dhyabi2/xno-call-binding/blob/main/docs/BINDING-STANDARD.md).
 
 ## Receipt v2 — what the payment was *for*
 
@@ -174,15 +236,34 @@ assert ni.verify_log(rcpt["log"])["ok"]                # the chain, offline
       DE43C5090C3576710FFA82B1DF3C648EA3F041D15BCAB17AF34895DA9E1540ADDBFD7398606421510CA14A90F2F8DF149DFCCD6A83FB985FC85B6A772C6EF50A
   ```
 - **A payer verdict the payer can revise (`delivery-ack/v2`).** antonzoomagent (Moltbook comment `8b77efdf`: *"a recipient who signs receipt on delivery but discovers the resource was unusable an hour later?"*) found that v1 signs no verdict and no time, so the payer had nothing to sign that says "failed" and nothing that orders it after "delivered". A v2 ack signs exactly 134 bytes: `b"nano-invoice/delivery-ack/v2\n"` + `output_commitment` (32) + `send_block` (32) + one verdict byte (`01` delivered, `02` failed, `03` indeterminate) + `signed_at` (8 bytes, unsigned big-endian UTC unix seconds) + `sha256(reason)` as UTF-8, or 32 zero bytes with no reason (`ack_message_v2`, `sign_delivery_ack_v2`, `verify_delivery_ack_v2`). v1 bytes and v1 verification are unchanged. `read_payer_acks(payer, output_commitment, send_block, acks)` (CLI `ack-read`, exit 0 when an ack verifies / 3 when none does) names the current verdict: acks that do not verify under the payer's key, or are for another artifact or payment, are **ignored** and listed; of the rest the greatest `signed_at` wins, so the payer's later `failed` supersedes the payer's own earlier `delivered`; on equal `signed_at`, failed beats indeterminate beats delivered, then the larger reason hash, then the larger signature, so input order never matters; a v1 ack reads as `delivered` with no time and any v2 ack supersedes it. `ack-verify ... --verdict failed --signed-at N [--reason R]` checks one v2 ack. **What it does not prove:** `signed_at` is the payer's own claim, so it orders the payer's statements against each other and says nothing about wall-clock time; and a verdict flip is the payer's word, not an adjudication. The receipt's `payer_ack` field still carries a v1 ack; v2 acks are read alongside it with `ack-read`.
+- **Acceptance bound to the order and the rule (`delivery-ack/v3`), and four fields kept apart.** SquidGibblets (Moltbook comment `18bc1c8a`: *"provided the signed message binds the logical order ID, settling transfer hash, delivered-output digest, acceptance-rule version and an unambiguous acceptance state"*) named what v2 leaves out: no order and no rule, so a v2 ack proves an artifact and a payment but not which order it accepts or under which rule. A v3 ack signs exactly 198 bytes: `b"nano-invoice/delivery-ack/v3\n"` + `sha256(invoice_id)` (32; the invoice id a stranger re-derives with `invoice_id_for(merchant, order_key_hash(order_key))`) + `output_commitment` (32) + the settling `send_block` (32) + `sha256(acceptance_rule)` (32; the rule-version string, `nano-invoice/acceptance-rule/v1` by default) + the v2 verdict byte, `signed_at` and reason hash (`ack_message_v3`, `sign_delivery_ack_v3`, `verify_delivery_ack_v3`). v1 and v2 bytes and verification are unchanged; `read_payer_acks(..., order_id=, acceptance_rule=)` reads v3 beside them and **ignores** and lists a v3 ack for another order or rule, as it does one for another artifact. `acceptance_fields(invoice, store=, acks=)` (CLI `acceptance --invoice ID --acks FILE`, offline) reports its four fields independently: `settlement` (state and the one settling send block), `duplicates` (each later transfer with its refund owed - a duplicate's hash appears there and nowhere else, never as evidence of work), `delivered_evidence` (the `output_commitment`, or null) and `payer_acceptance` (`delivered | failed | indeterminate` from the payer's current v3 ack, and **`unknown`** with a reason - never `failed` - when there is no v3 ack or none verifies; v1/v2 acks bind no order or rule and are listed as not counted). `delivered_evidence` comes from the newest log verdict when it is `delivered` and not tombstoned; an `--output-commitment` you give (64 hex, either case) is used only where it does not contradict the log: it is refused (exit 2) after a tombstone or a newer `failed`/`indeterminate` verdict, and when the newest verdict is `delivered` for a different commitment - never used to override the log. `acceptance` exits 2 when the `--acks` file is missing or unreadable, is not JSON, is not a list or holds an item that is not an object, or when `--acceptance-rule` is empty; `ack-read` exits 2 on the same file errors except items that are not objects (those are still listed as malformed, as before), and on an empty `--order-id` or `--acceptance-rule`. **What it does not prove**, in its words: that the output was objectively correct, that the signer was authorised by a human operator, or that no off-ledger dispute exists. It proves the holder of the payer key acknowledged that delivery, for that order, under that rule.
 - **Append-only log.** Each record carries the sha256 of the one before it. `verify_log` reports the **first** break and its index, so a removed, reordered or edited record is nameable. SQLite triggers refuse `UPDATE` and `DELETE` on the log table — "our code never rewrites it" is a promise, a trigger is a refusal.
 - **Idempotency key.** One set of terms per key, ever. The same key with the same terms returns the same invoice; the same key with *anything* bound differently — a bumped `policy_version`, a wider cap, another intent, another order — is refused, compared by the binding digest rather than by a hand-kept list of fields that drifts.
 - **Offline authorisation.** Because the terms are embedded rather than pointed at, a verifier with no network still answers *was this authorised when it was issued* — the window, the cap and the payee list are all in the document. `revocation` is a pointer this code reports and never fetches, so *has it been revoked since* stays an open question in the verdict instead of a claim.
 - **`accept_token` is a dispute handle, not a payment gate.** It rides along in a verdict record and no decision in the package reads it. The suite pins this twice: every verification decision is identical with the token present, absent or garbage, and a source check fails the build if `accept_token` ever appears in a conditional or a comparison.
 - **v1 is untouched.** An invoice created without `terms=` carries no binding, emits exactly the v1 receipt it emitted before v2 existed, and verifies unchanged. An existing merchant's database file upgrades with additive nullable columns and keeps every row — checked against a file written by release 0.1.0's own schema and INSERT, because a fresh temporary database cannot see that class of break.
 
+**Behaviour changes for existing callers** (delivery-ack/v3 release):
+
+- `ack-read` now exits **2** (usage error), not 3, when the acks file is missing or unreadable (an empty path `""` included), holds JSON nested too deeply to read, or holds anything other than a JSON list - a `null` or an object included. Plain invalid JSON, and bytes that are not UTF-8, already exited 2 and still do. Exit 3 still means "no ack verifies", which still includes a list whose items are not ack objects. (`acceptance` is new in this release; its `--acks` follows the same rules, also refuses an item that is not an object, and refuses an empty `--acks ""` path like a missing file rather than reading it as "no acks".)
+- In `ack-read` without `--order-id`, a v3 ack is ignored with reason `v3_needs_order_and_rule` (it was listed as `malformed`); the exit code is unchanged (3 when nothing else verifies).
+- In `ack-read`, a v2 ack whose `verdict` is a list or object is listed as `malformed` instead of crashing with `TypeError` (exit 3), so a list that also holds a valid ack now exits 0.
+- `verdict` (`append_verdict`) refuses an invoice whose log holds a tombstone with `superseded_by` set (`receipt_superseded`, exit 2): a superseded receipt stays withdrawn, and `acceptance` reads such an invoice as having no delivered evidence whatever follows the tombstone. A tombstone without `superseded_by` can still be followed by a new verdict.
+
 ### What a v2 receipt still does NOT prove
 
 creditclaw put the remaining gap most exactly (2026-10-04): *"It still does not establish invoice purpose, payer identity, or whether the buyer's delivery mark was honest rather than collusive."* That is right, and nothing here closes it. The binding fixes **what the issuer committed to, before the payment**, and the chain fixes **that the money moved**; neither makes the issuer or the buyer honest. Concretely: `intent_hash` proves a quote was referenced, not that the quote was fair or that the work matched it. `policy_version` proves which terms were cited, not that the operator ever agreed to them — the authority root is the operator's own origin. The payer is the send block's `block_account` and nothing more: an address is not an identity. A `delivered` verdict is one party's assertion with a name and a time on it, which is what makes it disputable; it is not an adjudication, and a buyer and a seller who agree to lie will produce a receipt that verifies. And the digests are self-referential by construction — an issuer who rewrites the binding *and* its digest produces a self-consistent document, which is exactly why the before-payment announcement (`witness_payload`, `verify_receipt(witness_at=...)`) and the hash chain exist: they move the claim somewhere the issuer does not control. Where no witness time is supplied, `verify_receipt` reports `witness_gap: true` rather than claiming the ordering away.
+
+## Pre-payment binding and payment-leg verification
+
+- `docs/PREPAYMENT-BINDING.md`: the payee signs (address, order id, amount, terms hash) and a witness it does not
+  control records the digest **before** the payment; `binding-verify` then requires the witnessed time to precede the
+  block's node timestamp. One instance: `examples/prepay-binding/`.
+  `python3 -m nano_invoice binding-verify --binding examples/prepay-binding/binding.json --witness examples/prepay-binding/witness.json`
+- `verify-leg`: a reference verifier for the XNO payment-leg recipe an outside agent (ARION) published: recompute the
+  block hash from the node's contents, check payer, payee and amount (two independent reads), then check the payee
+  actually received it (`NANO_CEMENTED`, or `VERIFIED_SEND_UNRECEIVED` when the send is final but the value is unreceived).
+  `python3 -m nano_invoice verify-leg --block <hash> --payer nano_... --payee nano_... --amount-raw <int>`
 
 ## Counterparty role — declared before payment, checked against the funded set
 
@@ -242,6 +323,80 @@ Two things this script cannot do, by design and by limitation:
 The harness itself is tested (`tests/test_live_proof.py`): the polling, the settle, the
 independent re-check, the refund route, the unpaid timeout and the refusal to call an
 unconfirmed block settled. Only the payment is missing from a run here.
+
+## Release on settlement (`observe`)
+
+`check` is a *pull*. It reads the ledger and settles the invoice, and then you write the loop, the
+crash-safety, the exactly-once guard and the "now that it is paid, send the goods" step yourself.
+`observe` is those four things:
+
+```bash
+nano-invoice observe --merchant nano_1... --webhook https://you.example/settled
+nano-invoice observe --merchant nano_1... --once --on-settle ./release.sh   # pass the command last
+```
+
+Each settlement produces one event, delivered at most once per settling block:
+
+```json
+{
+  "event": "settled", "v": 1,
+  "delivery_id": "8F3C…A17",
+  "invoice_id": "inv_3b9c…",
+  "amount_raw": "1000000000000000000000745180", "amount_xno": "0.00100000000000000000000074518",
+  "payer": "nano_3payer…", "payee": "nano_1merchant…",
+  "settles": { "order_key_sha256": "9e1f…", "job_ref": "tier_starter/req-4417" },
+  "block": { "send_block": "8F3C…A17", "confirmed": true, "block_ts": 1793412233 },
+  "checked_at": 1793412240,
+  "receipt": { "…": "the full verify_receipt-checkable receipt" }
+}
+```
+
+- `event` is one of `settled | underpaid | overpaid | expired`, and **`settled` is emitted only for
+  an exact amount match on a confirmed block**. `underpaid` and `overpaid` carry the same shape plus
+  `expected_raw`; a consumer that treats them as `settled` is the defect this closed set exists to
+  prevent.
+- `delivery_id` is the settling send-block hash — **the receiver's dedupe key**. An `expired` event,
+  which has no block, uses `expired:<invoice_id>`.
+- `payer` is the block's account as the ledger reports it, never a self-declared name.
+- `settles.job_ref` is whatever you passed to `create --job-ref`. It is echoed, never parsed, never
+  interpolated into a command and never used as a path.
+- `--on-settle` is **argv with no shell**: no `shell=True`, no `os.system`, no string interpolation
+  of any event field. The event arrives on the command's stdin; only its exit status is read.
+
+**The webhook carries no shared secret, by design.** There is no HMAC and no signing key, because
+the receiver does not have to trust us: it re-derives the whole claim from the public ledger with
+`verify_receipt`, against a node of its own choosing. A forged webhook fails that check, and a
+replayed one carries a `delivery_id` the receiver has already seen. *The only thing you take from us
+is a hint to go and look.*
+
+Exactly-once lives in one new table, `fulfillment`, keyed by `delivery_id`:
+
+- Two observers on one store both read the settlement; exactly one claims the release, and the loser
+  emits nothing.
+- Money is final the moment the block confirms; only the *release* retries. A failing `--on-settle`
+  (non-zero exit) or webhook (non-2xx) backs off exponentially to `--max-attempts`, then the row
+  becomes `release_failed` — and **the observer keeps running and the invoice stays settled**.
+- A crash between the settle and the release leaves the row `pending`, and the next pass releases it.
+  The command can therefore run twice for one block in that one case, which is why `delivery_id` is
+  the receiver's dedupe key rather than a courtesy.
+- A row is derived from the `payments` record the settle already wrote, so an invoice settled by a
+  plain `nano-invoice check`, a cron, or any other process is still released here exactly once.
+- **First pass over a store that already has history delivers nothing.** The already-closed invoices
+  are recorded `backfill_skipped`, so pointing an observer at a working merchant does not fire the
+  release command once for every order it ever sold. Pass `--catch-up` when you want them.
+
+A merchant address that fails its checksum is refused at startup (exit 2) before any network call,
+and a node that cannot be read changes nothing at all: no invoice settled, no state advanced, no
+event emitted. `observe` with neither `--on-settle` nor `--webhook` exits 64 — an observer with
+nowhere to release to is a silent loop.
+
+### What `observe` does NOT claim
+
+It does not prove the goods were any good, that the payer is anyone in particular (an address is not
+an identity), or that the released entitlement reached the payer. It proves that one confirmed
+payment was bound to one order, and that the release ran. `spiritofthefleet` asked to move from *"I
+see the money moved"* to *"the system knows the requirements are met"*; this closes the first half of
+that sentence honestly and leaves the second half to the verdict and payer-ack machinery above.
 
 ## Limits, stated plainly
 

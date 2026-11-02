@@ -15,6 +15,7 @@ sends. Refunds come out as instructions for the merchant's own wallet.
 """
 import contextlib
 import dataclasses
+import decimal
 import hashlib
 import json
 import secrets
@@ -116,6 +117,9 @@ def invoice_id_for(merchant, order_key_sha256):
     return "inv_" + hashlib.sha256(f"{ID_PREFIX}|{merchant}|{order_key_sha256}".encode()).hexdigest()[:32]
 
 
+QUOTE_FIELDS = ("quote_usd", "quote_usd_per_xno", "quote_source", "quote_read_at")
+
+
 @dataclasses.dataclass(frozen=True)
 class Invoice:
     id: str
@@ -141,6 +145,17 @@ class Invoice:
     terms_json: str = None
     terms_sha256: str = None
     binding_sha256: str = None
+    # USD quote (2026-10-28), set only by an invoice priced with --amount-usd:
+    # the reference rate read ONCE at creation. Nullable, so older invoices load
+    # unchanged; the raw amount above is what the invoice asks for, not these.
+    quote_usd: str = None
+    quote_usd_per_xno: str = None
+    quote_source: str = None
+    quote_read_at: str = None
+    # The seller's own name for what this invoice pays for (2026-10-27), carried
+    # so a settlement event can say WHICH job it settled. Opaque to us: echoed,
+    # never parsed, never interpolated into a command, never used as a path.
+    job_ref: str = None
 
     def to_dict(self):
         d = dataclasses.asdict(self)
@@ -150,11 +165,18 @@ class Invoice:
         d.pop("terms_json", None)
         if self.terms_json:
             d["terms"] = json.loads(self.terms_json)
+        quote = {k[len("quote_"):]: d.pop(k) for k in QUOTE_FIELDS}
+        if self.quote_usd is not None:
+            d["usd_quote"] = dict(quote, note="reference rate read once when the invoice was created; "
+                                              "not a swap quote; the XNO amount does not change")
         return d
 
     @property
     def terms(self):
         return json.loads(self.terms_json) if self.terms_json else None
+
+
+_INVOICE_FIELDS = frozenset(f.name for f in dataclasses.fields(Invoice))
 
 
 SCHEMA = """
@@ -238,6 +260,16 @@ CREATE TABLE IF NOT EXISTS short_sends(
   block_ts INTEGER,
   seen_at INTEGER NOT NULL
 );
+-- The merchant's own statement that it sent the refund owed for one duplicate or
+-- late transfer: that transfer's send block and the refund's send block. Created
+-- IF NOT EXISTS like short_sends, so an older file opens with no rows here. It is
+-- not checked on chain: nano-invoice never sends and reads no refund block.
+CREATE TABLE IF NOT EXISTS refunds_sent(
+  send_block TEXT PRIMARY KEY REFERENCES payments(send_block),
+  invoice_id TEXT NOT NULL REFERENCES invoices(id),
+  refund_block TEXT NOT NULL UNIQUE,
+  recorded_at INTEGER NOT NULL
+);
 """
 
 
@@ -275,6 +307,15 @@ class Store:
         ("invoices", "terms_json", "TEXT"),
         ("invoices", "terms_sha256", "TEXT"),
         ("invoices", "binding_sha256", "TEXT"),
+        # USD quote, 2026-10-28: nullable and additive like the rest.
+        ("invoices", "quote_usd", "TEXT"),
+        ("invoices", "quote_usd_per_xno", "TEXT"),
+        ("invoices", "quote_source", "TEXT"),
+        ("invoices", "quote_read_at", "TEXT"),
+        # The settlement observer, 2026-10-27. Additive and nullable like the
+        # rest: a store written before it existed opens unchanged and simply
+        # has no job_ref on its rows.
+        ("invoices", "job_ref", "TEXT"),
     )
 
     def _migrate(self):
@@ -302,7 +343,7 @@ class Store:
         for k in ("amount_raw", "pay_raw", "received_raw"):
             if d[k] is not None:
                 d[k] = int(d[k])
-        return Invoice(**d)
+        return Invoice(**{k: v for k, v in d.items() if k in _INVOICE_FIELDS})
 
     def get(self, invoice):
         inv_id = invoice.id if isinstance(invoice, Invoice) else invoice
@@ -445,9 +486,16 @@ def _require_store(store):
 
 def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, store=None, now=None,
                    witness_at=None, terms=None, intent_hash=None, idempotency_key=None,
-                   _rand=secrets.randbelow):
+                   quote=None, job_ref=None, _rand=secrets.randbelow):
     """Idempotent: the same (merchant, order_key) always returns the same invoice.
     The same order key with a different amount raises OrderConflict.
+
+    `job_ref` is the seller's own opaque name for what this invoice pays for
+    (an order id, a tier, a request id). It is stored and echoed on the
+    settlement event so a stranger reading the event can tell WHICH job the
+    payment settled; nothing here parses it. It is set when the invoice is
+    created, so the idempotent return of an existing invoice keeps the job_ref
+    that invoice already had.
 
     `witness_at` is the unix time the merchant announced this invoice's binding
     (id + tagged amount) to a channel it does not control, before any payment.
@@ -461,7 +509,13 @@ def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, stor
     `policy_version` lives in the terms, and a binding missing it would claim
     to bind an authorisation version it does not carry. Without `terms` nothing
     changes: the invoice has no binding and `receipt()` emits v1 exactly as
-    before."""
+    before.
+
+    `quote` ({usd, usd_per_xno, source, read_at}, strings) records the USD
+    reference rate an amount was converted at (see price.create_invoice_usd).
+    It is stored beside the invoice and binds nothing: the amount is amount_raw.
+    An existing invoice whose recorded USD amount equals quote["usd"] is
+    returned as it is, with its first quote."""
     store = _require_store(store)
     merchant = acct.normalise(merchant_account)
     require_raw(amount_raw, "amount_raw", minimum=TAG_MODULUS)
@@ -495,11 +549,11 @@ def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, stor
     okh = order_key_hash(order_key)
     inv_id = invoice_id_for(merchant, okh)
 
-    def binding_for(inv_id_, tag_, pay_raw_, created_at_, expires_at_):
+    def binding_for(inv_id_, tag_, pay_raw_, created_at_, expires_at_, amount_raw_=amount_raw):
         try:
             return v2.bound_document(
                 invoice_id=inv_id_, merchant=merchant, order_key_sha256=okh,
-                amount_raw=amount_raw, tag=tag_, pay_raw=pay_raw_, created_at=created_at_,
+                amount_raw=amount_raw_, tag=tag_, pay_raw=pay_raw_, created_at=created_at_,
                 expires_at=expires_at_, intent_hash=intent_hash,
                 idempotency_key=idempotency_key, terms=normalised_terms)
         except v2.TermsError as e:
@@ -509,11 +563,20 @@ def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, stor
         row = c.execute("SELECT * FROM invoices WHERE id = ?", (inv_id,)).fetchone()
         if row is not None:
             existing = Store._invoice(row)
-            if existing.amount_raw != amount_raw:
+            same_usd = (quote is not None and existing.quote_usd is not None
+                        and _same_decimal(existing.quote_usd, quote.get("usd")))
+            if existing.amount_raw != amount_raw and not same_usd:
                 raise OrderConflict(
                     f"order already invoiced as {existing.id} for {existing.amount_raw} raw; "
                     f"refusing a second invoice for {amount_raw} raw")
-            _same_binding(existing, normalised_terms, binding_for)
+            if same_usd:
+                # The same USD request re-quoted at another rate (e.g. a
+                # concurrent creator lost the race): the bound amount is the
+                # one already issued, not this caller's conversion of it.
+                _same_binding(existing, normalised_terms,
+                              lambda *a: binding_for(*a, amount_raw_=existing.amount_raw))
+            else:
+                _same_binding(existing, normalised_terms, binding_for)
             return existing
         if idempotency_key is not None:
             prior = c.execute(
@@ -533,15 +596,18 @@ def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, stor
                    if normalised_terms is not None else None)
         c.execute(
             "INSERT INTO invoices(id, merchant, order_key_sha256, amount_raw, tag, pay_raw, created_at,"
-            " expires_at, witness_at, state, intent_hash, idempotency_key, policy_version, terms_json,"
-            " terms_sha256, binding_sha256) VALUES (?,?,?,?,?,?,?,?,?, 'open',?,?,?,?,?,?)",
+            " expires_at, witness_at, state, job_ref, intent_hash, idempotency_key, policy_version, terms_json,"
+            " terms_sha256, binding_sha256, quote_usd, quote_usd_per_xno, quote_source, quote_read_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?, 'open',?,?,?,?,?,?,?,?,?,?,?)",
             (inv_id, merchant, okh, str(amount_raw), tag, str(pay_raw), now, now + expires_s, witness_at,
-             intent_hash, idempotency_key,
+             job_ref, intent_hash, idempotency_key,
              None if normalised_terms is None else normalised_terms["policy_version"],
              None if binding is None else json.dumps(
                  normalised_terms, sort_keys=True, separators=(",", ":"), ensure_ascii=False),
              None if binding is None else binding["terms_sha256"],
-             None if binding is None else v2.digest(binding)))
+             None if binding is None else v2.digest(binding),
+             *((None,) * 4 if quote is None else
+               (str(quote["usd"]), str(quote["usd_per_xno"]), str(quote["source"]), str(quote["read_at"])))))
     if normalised_terms is not None:
         # Record 0 of the append-only log. Written outside the invoice INSERT's
         # transaction on purpose: `Store.append` opens its own BEGIN IMMEDIATE
@@ -554,6 +620,15 @@ def create_invoice(merchant_account, amount_raw, order_key, expires_s=3600, stor
             "terms_sha256": binding["terms_sha256"],
         })
     return store.get(inv_id)
+
+
+def _same_decimal(a, b):
+    """Two recorded USD amounts compared as numbers ("1" == "1.00"), as
+    price._same_usd does; anything unparseable is simply not the same."""
+    try:
+        return a is not None and b is not None and decimal.Decimal(str(a)) == decimal.Decimal(str(b))
+    except decimal.DecimalException:
+        return False
 
 
 def _same_binding(existing, normalised_terms, binding_for):
@@ -903,6 +978,10 @@ def refund_instruction(item, store=None, claimed_payer=None):
         pay = None
         if isinstance(item, str) and not item.startswith("inv_"):
             pay = store.payment(item.upper())
+            if pay is None:     # a row stored in lower case through Store.record
+                row = store.conn.execute("SELECT * FROM payments WHERE UPPER(send_block) = ?"
+                                         " ORDER BY send_block LIMIT 1", (item.upper(),)).fetchone()
+                pay = _payment(row) if row else None
             if pay is None:
                 raise NotFound(f"no recorded block {item}")
         else:
@@ -915,6 +994,10 @@ def refund_instruction(item, store=None, claimed_payer=None):
         raise InvoiceError("pass a payment record, or a block hash / invoice with store=")
     if pay["kind"] not in REFUND_KINDS:
         return None
+    if store is not None and pay["kind"] in DUPLICATE_KINDS and store.conn.execute(
+            "SELECT 1 FROM refunds_sent WHERE UPPER(send_block) = ? AND invoice_id = ?",
+            (str(pay["send_block"]).upper(), pay["invoice_id"])).fetchone():
+        return None         # refunded with record_refund: never instruct it a second time
     amount = pay["amount_raw"]
     if pay["kind"] == "overpaid":
         inv = store.get(pay["invoice_id"]) if store is not None else None
@@ -938,13 +1021,269 @@ def refund_instruction(item, store=None, claimed_payer=None):
 
 
 def refund_hints(store, invoice_id):
+    """Refunds still to send. A duplicate/late transfer whose refund was recorded with
+    `record_refund` is left out: the instruction must never ask for a second payment."""
+    sent = {r["send_block"].upper() for r in store.conn.execute(
+        "SELECT send_block FROM refunds_sent WHERE invoice_id = ?", (invoice_id,))}
     hints = []
     for p in store.payments_for(invoice_id):
+        if str(p["send_block"]).upper() in sent:
+            continue
         r = refund_instruction(p, store=store)
         if r:
             r = dict(r, amount_raw=str(r["amount_raw"]))
             hints.append(r)
     return hints
+
+
+# ------------------------------------------------- four fields, independently
+
+DUPLICATE_KINDS = ("duplicate", "late")
+REFUND_WINDOW_S = 86400
+
+
+def _block_hash(value, name):
+    if (not isinstance(value, str) or len(value) != 64
+            or not all(ch in "0123456789abcdefABCDEF" for ch in value)):
+        raise InvoiceError(f"{name} must be 64 hex characters, got {value!r}")
+    return value.upper()
+
+
+def _epoch_s(value, name):
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2 ** 63:
+        raise InvoiceError(f"{name} must be a non-negative integer (epoch seconds), got {value!r}")
+    return value
+
+
+def record_refund(invoice, duplicate_send_block, refund_send_block, store=None, at=None):
+    """Record that the merchant sent the refund owed for one duplicate/late transfer of
+    this invoice, as the refund's own send block. Refused for a block that is not a
+    duplicate/late transfer of this invoice, and for a second record of the same one.
+    The refund block is the merchant's statement: it is not checked on chain, but a block
+    the ledger already holds as an incoming send, a short send, or one of our receive
+    blocks is refused (it cannot be our refund)."""
+    store = _require_store(store)
+    inv = store.get(invoice)
+    dup = _block_hash(duplicate_send_block, "duplicate_send_block")
+    ref = _block_hash(refund_send_block, "refund_send_block")
+    at = int(time.time()) if at is None else _epoch_s(at, "at")
+    with store.tx() as c:
+        # UPPER(): a block stored in lower case through Store.record is still the same block.
+        if c.execute("SELECT 1 FROM payments WHERE ? IN (UPPER(send_block), UPPER(receive_block))"
+                     " UNION ALL SELECT 1 FROM short_sends"
+                     " WHERE ? IN (UPPER(send_block), UPPER(receive_block))",
+                     (ref, ref)).fetchone():
+            raise InvoiceError(f"refund_block_is_incoming: {ref} is a payment this ledger "
+                               f"received, not a refund sent")
+        p = c.execute("SELECT invoice_id, kind, send_block FROM payments"
+                      " WHERE UPPER(send_block) = ? AND invoice_id = ?", (dup, inv.id)).fetchone()
+        if p is None or p["invoice_id"] != inv.id or p["kind"] not in DUPLICATE_KINDS:
+            raise InvoiceError(f"not_a_duplicate: {dup} is not a duplicate or late transfer "
+                               f"of {inv.id}")
+        prior = c.execute("SELECT refund_block FROM refunds_sent WHERE UPPER(send_block) = ?"
+                          " AND invoice_id = ?", (dup, inv.id)).fetchone()
+        if prior is not None:
+            raise InvoiceError(f"refund_already_recorded: {dup} was refunded by "
+                               f"{prior['refund_block']}")
+        try:
+            c.execute("INSERT INTO refunds_sent(send_block, invoice_id, refund_block, recorded_at)"
+                      " VALUES (?,?,?,?)", (p["send_block"], inv.id, ref, at))
+        except sqlite3.IntegrityError as e:
+            raise InvoiceError(f"refund_block_reused: {ref} already recorded: {e}") from e
+    return {"invoice_id": inv.id, "send_block": dup, "refund_block": ref, "recorded_at": at}
+
+
+def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
+                      acceptance_rule=nano_sig.ACCEPTANCE_RULE_V1,
+                      refund_window_s=REFUND_WINDOW_S, now=None):
+    """Four fields for one invoice, each read on its own (SquidGibblets, Moltbook comment
+    18bc1c8a: "settlement, duplicate/refund disposition, delivered evidence, and payer-signed
+    acceptance").
+
+    - `settlement`: the invoice's state and the one send block that settled it.
+    - `duplicates`: every later transfer bound to this invoice as duplicate/late, each with
+      its refund disposition. A duplicate's hash is never evidence of work: it appears here
+      and nowhere else. `refund_due_by` is the transfer's block time + `refund_window_s`
+      (None, with `refund_due_by_reason`, when no block time was recorded). The
+      disposition is `refunded` once `record_refund` holds its refund block, else
+      `refund_owed` (as on earlier versions); `refund_overdue` is true when no refund is
+      recorded and `now` > refund_due_by, false otherwise (and with no deadline). Overdue is
+      not terminal: a refund recorded after refund_due_by still reads `refunded`, with
+      `refunded_late` true (recorded_at > refund_due_by), so an integrator never treats
+      overdue as final and counts a late refund twice.
+    - `delivered_evidence`: the output_commitment (given as 64 hex, either case, read in
+      lower case; "" reads as not given), or else the newest log verdict's when that verdict
+      is "delivered" and no tombstone follows it; otherwise None. A given output_commitment
+      never overrides the log: when the invoice's newest verdict-or-tombstone record is a
+      tombstone or a verdict other than "delivered", or a "delivered" verdict for a different
+      output_commitment, giving one is refused (InvoiceError). A tombstone with
+      superseded_by set withdraws the invoice for good: no later verdict revives it.
+
+    `acks` must be a list or tuple of JSON objects; anything else is refused with
+    InvoiceError rather than read as "no v3 ack". `acceptance_rule` must be a non-empty
+    string.
+    - `payer_acceptance`: the verdict of the payer's current delivery-ack/v3 bound to THIS
+      invoice id, the settling send block, that output_commitment and `acceptance_rule`.
+      With no such ack, or none that verifies, or an invoice not `paid`/`overpaid` (an
+      underpaid close can be a stranger's dust), it is "unknown" with a reason - never
+      "failed". v1/v2 acks bind no order or rule and are listed as not counted.
+    """
+    store = _require_store(store)
+    if acks is None:
+        acks = ()
+    if not isinstance(acks, (list, tuple)):
+        raise InvoiceError(f"acks_not_a_list: acks must be a list of ack objects, got "
+                           f"{type(acks).__name__}")
+    bad = [i for i, a in enumerate(acks) if not isinstance(a, dict)]
+    if bad:
+        raise InvoiceError(f"ack_not_an_object: acks must be JSON objects; index {bad[0]} is "
+                           f"{type(acks[bad[0]]).__name__}")
+    if not isinstance(acceptance_rule, str) or not acceptance_rule:
+        raise InvoiceError("acceptance_rule_empty: the acceptance rule must be a non-empty string")
+    if isinstance(refund_window_s, bool) or not isinstance(refund_window_s, int) \
+            or refund_window_s < 0:
+        raise InvoiceError(f"refund_window_s must be a non-negative integer, got "
+                           f"{refund_window_s!r}")
+    now = int(time.time()) if now is None else _epoch_s(now, "now")
+    inv = store.get(invoice)
+    payments = store.payments_for(inv.id)
+    refunded = {r["send_block"]: (r["refund_block"], r["recorded_at"]) for r in store.conn.execute(
+        "SELECT send_block, refund_block, recorded_at FROM refunds_sent WHERE invoice_id = ?",
+        (inv.id,))}
+    refunded_upper = {k.upper(): v for k, v in refunded.items()}
+    settling = [p for p in payments if p["kind"] in SETTLING_KINDS]
+    settle_refund = refund_instruction(settling[0], store=store) if settling else None
+    settlement = {
+        "state": inv.state, "send_block": inv.send_block, "sender": inv.sender,
+        "pay_raw": str(inv.pay_raw),
+        "received_raw": str(inv.received_raw) if inv.received_raw is not None else None,
+        "refund": dict(settle_refund, amount_raw=str(settle_refund["amount_raw"]))
+        if settle_refund else None,
+    }
+    duplicates = []
+    for p in payments:
+        if p["kind"] not in DUPLICATE_KINDS:
+            continue
+        # Decide from the one `refunded` snapshot read above, never a second query: a refund
+        # recorded by another process in between must not leave refund_block None with no
+        # instruction (TypeError). Without store=, a duplicate's instruction needs no lookup.
+        r = None if str(p["send_block"]).upper() in refunded_upper else refund_instruction(p)
+        due = p["block_ts"] + refund_window_s if p["block_ts"] is not None else None
+        refund_block, recorded_at = refunded_upper.get(str(p["send_block"]).upper(), (None, None))
+        # `disposition` keeps main's value (`refund_owed`) until a refund is recorded, so a
+        # job that refunds every `refund_owed` row never loses the late ones; lateness is
+        # its own field.
+        disposition = "refunded" if refund_block else "refund_owed"
+        entry = {
+            "send_block": p["send_block"], "sender": p["sender"], "amount_raw": str(p["amount_raw"]),
+            "kind": p["kind"], "reason": p["reason"],
+            "disposition": disposition, "refund_due_by": due,
+            "refund_overdue": not refund_block and due is not None and now > due,
+            "refunded_late": bool(refund_block) and due is not None and recorded_at > due,
+            "refund_block": refund_block,
+            "refund": None if refund_block else dict(r, amount_raw=str(r["amount_raw"])),
+            "note": "instruction only: nano-invoice never sends funds; refund_block is the "
+                    "merchant's own record and is not checked on chain; "
+                    "this transfer is not evidence of completed work",
+        }
+        if due is None:
+            entry["refund_due_by_reason"] = "no block time recorded for this transfer"
+        duplicates.append(entry)
+    if output_commitment == "":
+        output_commitment = None
+    if isinstance(output_commitment, str):
+        output_commitment = output_commitment.lower()
+    if output_commitment is not None and not v2.is_sha256(output_commitment):
+        raise InvoiceError(f"output_commitment_not_sha256: {output_commitment!r}: expected 64 "
+                           f"hex characters")
+    # The newest verdict or tombstone decides: only a "delivered" verdict with an
+    # output_commitment is delivered evidence; a later failed/indeterminate verdict
+    # or a tombstone withdraws an earlier one.
+    newest, logged = None, None
+    log = store.log(inv)
+    superseded = next((rec for rec in log if rec.get("kind") == "tombstone"
+                       and (rec.get("body") or {}).get("superseded_by") is not None), None)
+    for rec in reversed(log):
+        if rec.get("kind") == "tombstone":
+            newest = rec
+            break
+        if rec.get("kind") != "verdict":
+            continue
+        newest = rec
+        body = rec.get("body") or {}
+        oc = body.get("output_commitment")
+        if body.get("verdict") == "delivered" and v2.is_sha256(oc):
+            logged = (oc, f"log verdict seq {rec.get('seq')}")
+        break
+    if superseded is not None:
+        # fail closed: a superseded receipt stays withdrawn, whatever follows it
+        newest, logged = superseded, None
+    if output_commitment is not None:
+        if newest is not None and (newest.get("kind") == "tombstone"
+                                   or (newest.get("body") or {}).get("verdict") != "delivered"):
+            what = ("a tombstone" if newest.get("kind") == "tombstone" else
+                    f"verdict {(newest.get('body') or {}).get('verdict')!r}")
+            raise InvoiceError(
+                f"output_commitment_withdrawn: the newest log record for {inv.id} is {what} "
+                f"(seq {newest.get('seq')}); a given output_commitment does not override it")
+        if logged is not None and logged[0] != output_commitment:
+            raise InvoiceError(
+                f"output_commitment_conflicts: the newest log record for {inv.id} is a delivered "
+                f"verdict for {logged[0]} ({logged[1]}); a given output_commitment "
+                f"{output_commitment} does not override it")
+        evidence, source = output_commitment, "given"
+    else:
+        evidence, source = logged if logged else (None, None)
+    delivered_evidence = ({"output_commitment": evidence, "source": source}
+                          if evidence else None)
+
+    counted, not_counted = [], []
+    for i, a in enumerate(acks):
+        if a.get("version") == 3:
+            counted.append((i, a))
+        else:
+            not_counted.append({"index": i, "reason": "not_v3: binds no order id or acceptance rule"})
+
+    def unknown(reason, **extra):
+        return dict({"state": "unknown", "reason": reason, "acceptance_rule": acceptance_rule,
+                     "order_id": inv.id, "not_counted": not_counted}, **extra)
+
+    if inv.send_block is None:
+        acceptance = unknown("not_settled")
+    elif inv.state not in ("paid", "overpaid"):
+        # underpaid: the closing send can be dust from anyone, so its sender is not "the payer"
+        acceptance = unknown("not_paid")
+    elif evidence is None:
+        acceptance = unknown("no_delivered_evidence")
+    elif not counted:
+        acceptance = unknown("no_v3_ack")
+    else:
+        r = nano_sig.read_payer_acks(inv.sender, evidence, inv.send_block, [a for _, a in counted],
+                                     order_id=inv.id, acceptance_rule=acceptance_rule)
+        remap = [i for i, _ in counted]
+        ignored = [dict(e, index=remap[e["index"]]) for e in r["ignored"]]
+        if not r["ok"]:
+            acceptance = unknown("no_v3_ack_verifies", ignored=ignored)
+        else:
+            acceptance = {
+                "state": r["verdict"], "payer": inv.sender, "order_id": inv.id,
+                "send_block": inv.send_block, "acceptance_rule": acceptance_rule,
+                "current": dict(r["current"], index=remap[r["current"]["index"]]),
+                "superseded": [dict(e, index=remap[e["index"]]) for e in r["superseded"]],
+                "ignored": ignored, "not_counted": not_counted,
+            }
+    return {
+        "invoice_id": inv.id,
+        "settlement": settlement,
+        "duplicates": duplicates,
+        "delivered_evidence": delivered_evidence,
+        "payer_acceptance": acceptance,
+        "proves": "payer_acceptance, when not unknown: the holder of the payer account's key "
+                  "signed this verdict for this invoice id, settling send block, output digest "
+                  "and acceptance rule",
+        "does_not_prove": "that the output was objectively correct, that the signer was "
+                          "authorised by a human operator, or that no off-ledger dispute exists",
+    }
 
 
 # ---------------------------------------------------------------- receipts
@@ -1002,6 +1341,12 @@ def append_verdict(invoice, verdict, output_commitment=None, asserted_by=None, a
     if inv.state == "open":
         raise InvoiceError(
             f"{inv.id} is open: a delivery verdict is appended after settlement, not before it")
+    for rec in store.log(inv):
+        sup = (rec.get("body") or {}).get("superseded_by") if rec.get("kind") == "tombstone" else None
+        if sup is not None:
+            raise InvoiceError(
+                f"receipt_superseded: {inv.id} was tombstoned as superseded by {sup} "
+                f"(seq {rec.get('seq')}); a later verdict would revive it")
     try:
         body = v2.verdict_body(verdict, output_commitment=output_commitment,
                                accept_token=accept_token, note=note, payer_ack=payer_ack)

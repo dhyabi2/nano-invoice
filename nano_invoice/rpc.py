@@ -10,7 +10,8 @@ import urllib.request
 
 DEFAULT_RPC = "https://rpc.nano.to"
 USER_AGENT = "nano-invoice/0.1 (+https://github.com/dhyabi2/nano-invoice)"
-READ_ACTIONS = frozenset({"account_history", "receivable", "block_info", "blocks_info", "account_info"})
+READ_ACTIONS = frozenset({"account_history", "receivable", "block_info", "blocks_info", "account_info",
+                          "price"})  # price: USD per XNO, for --amount-usd
 
 
 class RpcError(RuntimeError):
