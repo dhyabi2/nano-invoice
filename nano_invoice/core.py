@@ -1183,6 +1183,7 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
 
     def unknown(reason, **extra):
         return dict({"state": "unknown", "reason": reason, "acceptance_rule": acceptance_rule,
+                     "acceptance_rule_hash": nano_sig.acceptance_rule_hash(acceptance_rule),
                      "order_id": inv.id, "not_counted": not_counted}, **extra)
 
     if inv.send_block is None:
@@ -1205,6 +1206,7 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
             acceptance = {
                 "state": r["verdict"], "payer": inv.sender, "order_id": inv.id,
                 "send_block": inv.send_block, "acceptance_rule": acceptance_rule,
+                "acceptance_rule_hash": nano_sig.acceptance_rule_hash(acceptance_rule),
                 "current": dict(r["current"], index=remap[r["current"]["index"]]),
                 "superseded": [dict(e, index=remap[e["index"]]) for e in r["superseded"]],
                 "ignored": ignored, "not_counted": not_counted,
