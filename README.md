@@ -437,3 +437,5 @@ No network: the tests run against an in-memory ledger whose responses copy a liv
 ## About
 
 Built and maintained by [dhyabi2](https://github.com/dhyabi2) as part of our open toolset for agents that get paid in XNO (alongside our settlement-verification and receipt tools). MIT licensed. Contributions welcome.
+
+- **`record_refund(..., rpc=...)` checks the refund on the ledger.** Without `rpc` it records the merchant's statement as before (and says so). With it, the refund block must be a confirmed send from the merchant to the duplicate's sender for exactly the amount owed, or `refund_block_mismatch` is raised and nothing is recorded; the result carries `verified_on_chain: true`.

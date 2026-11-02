@@ -992,18 +992,25 @@ def _epoch_s(value, name):
     return value
 
 
-def record_refund(invoice, duplicate_send_block, refund_send_block, store=None, at=None):
+def record_refund(invoice, duplicate_send_block, refund_send_block, store=None, at=None, rpc=None):
     """Record that the merchant sent the refund owed for one duplicate/late transfer of
     this invoice, as the refund's own send block. Refused for a block that is not a
     duplicate/late transfer of this invoice, and for a second record of the same one.
     The refund block is the merchant's statement: it is not checked on chain, but a block
     the ledger already holds as an incoming send, a short send, or one of our receive
-    blocks is refused (it cannot be our refund)."""
+    blocks is refused (it cannot be our refund).
+
+    With `rpc=` the statement is checked instead of taken on trust: the refund block is
+    read from the ledger and must be a confirmed send from the merchant to the duplicate's
+    sender for exactly the amount owed; anything else raises `refund_block_mismatch` and
+    records nothing. The result then carries `verified_on_chain: True`."""
     store = _require_store(store)
     inv = store.get(invoice)
     dup = _block_hash(duplicate_send_block, "duplicate_send_block")
     ref = _block_hash(refund_send_block, "refund_send_block")
     at = int(time.time()) if at is None else _epoch_s(at, "at")
+    if rpc is not None:
+        _verify_refund_block(store, inv, dup, ref, rpc)
     with store.tx() as c:
         # UPPER(): a block stored in lower case through Store.record is still the same block.
         if c.execute("SELECT 1 FROM payments WHERE ? IN (UPPER(send_block), UPPER(receive_block))"
@@ -1027,7 +1034,37 @@ def record_refund(invoice, duplicate_send_block, refund_send_block, store=None, 
                       " VALUES (?,?,?,?)", (p["send_block"], inv.id, ref, at))
         except sqlite3.IntegrityError as e:
             raise InvoiceError(f"refund_block_reused: {ref} already recorded: {e}") from e
-    return {"invoice_id": inv.id, "send_block": dup, "refund_block": ref, "recorded_at": at}
+    out = {"invoice_id": inv.id, "send_block": dup, "refund_block": ref, "recorded_at": at}
+    if rpc is not None:
+        out["verified_on_chain"] = True
+    return out
+
+
+def _verify_refund_block(store, inv, dup, ref, rpc):
+    """Read `ref` from the ledger; raise unless it is the refund owed for `dup` of `inv`."""
+    row = store.conn.execute("SELECT * FROM payments WHERE UPPER(send_block) = ? AND invoice_id = ?",
+                             (dup, inv.id)).fetchone()
+    if row is None or _payment(row)["kind"] not in DUPLICATE_KINDS:
+        return          # the ordinary checks below name the real problem (not_a_duplicate)
+    owed = refund_instruction(_payment(row), store=store)
+    if owed is None:
+        return
+    info = as_rpc(rpc).call("block_info", json_block="true", hash=ref)
+    contents = info.get("contents") or {}
+    dest = contents.get("link_as_account") or contents.get("destination")
+    problems = []
+    if _subtype(info) != "send":
+        problems.append(f"block is a {_subtype(info)}, not a send")
+    if not info.get("block_account") or acct.normalise(info["block_account"]) != inv.merchant:
+        problems.append("not sent from the merchant's account")
+    if not dest or acct.normalise(dest) != owed["to"]:
+        problems.append("not sent to the account the refund is owed to")
+    if int(info.get("amount", -1)) != owed["amount_raw"]:
+        problems.append(f"amount {info.get('amount')} is not the {owed['amount_raw']} raw owed")
+    if str(info.get("confirmed")).lower() != "true":
+        problems.append("not confirmed yet")
+    if problems:
+        raise InvoiceError(f"refund_block_mismatch: {ref} is not the refund for {dup}: " + "; ".join(problems))
 
 
 def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
