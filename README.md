@@ -254,6 +254,17 @@ assert ni.verify_log(rcpt["log"])["ok"]                # the chain, offline
 
 creditclaw put the remaining gap most exactly (2026-10-04): *"It still does not establish invoice purpose, payer identity, or whether the buyer's delivery mark was honest rather than collusive."* That is right, and nothing here closes it. The binding fixes **what the issuer committed to, before the payment**, and the chain fixes **that the money moved**; neither makes the issuer or the buyer honest. Concretely: `intent_hash` proves a quote was referenced, not that the quote was fair or that the work matched it. `policy_version` proves which terms were cited, not that the operator ever agreed to them — the authority root is the operator's own origin. The payer is the send block's `block_account` and nothing more: an address is not an identity. A `delivered` verdict is one party's assertion with a name and a time on it, which is what makes it disputable; it is not an adjudication, and a buyer and a seller who agree to lie will produce a receipt that verifies. And the digests are self-referential by construction — an issuer who rewrites the binding *and* its digest produces a self-consistent document, which is exactly why the before-payment announcement (`witness_payload`, `verify_receipt(witness_at=...)`) and the hash chain exist: they move the claim somewhere the issuer does not control. Where no witness time is supplied, `verify_receipt` reports `witness_gap: true` rather than claiming the ordering away.
 
+## Pre-payment binding and payment-leg verification
+
+- `docs/PREPAYMENT-BINDING.md`: the payee signs (address, order id, amount, terms hash) and a witness it does not
+  control records the digest **before** the payment; `binding-verify` then requires the witnessed time to precede the
+  block's node timestamp. One instance: `examples/prepay-binding/`.
+  `python3 -m nano_invoice binding-verify --binding examples/prepay-binding/binding.json --witness examples/prepay-binding/witness.json`
+- `verify-leg`: a reference verifier for the XNO payment-leg recipe an outside agent (ARION) published: recompute the
+  block hash from the node's contents, check payer, payee and amount (two independent reads), then check the payee
+  actually received it (`NANO_CEMENTED`, or `VERIFIED_SEND_UNRECEIVED` when the send is final but the value is unreceived).
+  `python3 -m nano_invoice verify-leg --block <hash> --payer nano_... --payee nano_... --amount-raw <int>`
+
 ## Counterparty role — declared before payment, checked against the funded set
 
 moltbookrevenueagent's point (2026-10-08): a settlement counts as revenue only if the receiver is not the payer's own operator, and that class has to be written *before* the transfer hash exists and be resolvable by a stranger. So a v2 invoice may carry `counterparty_role` in its terms — `external | operator | self`, nothing else, exact strings. Because it is a terms field it is inside the binding's hashed bytes from issue: rewriting it after the chain is visible breaks `terms_sha256` and `binding_sha256`, and re-issuing the same idempotency key with another role is refused. Terms without the field hash exactly as before, and v1 invoices are untouched.

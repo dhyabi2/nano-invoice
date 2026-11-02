@@ -30,6 +30,8 @@ from . import nano_sig
 from . import price
 from . import observer as obs
 from . import rep_binding
+from . import prepay_binding
+from . import xno_receipt
 from .rpc import DEFAULT_RPC, Rpc
 
 
@@ -214,6 +216,19 @@ def build_parser():
     v = sub.add_parser("verify", help="re-check a receipt from the public ledger alone")
     v.add_argument("--receipt", required=True, help="receipt JSON file, or - for stdin")
 
+    vg = sub.add_parser("verify-leg", help="walk the XNO payment-leg recipe for one send block "
+                                            "(hash recompute, payer/payee/amount, payee custody)")
+    vg.add_argument("--block", required=True)
+    vg.add_argument("--payer", required=True)
+    vg.add_argument("--payee", required=True)
+    vg.add_argument("--amount-raw", required=True, help="integer raw (1 XNO = 10**30 raw)")
+
+    bv = sub.add_parser("binding-verify", help="check a signed pre-payment binding, its witness chain and, "
+                                                "if given a block, that it was witnessed before the send")
+    bv.add_argument("--binding", required=True, help="binding JSON file")
+    bv.add_argument("--witness", required=True, help="witness chain JSON file (a list of entries)")
+    bv.add_argument("--block", help="the send block that paid it (omit before payment)")
+
     h = sub.add_parser("refund-hint", help="refund instructions (never sends)")
     h.add_argument("--invoice", required=True)
     h.add_argument("--claimed-payer", help="shown only to say it was ignored")
@@ -321,6 +336,22 @@ def main(argv=None):
                                                    delivered_at=args.delivered_at, rpc=rpc)
             _out(result)
             return 0 if result["ok"] else 1
+        if args.cmd == "binding-verify":
+            with open(args.binding) as fh:
+                binding = json.load(fh)
+            with open(args.witness) as fh:
+                chain = json.load(fh)
+            result = prepay_binding.verify_prepayment(binding, chain, block=args.block, rpc=rpc)
+            _out(result)
+            if args.block is None:  # before payment: the question is "bound and witnessed?"
+                return 0 if result["binding_signed"]["ok"] and result.get("witnessed", {}).get("ok") else 1
+            return 0 if result["ok"] else 1
+        if args.cmd == "verify-leg":
+            if not (args.amount_raw.isascii() and args.amount_raw.isdigit()):
+                raise core.AmountError("--amount-raw must be digits only (integer raw; 1 XNO = 10**30 raw)")
+            result = xno_receipt.verify_leg(args.block, args.payer, args.payee, int(args.amount_raw), rpc=rpc)
+            _out(result)
+            return xno_receipt.EXIT_CODES.get(result["verdict"], 3)
         if args.cmd in ("verify", "verify-log"):
             src = sys.stdin if args.receipt == "-" else open(args.receipt)
             with src:

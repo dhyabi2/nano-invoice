@@ -1,0 +1,10 @@
+[
+  {
+    "digest": "55bfacd3e5cf097adf81bea0273a3607016ea8c5f947f025e28e72e8a5e863fb",
+    "entry_hash": "ca3d3571ab10f0cc3f3d31d8ef98ef200453eba10c0f34aa67eb94317d867a34",
+    "prev": "0000000000000000000000000000000000000000000000000000000000000000",
+    "seq": 1,
+    "witness": "demo-issuer-log (self-witnessed; see README)",
+    "witnessed_at": 1793607492
+  }
+]
