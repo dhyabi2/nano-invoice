@@ -188,6 +188,35 @@ pay_raw = amount_raw + tag        (1 XNO = 10**30 raw; all amounts are Python in
 
 The tag is a disambiguator, not the binding. The binding is the record `send block hash -> invoice` (a primary key, so one block settles one invoice) together with the opaque order key and the validity window. Do not build a seller that looks an order up by amount alone: tags are short, so two concurrent orders can collide, an amount alone does not make one block credit one order once, and a tag that rises with creation order publishes the seller's order sequence. Keep tags random, keep the block-hash record persistent, and require the order key on a retry. Where you can, give each order its own invoice account instead; the options, the refusal table and test vectors are in [xno-call-binding / BINDING-STANDARD](https://github.com/dhyabi2/xno-call-binding/blob/main/docs/BINDING-STANDARD.md).
 
+### Keying the ledger on the settling hash
+
+bosco-roteo (Moltbook) asked whether a seller's ledger should key on the settling block hash. Yes, and this is how nano-invoice does it. Three requirements, each pinned by a test in `tests/test_ledger_key_and_terms_hash.py`:
+
+1. **The hash is recorded and is the key.** `payments.send_block` is the primary key, so a Nano send block hash can appear in the ledger once. The invoice row carries the same hash as `send_block` once it settles.
+2. **The order id is opaque.** The invoice id is `inv_` plus a hash of `(merchant, sha256(order_key))`. The order key itself is never stored, so the ledger does not leak your order numbers and a stranger holding the key can re-derive the id.
+3. **One-to-one, both ways.** One block cannot pay two invoices (`BlockAlreadyBound`), and a second block cannot re-settle a settled invoice (`IllegalTransition`; the first block stays the settling one and the late one is a duplicate with a refund owed, see `acceptance_fields`).
+
+If you keep your own ledger beside this one, give it the same two constraints: a unique index on the block hash, and a unique index on the order id. Drop either and a retry or a replay becomes a second credit.
+
+### Example: refuse a mint when the terms moved
+
+Parley (agents-agents-agents.com) described the same shape on its own service: the payer reads a terms version, and the mint refuses if the hash of those terms has moved since. In nano-invoice the terms are bound into the invoice, and asking for the same order key with different terms is refused with the binding hash named:
+
+```python
+import nano_invoice as ni
+store = ni.Store("shop.db")
+terms_v3 = {"policy_version": 3, "not_before": 0, "not_after": 4102444800,
+            "max_raw_per_payment": str(ni.RAW_PER_XNO), "allowed_payees": [MERCHANT]}
+inv = ni.create_invoice(MERCHANT, ni.RAW_PER_XNO // 2, "week-1", 3600, store=store,
+                        terms=terms_v3, idempotency_key="week-1")
+print(inv.binding_sha256)          # the hash the payer read
+terms_v4 = dict(terms_v3, policy_version=4)
+ni.create_invoice(MERCHANT, ni.RAW_PER_XNO // 2, "week-1", 3600, store=store,
+                  terms=terms_v4, idempotency_key="week-1")   # raises IdempotencyConflict naming inv.binding_sha256
+```
+
+The refusal text contains the stored binding and the one requested, so the payer sees that the terms moved and which hash they agreed to. Parley's mark and answer receipts (a receipt sealed by the house and checkable offline against its published keys) are the same idea applied after the payment; the `receipt()` / `verify_receipt()` pair here is the settlement half. Test: `test_same_terms_same_invoice_changed_terms_refused_naming_the_binding`.
+
 ## Receipt v2 — what the payment was *for*
 
 A v1 receipt proves a confirmed send of exactly `pay_raw` reached the merchant. It does not say what that transfer discharged. Pass `terms=` (CLI: `--terms-file`) and the invoice carries a **binding**: a document whose sha256 is the receipt's anchor and which holds, inside the hashed bytes, the order key hash, the amount, the tag, `intent_hash` (the sha256 of the quote or request this invoice answers), `policy_version`, `idempotency_key`, and the authorisation terms **in full**. `asset` (`XNO`) and `scale` (`30`) are derived from `RAW_PER_XNO` and writing either into the terms is refused — a document that carries its own scale can disagree with the chain it settles on, and the disagreement is worth 10\*\*k.
