@@ -25,7 +25,7 @@ import time
 from . import account as acct
 from . import nano_sig
 from . import receipt_v2 as v2
-from .rpc import as_rpc
+from .rpc import RpcError, as_rpc
 
 RAW_PER_XNO = 10 ** 30
 TAG_MODULUS = 10 ** 6
@@ -721,27 +721,65 @@ def _resolve_send(rpc, merchant, send_hash, receive_hash=None, receive_ts=0):
     }
 
 
-def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None):
-    """Every incoming send to merchant whose amount ends in this tag, with its
-    sender, amount, confirmation and timestamp read from the ledger.
+# At most this many untagged sends (>= untagged_min, not ending in the tag) are
+# looked up per scan. Each costs one block_info (two for a received one), and
+# they are only ever reported, never settled, so a busy account must not turn
+# one check into hundreds of RPC calls. Sends past the cap are counted in the
+# caller's `untagged_notes`, not looked up.
+UNTAGGED_LOOKUP_CAP = 8
 
-    With `untagged_min`, also every send of at least that many raw whose amount
-    does NOT end in the tag (e.g. an overpayment by an excess that is not a
-    multiple of TAG_MODULUS). Each result carries `tag_match`."""
+
+def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged_notes=None):
+    """Every incoming send to merchant whose amount ends in this tag, with its
+    sender, amount, confirmation and timestamp read from the ledger. Each
+    result carries `tag_match` (True for these).
+
+    With `untagged_min`, also up to UNTAGGED_LOOKUP_CAP sends of at least that
+    many raw whose amount does NOT end in the tag (e.g. an overpayment by an
+    excess that is not a multiple of TAG_MODULUS), with `tag_match` False.
+    Those are best effort: a failed lookup of one is skipped, never raised, and
+    each skip (failed, or past the cap) is appended as a string to
+    `untagged_notes` when a list is given. A failed lookup of a tagged send
+    still raises, as without `untagged_min`."""
     rpc = as_rpc(rpc)
     found = {}
+    budget = [UNTAGGED_LOOKUP_CAP]
+
+    def tagged(amount):
+        return amount % TAG_MODULUS == tag
 
     def wanted(amount):
-        return amount % TAG_MODULUS == tag or (untagged_min is not None and amount >= untagged_min)
+        return tagged(amount) or (untagged_min is not None and amount >= untagged_min)
+
+    def note(msg):
+        if untagged_notes is not None:
+            untagged_notes.append(msg)
+
+    def untagged_lookup(h, fn):
+        """Run fn() for an untagged send `h` within the cap; None if skipped."""
+        if budget[0] <= 0:
+            note(f"{h.upper()}: untagged send not looked up (cap of {UNTAGGED_LOOKUP_CAP} per check reached)")
+            return None
+        budget[0] -= 1
+        try:
+            return fn()
+        except (RpcError, KeyError, ValueError, TypeError) as e:
+            note(f"{h.upper()}: untagged send skipped, lookup failed: {e}")
+            return None
 
     pending = _blocks_field(rpc.call("receivable", account=merchant, count=str(max_blocks), source="true"))
     for h, info in pending.items():
         amount = int(info["amount"]) if isinstance(info, dict) else (int(info) if info is not None else None)
         if amount is not None and not wanted(amount):
             continue
-        ob = _resolve_send(rpc, merchant, h)
+        if amount is not None and not tagged(amount):
+            ob = untagged_lookup(h, lambda h=h: _resolve_send(rpc, merchant, h))
+            if ob is None:
+                continue
+        else:
+            ob = _resolve_send(rpc, merchant, h)
         if wanted(ob["amount_raw"]):
-            ob["tag_match"] = ob["amount_raw"] % TAG_MODULUS == tag
+            ob["tag_match"] = tagged(ob["amount_raw"])
             found[ob["send_block"]] = ob
     head, seen = None, 0
     while seen < max_blocks:
@@ -758,15 +796,20 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None):
                 break
             if _subtype(e) != "receive" or not wanted(int(e["amount"])):
                 continue
-            rinfo = rpc.call("block_info", json_block="true", hash=e["hash"])
-            link = (rinfo.get("contents") or {}).get("link") or (rinfo.get("contents") or {}).get("source")
-            if not link or acct.normalise(rinfo["block_account"]) != merchant:
+
+            def resolve(e=e, ts=ts):
+                rinfo = rpc.call("block_info", json_block="true", hash=e["hash"])
+                link = (rinfo.get("contents") or {}).get("link") or (rinfo.get("contents") or {}).get("source")
+                if not link or acct.normalise(rinfo["block_account"]) != merchant:
+                    return None
+                ob = _resolve_send(rpc, merchant, link, receive_hash=e["hash"], receive_ts=ts)
+                ob["confirmed"] = ob["confirmed"] and str(rinfo.get("confirmed")).lower() == "true"
+                return ob
+
+            ob = resolve() if tagged(int(e["amount"])) else untagged_lookup(e["hash"], resolve)
+            if ob is None or not wanted(ob["amount_raw"]):
                 continue
-            ob = _resolve_send(rpc, merchant, link, receive_hash=e["hash"], receive_ts=ts)
-            ob["confirmed"] = ob["confirmed"] and str(rinfo.get("confirmed")).lower() == "true"
-            if not wanted(ob["amount_raw"]):
-                continue
-            ob["tag_match"] = ob["amount_raw"] % TAG_MODULUS == tag
+            ob["tag_match"] = tagged(ob["amount_raw"])
             found.setdefault(ob["send_block"], ob)
         nxt = data.get("previous")
         if older or not nxt:
@@ -808,13 +851,18 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
 
     A send of at least pay_raw whose amount does NOT end in the tag (an
     overpayment by an excess that is not a multiple of TAG_MODULUS) carries no
-    tag, so nothing in it says which order it is for: it is bound to nothing
-    and settles nothing, but it is no longer invisible. It is listed under
-    `unmatched_candidates` with its excess over this invoice, every invoice of
-    the merchant it could equally be for (`candidate_invoices`, `ambiguous`)
-    and a refund instruction for the whole amount to the ledger sender. A send
-    whose low six digits equal another open or quarantined tag is left to that
-    tag: it is that invoice's payment (or overpayment), not this one's.
+    tag, so nothing in it says which order it is for (it may not be for any:
+    it may be unrelated income): it is bound to nothing and settles nothing,
+    but it is no longer invisible. It is listed under `unmatched_candidates`,
+    for information only, with its excess over this invoice and the invoices
+    it could equally be for (`candidate_invoices`: this one and the merchant's
+    other open invoices whose pay_raw it covers and whose window holds it;
+    `ambiguous` if more than one). No refund instruction is attached and none
+    is recorded: deciding whether to refund it is for a human. A send whose
+    low six digits equal another open or quarantined tag is left to that tag.
+    At most UNTAGGED_LOOKUP_CAP untagged sends are looked up per check, and a
+    failed lookup of one is skipped (listed in `unmatched_notes`), never
+    raised, so it cannot stop this invoice's own payment being recorded.
     """
     store = _require_store(store)
     inv = store.get(invoice)
@@ -824,7 +872,9 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
     observations = []
     short = []
     unmatched = []
-    for ob in scan(rpc, inv.merchant, inv.tag, inv.created_at - skew_s, max_blocks, untagged_min=inv.pay_raw):
+    unmatched_notes = []
+    for ob in scan(rpc, inv.merchant, inv.tag, inv.created_at - skew_s, max_blocks,
+                   untagged_min=inv.pay_raw, untagged_notes=unmatched_notes):
         if not ob.pop("tag_match", True):
             unmatched.append(ob)
             continue
@@ -915,18 +965,22 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
         "observations": observations,
         "refunds": refund_hints(store, inv.id),
         "unmatched_candidates": _unmatched_candidates(store, inv, unmatched, own, excluded, now, skew_s),
+        "unmatched_notes": unmatched_notes,
     }
 
 
 UNMATCHED_REASON = (
     "at least pay_raw but its lowest six raw digits are not this invoice's tag: an overpayment by an "
     "excess that is not a multiple of 10**6 raw carries no tag, so it cannot be attributed to an order "
-    "and settles nothing; refund it in full, or settle it with the buyer by hand")
+    "and settles nothing. It may be an overpayment of one of candidate_invoices or unrelated income; "
+    "information only: no refund instruction is issued for it, a human decides")
 
 
 def _unmatched_candidates(store, inv, unmatched, own, excluded, now, skew_s):
     """Untagged sends >= pay_raw that could be an overpayment of `inv`. Bound to
-    nothing; reported so the merchant can see and refund them."""
+    nothing and informational only: no refund instruction, because the same
+    send is listed on every check of every candidate invoice and an automation
+    acting on it would refund it more than once."""
     if not unmatched:
         return []
     rows = [Store._invoice(r) for r in store.conn.execute(
@@ -942,15 +996,13 @@ def _unmatched_candidates(store, inv, unmatched, own, excluded, now, skew_s):
                 or store.payment(ob["send_block"]) is not None):
             continue
         candidates = sorted(r.id for r in rows
-                            if r.pay_raw <= amount and r.created_at - skew_s <= ts <= r.expires_at)
+                            if (r.id == inv.id or r.state == "open")
+                            and r.pay_raw <= amount and r.created_at - skew_s <= ts <= r.expires_at)
         view = {k: (str(v) if k == "amount_raw" else v) for k, v in ob.items() if k != "problems"}
         out.append(dict(
             view, outcome="unmatched", reason=UNMATCHED_REASON,
             excess_raw=str(amount - inv.pay_raw),
-            candidate_invoices=candidates, ambiguous=len(candidates) > 1,
-            refund={"to": ob["sender"], "amount_raw": str(amount), "reason": "unmatched",
-                    "source_block": ob["send_block"], "invoice_id": None,
-                    "note": "instruction only: nano-invoice never sends; pay it from the merchant wallet"}))
+            candidate_invoices=candidates, ambiguous=len(candidates) > 1))
     return out
 
 
