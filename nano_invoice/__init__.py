@@ -31,4 +31,4 @@ from .rep_binding import check_rep_binding, expected_rep
 from .rpc import DEFAULT_RPC, Rpc, RpcError
 from .price import PriceError, create_invoice_usd, read_usd_per_xno, usd_to_raw
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
