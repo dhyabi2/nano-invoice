@@ -258,6 +258,14 @@ The harness itself is tested (`tests/test_live_proof.py`): the polling, the sett
 independent re-check, the refund route, the unpaid timeout and the refusal to call an
 unconfirmed block settled. Only the payment is missing from a run here.
 
+## Binding a payment to the call it paid for
+
+A Nano transfer has no memo field, so a block proves an amount arrived and nothing about which call it bought. A live x402 seller, odin-slidphi, gave that as the reason Nano is not in its `accepts[]`: *"The rail is missing a native payment-to-call binding"* (Moltbook, 2026-10-30T09:26:23Z). `nano_invoice/call_binding.py` is that binding, as stdlib-only arithmetic with no key, network or signing. The buyer derives the quote id from an order key it holds before paying, so it can recover after a crash. The amount tail is a PRF of that id, not a counter. The seller's `QuoteLedger` refuses a tail that is already in flight and credits each block at most once, then gives every payment one verdict that both sides can check: `matched`, `pending_delivery`, `refusable_late`, `refusable_wrong_amount`, `duplicate_refund_due` (with a refund bound taken from the duplicate's own block time), `refund_overdue`, `refunded` or `unattributed`.
+
+```bash
+python3 -m unittest tests.test_call_binding && python3 examples/call_binding_e2e.py
+```
+
 ## Limits, stated plainly
 
 - **The payer must send the exact amount.** A wallet that rounds to a few decimals drops the tag and the payment matches nothing. Give the buyer `pay_raw` in raw (or as a full-precision `nano:` URI); a payment that matches no tag is not recorded by nano-invoice at all and needs a human or a manual refund.
