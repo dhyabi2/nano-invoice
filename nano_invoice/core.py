@@ -25,7 +25,7 @@ import time
 from . import account as acct
 from . import nano_sig
 from . import receipt_v2 as v2
-from .rpc import as_rpc
+from .rpc import RpcError, as_rpc
 
 RAW_PER_XNO = 10 ** 30
 TAG_MODULUS = 10 ** 6
@@ -1002,23 +1002,25 @@ def record_refund(invoice, duplicate_send_block, refund_send_block, store=None, 
 
     With `rpc=` the statement is checked instead of taken on trust: the refund block is
     read from the ledger and must be a confirmed send from the merchant to the duplicate's
-    sender for exactly the amount owed; anything else raises `refund_block_mismatch` and
-    records nothing. The result then carries `verified_on_chain: True`."""
+    sender for exactly the amount owed, whose node `local_timestamp` is strictly later than
+    the duplicate's recorded block time (so a send made before the duplicate existed cannot
+    be passed off as its refund); anything else raises `refund_block_mismatch` and records
+    nothing. That includes a node that gives no `local_timestamp`, or a duplicate with no
+    recorded block time: order cannot be proven, so it is refused (fail closed). A node
+    error or an unreadable block_info raises `refund_block_unverified` (an InvoiceError),
+    and records nothing. A block this ledger received is still `refund_block_is_incoming`.
+    The result then carries `verified_on_chain: True`."""
     store = _require_store(store)
     inv = store.get(invoice)
     dup = _block_hash(duplicate_send_block, "duplicate_send_block")
     ref = _block_hash(refund_send_block, "refund_send_block")
     at = int(time.time()) if at is None else _epoch_s(at, "at")
     if rpc is not None:
+        # The more specific refusal first, then the ledger read (outside the write lock).
+        _refuse_incoming_refund_block(store.conn, ref)
         _verify_refund_block(store, inv, dup, ref, rpc)
     with store.tx() as c:
-        # UPPER(): a block stored in lower case through Store.record is still the same block.
-        if c.execute("SELECT 1 FROM payments WHERE ? IN (UPPER(send_block), UPPER(receive_block))"
-                     " UNION ALL SELECT 1 FROM short_sends"
-                     " WHERE ? IN (UPPER(send_block), UPPER(receive_block))",
-                     (ref, ref)).fetchone():
-            raise InvoiceError(f"refund_block_is_incoming: {ref} is a payment this ledger "
-                               f"received, not a refund sent")
+        _refuse_incoming_refund_block(c, ref)
         p = c.execute("SELECT invoice_id, kind, send_block FROM payments"
                       " WHERE UPPER(send_block) = ? AND invoice_id = ?", (dup, inv.id)).fetchone()
         if p is None or p["invoice_id"] != inv.id or p["kind"] not in DUPLICATE_KINDS:
@@ -1040,6 +1042,16 @@ def record_refund(invoice, duplicate_send_block, refund_send_block, store=None, 
     return out
 
 
+def _refuse_incoming_refund_block(c, ref):
+    # UPPER(): a block stored in lower case through Store.record is still the same block.
+    if c.execute("SELECT 1 FROM payments WHERE ? IN (UPPER(send_block), UPPER(receive_block))"
+                 " UNION ALL SELECT 1 FROM short_sends"
+                 " WHERE ? IN (UPPER(send_block), UPPER(receive_block))",
+                 (ref, ref)).fetchone():
+        raise InvoiceError(f"refund_block_is_incoming: {ref} is a payment this ledger "
+                           f"received, not a refund sent")
+
+
 def _verify_refund_block(store, inv, dup, ref, rpc):
     """Read `ref` from the ledger; raise unless it is the refund owed for `dup` of `inv`."""
     row = store.conn.execute("SELECT * FROM payments WHERE UPPER(send_block) = ? AND invoice_id = ?",
@@ -1049,7 +1061,17 @@ def _verify_refund_block(store, inv, dup, ref, rpc):
     owed = refund_instruction(_payment(row), store=store)
     if owed is None:
         return
-    info = as_rpc(rpc).call("block_info", json_block="true", hash=ref)
+    try:
+        problems = _refund_block_problems(as_rpc(rpc).call("block_info", json_block="true", hash=ref),
+                                          inv, owed, _payment(row)["block_ts"])
+    except (RpcError, KeyError, TypeError, ValueError, AttributeError) as e:
+        raise InvoiceError(f"refund_block_unverified: {ref} could not be read from the ledger "
+                           f"({type(e).__name__}: {e}); nothing recorded") from e
+    if problems:
+        raise InvoiceError(f"refund_block_mismatch: {ref} is not the refund for {dup}: " + "; ".join(problems))
+
+
+def _refund_block_problems(info, inv, owed, dup_ts):
     contents = info.get("contents") or {}
     dest = contents.get("link_as_account") or contents.get("destination")
     problems = []
@@ -1063,8 +1085,17 @@ def _verify_refund_block(store, inv, dup, ref, rpc):
         problems.append(f"amount {info.get('amount')} is not the {owed['amount_raw']} raw owed")
     if str(info.get("confirmed")).lower() != "true":
         problems.append("not confirmed yet")
-    if problems:
-        raise InvoiceError(f"refund_block_mismatch: {ref} is not the refund for {dup}: " + "; ".join(problems))
+    ts = int(info.get("local_timestamp") or 0)
+    if not ts:
+        problems.append("the node gives no local_timestamp for it, so it cannot be shown to "
+                        "come after the duplicate (refused, not assumed)")
+    elif dup_ts is None or int(dup_ts) <= 0:
+        problems.append("the duplicate has no recorded block time, so the refund cannot be "
+                        "shown to come after it (refused, not assumed)")
+    elif ts <= int(dup_ts):
+        problems.append(f"sent at {ts}, not after the duplicate it would refund (block time {dup_ts}): "
+                        "a send made before the duplicate existed is not its refund")
+    return problems
 
 
 def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
