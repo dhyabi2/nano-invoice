@@ -12,6 +12,7 @@ from tests.test_receipt_v2 import MERCHANT, T0, Base
 from tests.fake_ledger import account
 
 OTHER = account(77)
+CLOCK = T0 + 30 * 86400     # the injected local clock: every block time below is before it
 
 
 class _Setup(Base):
@@ -23,6 +24,7 @@ class _Setup(Base):
         ni.check_invoice(self.inv, rpc=self.ledger, store=self.store, now=T0 + 60)
 
     def rec(self, block, **kw):
+        kw.setdefault("now", CLOCK)
         return ni.record_refund(self.inv.id, self.retry, block, store=self.store, rpc=self.ledger, **kw)
 
     def dup_entry(self, now):
@@ -101,7 +103,7 @@ class RefundVerified(_Setup):
     def test_cli_verify_on_chain_uses_the_rpc(self):
         back, _ = self.ledger.send(MERCHANT, PAYER, self.inv.pay_raw, T0 - 1000, received=False)
         args = ["record-refund", "--invoice", self.inv.id, "--duplicate-block", self.retry,
-                "--refund-block", back, "--at", str(T0 + 500), "--verify-on-chain"]
+                "--refund-block", back, "--at", str(T0 + 500), "--verify-on-chain", "--now", str(CLOCK)]
         seen = []
         ledger = self.ledger
 
@@ -178,7 +180,8 @@ class RefundTimeIsTheBlockTime(_Setup):
 
         def run(extra):
             args = ["--db", self.db, "record-refund", "--invoice", self.inv.id,
-                    "--duplicate-block", self.retry, "--refund-block", late, "--verify-on-chain"] + extra
+                    "--duplicate-block", self.retry, "--refund-block", late, "--verify-on-chain",
+                    "--now", str(CLOCK)] + extra
             orig = cli.Rpc
             cli.Rpc = Node
             try:
@@ -196,3 +199,77 @@ class RefundTimeIsTheBlockTime(_Setup):
         self.assertEqual(code, 0, text)
         self.assertIn(str(self.LATE), text)
         self.assertTrue(self.dup_entry(self.LATE + 1)["refunded_late"])
+
+
+class RefundTimestampBounds(_Setup):
+    """A verified local_timestamp is a time this store will keep and compute refunded_late
+    from: it must fit SQLite's INTEGER like `at`, and not lie far in the future."""
+
+    def refund_at(self, ts):
+        back, _ = self.ledger.send(MERCHANT, PAYER, self.inv.pay_raw, T0 + 100, received=False)
+        self.ledger.blocks[back]["local_timestamp"] = ts
+        return back
+
+    def assert_unverified(self, back, **kw):
+        with self.assertRaises(ni.InvoiceError) as cm:
+            self.rec(back, **kw)
+        self.assertIn("refund_block_unverified", str(cm.exception))
+        self.assertEqual(self.refunded(), [])
+
+    def test_a_timestamp_beyond_sqlite_integer_is_an_invoice_error_not_overflow(self):
+        # Without now=, exactly as a caller of the earlier signature: the range check comes
+        # before the clock is consulted, and the error is an InvoiceError, never OverflowError.
+        for ts in ("99999999999999999999", str(2 ** 63)):
+            back = self.refund_at(ts)
+            with self.assertRaises(ni.InvoiceError) as cm:
+                ni.record_refund(self.inv.id, self.retry, back, store=self.store, rpc=self.ledger)
+            self.assertIn("refund_block_unverified", str(cm.exception))
+            self.assertEqual(self.refunded(), [])
+
+    def test_a_timestamp_far_in_the_future_is_refused(self):
+        self.assert_unverified(self.refund_at(str(2 ** 62)))
+        self.assert_unverified(self.refund_at(str(CLOCK + ni.core.REFUND_TS_MAX_AHEAD_S + 1)))
+
+    def test_a_timestamp_within_a_day_ahead_is_accepted(self):
+        back = self.refund_at(str(CLOCK + ni.core.REFUND_TS_MAX_AHEAD_S))
+        out = self.rec(back)
+        self.assertEqual(out["recorded_at"], CLOCK + ni.core.REFUND_TS_MAX_AHEAD_S)
+
+    def test_the_default_clock_is_the_local_clock(self):
+        # Without now=, the bound is time.time(): T0 + 100 is after today + 1 day only if
+        # the local clock says so, so pin it through the module's time.
+        import time as _time
+        orig = ni.core.time.time
+        ni.core.time.time = lambda: T0 - 10 * 86400
+        try:
+            with self.assertRaises(ni.InvoiceError) as cm:
+                ni.record_refund(self.inv.id, self.retry, self.refund_at(str(T0 + 100)),
+                                 store=self.store, rpc=self.ledger)
+            self.assertIn("refund_block_unverified", str(cm.exception))
+        finally:
+            ni.core.time.time = orig
+        self.assertIs(_time.time, orig)
+
+    def test_cli_far_future_timestamp_is_refused_with_exit_not_zero(self):
+        back = self.refund_at(str(2 ** 62))
+        ledger = self.ledger
+
+        class Node:
+            def __init__(self, url):
+                pass
+
+            def call(self, action, **p):
+                return ledger.call(action, **p)
+        orig = cli.Rpc
+        cli.Rpc = Node
+        try:
+            buf = io.StringIO()
+            with redirect_stdout(buf), redirect_stderr(buf):
+                code = cli.main(["--db", self.db, "record-refund", "--invoice", self.inv.id,
+                                 "--duplicate-block", self.retry, "--refund-block", back,
+                                 "--verify-on-chain", "--now", str(CLOCK)])
+        finally:
+            cli.Rpc = orig
+        self.assertNotEqual(code, 0)
+        self.assertIn("refund_block_unverified", buf.getvalue())
+        self.assertEqual(self.refunded(), [])

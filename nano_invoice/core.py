@@ -992,7 +992,14 @@ def _epoch_s(value, name):
     return value
 
 
-def record_refund(invoice, duplicate_send_block, refund_send_block, store=None, at=None, rpc=None):
+# A verified refund block's local_timestamp more than this far ahead of the local clock is
+# refused as refund_block_unverified: a node that reports a time in the future cannot be
+# used to decide whether the refund was late.
+REFUND_TS_MAX_AHEAD_S = 86400
+
+
+def record_refund(invoice, duplicate_send_block, refund_send_block, store=None, at=None, rpc=None,
+                  now=None):
     """Record that the merchant sent the refund owed for one duplicate/late transfer of
     this invoice, as the refund's own send block. Refused for a block that is not a
     duplicate/late transfer of this invoice, and for a second record of the same one.
@@ -1012,7 +1019,10 @@ def record_refund(invoice, duplicate_send_block, refund_send_block, store=None, 
     The result then carries `verified_on_chain: True`, and the refund's recorded time
     (`recorded_at`, which `refunded_late` is computed from) is the verified block's
     `local_timestamp`, not `at`: a given `at` that differs from it is refused as
-    `refund_block_mismatch`."""
+    `refund_block_mismatch`. The verified `local_timestamp` must be epoch seconds that
+    fit SQLite's INTEGER (0 <= t < 2**63, as `at`) and be no more than
+    REFUND_TS_MAX_AHEAD_S (one day) ahead of `now` (default: the local clock); otherwise
+    `refund_block_unverified` is raised and nothing is recorded."""
     store = _require_store(store)
     inv = store.get(invoice)
     dup = _block_hash(duplicate_send_block, "duplicate_send_block")
@@ -1023,7 +1033,8 @@ def record_refund(invoice, duplicate_send_block, refund_send_block, store=None, 
     if rpc is not None:
         # The more specific refusal first, then the ledger read (outside the write lock).
         _refuse_incoming_refund_block(store.conn, ref)
-        verified_ts = _verify_refund_block(store, inv, dup, ref, rpc)
+        clock = int(time.time()) if now is None else _epoch_s(now, "now")
+        verified_ts = _verify_refund_block(store, inv, dup, ref, rpc, clock)
         if verified_ts is not None:
             # Verified on chain: the refund's time is the block's, never the merchant's word,
             # so refunded_late is computed from the ledger. A stated `at` that disagrees is
@@ -1070,7 +1081,7 @@ def _refuse_incoming_refund_block(c, ref):
                            f"received, not a refund sent")
 
 
-def _verify_refund_block(store, inv, dup, ref, rpc):
+def _verify_refund_block(store, inv, dup, ref, rpc, now):
     """Read `ref` from the ledger; raise unless it is the refund owed for `dup` of `inv`.
     Returns the block's verified `local_timestamp` (None only when the checks in
     record_refund will refuse the record anyway)."""
@@ -1090,6 +1101,12 @@ def _verify_refund_block(store, inv, dup, ref, rpc):
                            f"({type(e).__name__}: {e}); nothing recorded") from e
     if problems:
         raise InvoiceError(f"refund_block_mismatch: {ref} is not the refund for {dup}: " + "; ".join(problems))
+    if not 0 <= ts < 2 ** 63:
+        raise InvoiceError(f"refund_block_unverified: {ref} has local_timestamp {ts}, not epoch "
+                           f"seconds in 0..2**63-1; nothing recorded")
+    if ts > now + REFUND_TS_MAX_AHEAD_S:
+        raise InvoiceError(f"refund_block_unverified: {ref} has local_timestamp {ts}, more than "
+                           f"{REFUND_TS_MAX_AHEAD_S} s ahead of now ({now}); nothing recorded")
     return ts
 
 
