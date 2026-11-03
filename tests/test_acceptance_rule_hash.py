@@ -9,7 +9,9 @@ No network, no funds: Nano's published zero-seed test key and FakeLedger-free re
 import hashlib
 import unittest
 
+import nano_invoice as ni
 from nano_invoice import nano_sig
+from tests.test_receipt_v2 import Base
 from tests.test_acceptance_v3 import ack3, BLOCK, ORDER, OUTPUT, PAYER, RULE, T
 
 
@@ -51,6 +53,54 @@ class RuleHashField(unittest.TestCase):
         a["acceptance_rule_hash"] = nano_sig.acceptance_rule_hash(other)
         r = self.read(a)  # asked under RULE: the ack names another rule, so it does not count
         self.assertFalse(r["ok"])
+
+
+
+class UnhashableRuleIsMalformed(unittest.TestCase):
+    """A rule that cannot be hashed ('' or a lone surrogate) with an ack that names an
+    acceptance_rule_hash is ignored as malformed, as on main - never an exception."""
+    BAD_RULES = ("", "rule-\ud800")
+
+    def ack(self):
+        a = ack3(ORDER, BLOCK)
+        del a["acceptance_rule"]
+        a["acceptance_rule_hash"] = nano_sig.acceptance_rule_hash(RULE)
+        return a
+
+    def test_library_ignores_it_as_malformed(self):
+        for rule in self.BAD_RULES:
+            with self.subTest(rule=rule):
+                r = nano_sig.read_payer_acks(PAYER, OUTPUT, BLOCK, [self.ack()],
+                                             order_id=ORDER, acceptance_rule=rule)
+                self.assertFalse(r["ok"])
+                self.assertEqual([e["reason"] for e in r["ignored"]], ["malformed"])
+
+    def test_cli_exits_3_not_2(self):
+        import contextlib
+        import io
+        import json
+        import os
+        import tempfile
+        from nano_invoice import cli
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "acks.json")
+            with open(path, "w") as fh:
+                json.dump([self.ack()], fh)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                code = cli.main(["ack-read", PAYER, OUTPUT, BLOCK, path, "--order-id", ORDER,
+                                 "--acceptance-rule", "rule-\ud800"])
+        self.assertEqual(code, 3, buf.getvalue())
+        out = json.loads(buf.getvalue())
+        self.assertFalse(out["ok"])
+        self.assertEqual([e["reason"] for e in out["ignored"]], ["malformed"])
+
+
+class UnhashableRuleInAcceptanceFields(Base):
+    def test_unknown_state_not_an_exception(self):
+        inv = self.v2_invoice()
+        a = ni.acceptance_fields(inv.id, store=self.store, acceptance_rule="rule-\ud800")["payer_acceptance"]
+        self.assertEqual((a["state"], a["reason"], a["acceptance_rule_hash"]), ("unknown", "not_settled", None))
 
 
 if __name__ == "__main__":

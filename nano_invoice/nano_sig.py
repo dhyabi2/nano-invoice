@@ -430,18 +430,21 @@ def read_payer_acks(payer_address, output_commitment, payment_block_hash, acks, 
             if a.get("acceptance_rule", acceptance_rule) != acceptance_rule:
                 ignored.append({"index": i, "reason": "other_acceptance_rule"})
                 continue
+            try:
+                ack_message_v3(order_id, output_commitment, payment_block_hash, acceptance_rule,
+                               verdict, at, reason)
+                # Inside the try: a rule that cannot be hashed ('' or not UTF-8 encodable) is
+                # malformed here exactly as it is for ack_message_v3, never an exception.
+                rule_hash = acceptance_rule_hash(acceptance_rule)
+            except (ValueError, TypeError):
+                ignored.append({"index": i, "reason": "malformed"})
+                continue
             # An ack may carry the rule hash as its own field. It is never trusted alone: it
             # must equal sha256(rule), and the signature (which covers that hash) is checked below.
             named_hash = a.get("acceptance_rule_hash")
             if named_hash is not None and (not isinstance(named_hash, str)
-                                           or named_hash.lower() != acceptance_rule_hash(acceptance_rule)):
+                                           or named_hash.lower() != rule_hash):
                 ignored.append({"index": i, "reason": "acceptance_rule_hash_mismatch"})
-                continue
-            try:
-                ack_message_v3(order_id, output_commitment, payment_block_hash, acceptance_rule,
-                               verdict, at, reason)
-            except (ValueError, TypeError):
-                ignored.append({"index": i, "reason": "malformed"})
                 continue
             if not verify_delivery_ack_v3(payer_address, order_id, output_commitment,
                                           payment_block_hash, acceptance_rule, verdict, at, sig,
@@ -450,7 +453,7 @@ def read_payer_acks(payer_address, output_commitment, payment_block_hash, acks, 
                 continue
             entry = {"index": i, "version": 3, "verdict": verdict, "signed_at": at,
                      "order_id": order_id, "acceptance_rule": acceptance_rule,
-                     "acceptance_rule_hash": acceptance_rule_hash(acceptance_rule),
+                     "acceptance_rule_hash": rule_hash,
                      "signature": sig.upper()}
             if reason:
                 entry["reason"] = reason
