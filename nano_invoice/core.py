@@ -725,12 +725,52 @@ def _resolve_send(rpc, merchant, send_hash, receive_hash=None, receive_ts=0):
 # looked up per scan. Each costs one block_info (two for a received one), and
 # they are only ever reported, never settled, so a busy account must not turn
 # one check into hundreds of RPC calls. Sends past the cap are counted in the
-# caller's `untagged_notes`, not looked up.
+# caller's `untagged_notes`, not looked up. An answer already held in an
+# UntaggedLookups cache costs no RPC call and does not spend the cap.
 UNTAGGED_LOOKUP_CAP = 8
 
 
+class UntaggedLookups:
+    """Bounded cache of untagged-send lookups for ONE node, shared by the checks of
+    a watch pass (and across passes) so that one unrelated send is looked up once,
+    not once per open invoice. A confirmed answer cannot change, so it is kept
+    across passes (at most `max_entries`, oldest dropped first); anything else
+    (unconfirmed, not addressed to us, a failed lookup) is kept only until
+    `new_pass()`. Only the untagged path uses it: a tagged send is always read
+    fresh from the node, as before."""
+
+    def __init__(self, max_entries=4096):
+        self.max_entries = max_entries
+        self._kept = {}
+        self._pass = {}
+
+    def new_pass(self):
+        self._pass = {}
+
+    def get(self, key):
+        """(True, value) for a held answer (a copy), else (False, None)."""
+        for d in (self._kept, self._pass):
+            if key in d:
+                value = d[key]
+                return True, (dict(value, problems=list(value["problems"]))
+                              if isinstance(value, dict) else value)
+        return False, None
+
+    def put(self, key, value):
+        d = self._kept if isinstance(value, dict) and value.get("confirmed") else self._pass
+        if key not in d and len(d) >= self.max_entries:
+            d.pop(next(iter(d)))
+        d[key] = (dict(value, problems=list(value["problems"]))
+                  if isinstance(value, dict) else value)
+
+
+class _LookupFailed:
+    def __init__(self, message):
+        self.message = message
+
+
 def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged_notes=None,
-         untagged_skip_tags=()):
+         untagged_skip_tags=(), untagged_skip=None, untagged_cache=None):
     """Every incoming send to merchant whose amount ends in this tag, with its
     sender, amount, confirmation and timestamp read from the ledger. Each
     result carries `tag_match` (True for these).
@@ -744,10 +784,15 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
     a malformed answer of any shape (None, a string, missing fields). A failed
     lookup of a tagged send still raises, as without `untagged_min`.
 
-    An untagged send whose lowest six digits are in `untagged_skip_tags` (other
-    invoices' open or quarantined tags: that invoice's check decides it) is
-    skipped before the cap is spent, so payments of other orders cannot use up
-    the lookups and hide an overpayment of this one."""
+    Before an untagged send spends the cap it must pass the cheap filters: its
+    lowest six digits are not in `untagged_skip_tags` (other invoices' open or
+    quarantined tags: that invoice's check decides it; a set, or a callable
+    returning one, called only once an untagged candidate is seen), and
+    `untagged_skip(send_hash, sender)` (either may be None when the node's list
+    does not say) is not true - e.g. a sender that is the merchant's own or
+    not income, or a send already recorded. A history entry older than `since`
+    ends the walk, as for tagged sends. `untagged_cache` (an UntaggedLookups for
+    this node) answers repeated lookups without an RPC call."""
     rpc = as_rpc(rpc)
     found = {}
     budget = [UNTAGGED_LOOKUP_CAP]
@@ -755,27 +800,58 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
     def tagged(amount):
         return amount % TAG_MODULUS == tag
 
-    skip_tags = frozenset(untagged_skip_tags or ())
+    busy = []
+
+    def skip_tags():
+        if not busy:
+            tags = untagged_skip_tags() if callable(untagged_skip_tags) else untagged_skip_tags
+            busy.append(frozenset(tags or ()))
+        return busy[0]
+
+    def untagged_candidate(amount):
+        return (untagged_min is not None and not tagged(amount) and amount >= untagged_min
+                and amount % TAG_MODULUS not in skip_tags())
 
     def wanted(amount):
-        return tagged(amount) or (untagged_min is not None and amount >= untagged_min
-                                  and amount % TAG_MODULUS not in skip_tags)
+        return tagged(amount) or untagged_candidate(amount)
+
+    def skipped(send_hash, sender):
+        if untagged_skip is None:
+            return False
+        try:
+            return bool(untagged_skip(send_hash, sender))
+        except Exception:  # noqa: BLE001 - a malformed sender is no reason to skip the lookup
+            return False
 
     def note(msg):
         if untagged_notes is not None:
             untagged_notes.append(msg)
 
-    def untagged_lookup(h, fn):
+    def untagged_lookup(key, h, fn):
         """Run fn() for an untagged send `h` within the cap; None if skipped."""
+        if untagged_cache is not None:
+            hit, value = untagged_cache.get(key)
+            if hit:
+                if isinstance(value, _LookupFailed):
+                    note(value.message)
+                    return None
+                return value
         if budget[0] <= 0:
             note(f"{h.upper()}: untagged send not looked up (cap of {UNTAGGED_LOOKUP_CAP} per check reached)")
             return None
         budget[0] -= 1
         try:
-            return fn()
+            value = fn()
         except Exception as e:  # noqa: BLE001 - any malformed node answer: skip and note
-            note(f"{h.upper()}: untagged send skipped, lookup failed: {type(e).__name__}: {e}")
+            msg = f"{h.upper()}: untagged send skipped, lookup failed: {type(e).__name__}: {e}"
+            if untagged_cache is not None:
+                untagged_cache.put(key, _LookupFailed(msg))
+            note(msg)
             return None
+        if untagged_cache is not None:
+            untagged_cache.put(key, value)
+            hit, value = untagged_cache.get(key)
+        return value
 
     pending = _blocks_field(rpc.call("receivable", account=merchant, count=str(max_blocks), source="true"))
     for h, info in pending.items():
@@ -783,7 +859,10 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
         if amount is not None and not wanted(amount):
             continue
         if amount is not None and not tagged(amount):
-            ob = untagged_lookup(h, lambda h=h: _resolve_send(rpc, merchant, h))
+            sender = info.get("source") if isinstance(info, dict) else None
+            if skipped(h, sender):
+                continue
+            ob = untagged_lookup(("send", h.upper()), h, lambda h=h: _resolve_send(rpc, merchant, h))
             if ob is None:
                 continue
         else:
@@ -806,6 +885,8 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
                 break
             if _subtype(e) != "receive" or not wanted(int(e["amount"])):
                 continue
+            if not tagged(int(e["amount"])) and skipped(None, e.get("account")):
+                continue
 
             def resolve(e=e, ts=ts):
                 rinfo = rpc.call("block_info", json_block="true", hash=e["hash"])
@@ -816,7 +897,8 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
                 ob["confirmed"] = ob["confirmed"] and str(rinfo.get("confirmed")).lower() == "true"
                 return ob
 
-            ob = resolve() if tagged(int(e["amount"])) else untagged_lookup(e["hash"], resolve)
+            ob = (resolve() if tagged(int(e["amount"]))
+                  else untagged_lookup(("receive", str(e["hash"]).upper()), e["hash"], resolve))
             if ob is None or not wanted(ob["amount_raw"]):
                 continue
             ob["tag_match"] = tagged(ob["amount_raw"])
@@ -835,7 +917,7 @@ def _accounts(values):
 
 
 def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=None, now=None,
-                  max_blocks=1000, skew_s=CLOCK_SKEW_S):
+                  max_blocks=1000, skew_s=CLOCK_SKEW_S, untagged_cache=None, busy_tags=None):
     """Read the merchant's account from the public ledger and settle the invoice.
 
     A block pays only if: it is a confirmed send to the merchant, it was sent
@@ -887,10 +969,25 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
     unmatched_notes = []
     # Other invoices' open or quarantined tags: an untagged send ending in one is that
     # invoice's, so it is filtered out before it can spend this check's lookup cap.
-    other_busy = _busy_tags(store, inv.merchant, now) - {inv.tag}
+    # Read lazily: only once an untagged candidate is actually seen, and only once per
+    # watch pass when the observer hands in its `busy_tags` (a callable).
+    busy = busy_tags if busy_tags is not None else _lazy_busy_tags(store, inv.merchant, now)
+
+    def other_busy():
+        return busy() - {inv.tag}
+
+    def skip_untagged(send_hash, sender):
+        # The cheap filters, before an untagged send may spend the lookup cap.
+        if sender:
+            s = acct.normalise(sender)
+            if s in own or s in excluded:
+                return True
+        return bool(send_hash) and store.payment(str(send_hash).upper()) is not None
+
     for ob in scan(rpc, inv.merchant, inv.tag, inv.created_at - skew_s, max_blocks,
                    untagged_min=inv.pay_raw, untagged_notes=unmatched_notes,
-                   untagged_skip_tags=other_busy):
+                   untagged_skip_tags=other_busy, untagged_skip=skip_untagged,
+                   untagged_cache=untagged_cache if untagged_cache is not None else UntaggedLookups()):
         if not ob.pop("tag_match", True):
             unmatched.append(ob)
             continue
@@ -1003,6 +1100,20 @@ def _tag_busy(r, now):
 
 def _busy_tags(store, merchant, now):
     return {r.tag for r in _merchant_invoices(store, merchant) if _tag_busy(r, now)}
+
+
+def _lazy_busy_tags(store, merchant, now):
+    """A callable returning the merchant's open or quarantined tags, read from the
+    store on the first call only. Within one watch pass the set cannot shrink (a
+    tag closed during the pass is quarantined) and no invoice is created, so one
+    read serves every check of the pass."""
+    held = []
+
+    def tags():
+        if not held:
+            held.append(frozenset(_busy_tags(store, merchant, now)))
+        return held[0]
+    return tags
 
 
 def _unmatched_candidates(store, inv, unmatched, own, excluded, now, skew_s):
