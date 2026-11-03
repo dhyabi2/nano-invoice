@@ -147,5 +147,86 @@ class TestUntaggedOverpayment(unittest.TestCase):
         self.assertEqual(res["unmatched_candidates"], [])
 
 
+class TestUntaggedReviewRound2(unittest.TestCase):
+    """Round-2 review: the cap is spent only on sends no other tag claims, any
+    malformed node answer on the untagged path is skipped and noted, and only
+    OPEN invoices are candidates (a paid, checked invoice never names itself)."""
+    setUp = TestUntaggedOverpayment.setUp
+    tearDown = TestUntaggedOverpayment.tearDown
+    invoice = TestUntaggedOverpayment.invoice
+    check = TestUntaggedOverpayment.check
+
+    def malformed(self, answers):
+        orig = self.ledger.call
+
+        def call(action, **p):
+            h = str(p.get("hash", "")).upper()
+            if action == "block_info" and h in answers:
+                self.ledger.calls.append((action, p))
+                return answers[h]
+            return orig(action, **p)
+        self.ledger.call = call
+
+    def test_payments_of_other_open_invoices_do_not_spend_the_cap(self):
+        inv = self.invoice("order-1", tag=5)
+        over, _ = self.ledger.send(BUYER, MERCHANT, inv.pay_raw + 10 ** 27 + 7, T0 + 5)
+        others = [self.invoice(f"other-{i}", tag=100 + i) for i in range(core.UNTAGGED_LOOKUP_CAP + 2)]
+        for i, o in enumerate(others):  # newer than the overpayment: walked first
+            self.ledger.send(account(f"payer-{i}"), MERCHANT, o.pay_raw, T0 + 10 + i)
+        res = self.check(inv)
+        self.assertEqual([u["send_block"] for u in res["unmatched_candidates"]], [over])
+        self.assertEqual(res["unmatched_notes"], [])
+        lookups = sum(1 for action, _ in self.ledger.calls if action == "block_info")
+        self.assertEqual(lookups, 2)  # only the overpayment (receive + send)
+        for o in others:  # each other invoice's own check still settles its payment
+            self.check(o)
+            self.assertEqual(self.store.get(o).state, "paid")
+
+    def test_any_malformed_untagged_answer_is_skipped_and_the_own_payment_settles(self):
+        for bad in (None, "garbage", 7, ["x"]):
+            with self.subTest(bad=bad):
+                self.tearDown()
+                self.setUp()   # fresh store and ledger: the fake's block hashes repeat
+                inv = self.invoice(f"order-{bad!r}")
+                _, recv = self.ledger.send(account("o1"), MERCHANT, inv.pay_raw + 10 ** 27 + 5, T0 + 5)
+                pend, _ = self.ledger.send(account("o2"), MERCHANT, inv.pay_raw + 10 ** 27 + 9, T0 + 6,
+                                           received=False)
+                self.malformed({recv.upper(): bad, pend.upper(): bad})
+                pay, _ = self.ledger.send(BUYER, MERCHANT, inv.pay_raw, T0 + 20)
+                res = self.check(inv)
+                self.assertEqual(self.store.get(inv).state, "paid")
+                self.assertEqual(self.store.get(inv).send_block, pay)
+                self.assertEqual(res["unmatched_candidates"], [])
+                self.assertEqual(len(res["unmatched_notes"]), 2)
+                self.assertTrue(all("lookup failed" in n for n in res["unmatched_notes"]))
+
+    def test_a_malformed_answer_for_the_own_tagged_send_still_raises(self):
+        inv = self.invoice("order-1")
+        pay, recv = self.ledger.send(BUYER, MERCHANT, inv.pay_raw, T0 + 20)
+        self.malformed({recv.upper(): None})
+        with self.assertRaises(Exception):
+            self.check(inv)
+        self.assertEqual(self.store.get(inv).state, "open")
+
+    def test_a_paid_checked_invoice_does_not_list_itself(self):
+        a = self.invoice("order-a", tag=111)
+        self.ledger.send(BUYER, MERCHANT, a.pay_raw, T0 + 5)
+        self.check(a)
+        self.assertEqual(self.store.get(a).state, "paid")
+        b = self.invoice("order-b", tag=222)
+        send, _ = self.ledger.send(BUYER, MERCHANT, b.pay_raw + 10 ** 27 + 7, T0 + 10)
+        u = self.check(a)["unmatched_candidates"]
+        self.assertEqual([x["send_block"] for x in u], [send])
+        self.assertEqual(u[0]["candidate_invoices"], [b.id])
+        self.assertFalse(u[0]["ambiguous"])
+        # Once b is paid too, nothing open covers it: the list is empty, never [a].
+        self.ledger.send(BUYER, MERCHANT, b.pay_raw, T0 + 12)
+        self.check(b)
+        self.assertEqual(self.store.get(b).state, "paid")
+        u = self.check(a)["unmatched_candidates"]
+        self.assertEqual([(x["send_block"], x["candidate_invoices"], x["ambiguous"]) for x in u],
+                         [(send, [], False)])
+
+
 if __name__ == "__main__":
     unittest.main()

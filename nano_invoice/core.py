@@ -25,7 +25,7 @@ import time
 from . import account as acct
 from . import nano_sig
 from . import receipt_v2 as v2
-from .rpc import RpcError, as_rpc
+from .rpc import as_rpc
 
 RAW_PER_XNO = 10 ** 30
 TAG_MODULUS = 10 ** 6
@@ -729,7 +729,8 @@ def _resolve_send(rpc, merchant, send_hash, receive_hash=None, receive_ts=0):
 UNTAGGED_LOOKUP_CAP = 8
 
 
-def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged_notes=None):
+def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged_notes=None,
+         untagged_skip_tags=()):
     """Every incoming send to merchant whose amount ends in this tag, with its
     sender, amount, confirmation and timestamp read from the ledger. Each
     result carries `tag_match` (True for these).
@@ -739,8 +740,14 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
     excess that is not a multiple of TAG_MODULUS), with `tag_match` False.
     Those are best effort: a failed lookup of one is skipped, never raised, and
     each skip (failed, or past the cap) is appended as a string to
-    `untagged_notes` when a list is given. A failed lookup of a tagged send
-    still raises, as without `untagged_min`."""
+    `untagged_notes` when a list is given. Any failure counts: a node error, or
+    a malformed answer of any shape (None, a string, missing fields). A failed
+    lookup of a tagged send still raises, as without `untagged_min`.
+
+    An untagged send whose lowest six digits are in `untagged_skip_tags` (other
+    invoices' open or quarantined tags: that invoice's check decides it) is
+    skipped before the cap is spent, so payments of other orders cannot use up
+    the lookups and hide an overpayment of this one."""
     rpc = as_rpc(rpc)
     found = {}
     budget = [UNTAGGED_LOOKUP_CAP]
@@ -748,8 +755,11 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
     def tagged(amount):
         return amount % TAG_MODULUS == tag
 
+    skip_tags = frozenset(untagged_skip_tags or ())
+
     def wanted(amount):
-        return tagged(amount) or (untagged_min is not None and amount >= untagged_min)
+        return tagged(amount) or (untagged_min is not None and amount >= untagged_min
+                                  and amount % TAG_MODULUS not in skip_tags)
 
     def note(msg):
         if untagged_notes is not None:
@@ -763,8 +773,8 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
         budget[0] -= 1
         try:
             return fn()
-        except (RpcError, KeyError, ValueError, TypeError) as e:
-            note(f"{h.upper()}: untagged send skipped, lookup failed: {e}")
+        except Exception as e:  # noqa: BLE001 - any malformed node answer: skip and note
+            note(f"{h.upper()}: untagged send skipped, lookup failed: {type(e).__name__}: {e}")
             return None
 
     pending = _blocks_field(rpc.call("receivable", account=merchant, count=str(max_blocks), source="true"))
@@ -855,14 +865,16 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
     it may be unrelated income): it is bound to nothing and settles nothing,
     but it is no longer invisible. It is listed under `unmatched_candidates`,
     for information only, with its excess over this invoice and the invoices
-    it could equally be for (`candidate_invoices`: this one and the merchant's
-    other open invoices whose pay_raw it covers and whose window holds it;
-    `ambiguous` if more than one). No refund instruction is attached and none
-    is recorded: deciding whether to refund it is for a human. A send whose
-    low six digits equal another open or quarantined tag is left to that tag.
+    it could equally be for (`candidate_invoices`: the merchant's OPEN
+    invoices, this one included only while it is open, whose pay_raw it covers
+    and whose window holds it; `ambiguous` if more than one). No refund
+    instruction is attached and none is recorded: deciding whether to refund it
+    is for a human. A send whose low six digits equal another open or
+    quarantined tag is left to that tag, and is filtered out before any lookup.
     At most UNTAGGED_LOOKUP_CAP untagged sends are looked up per check, and a
-    failed lookup of one is skipped (listed in `unmatched_notes`), never
-    raised, so it cannot stop this invoice's own payment being recorded.
+    failed lookup of one (a node error or any malformed answer) is skipped
+    (listed in `unmatched_notes`), never raised, so it cannot stop this
+    invoice's own payment being recorded.
     """
     store = _require_store(store)
     inv = store.get(invoice)
@@ -873,8 +885,12 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
     short = []
     unmatched = []
     unmatched_notes = []
+    # Other invoices' open or quarantined tags: an untagged send ending in one is that
+    # invoice's, so it is filtered out before it can spend this check's lookup cap.
+    other_busy = _busy_tags(store, inv.merchant, now) - {inv.tag}
     for ob in scan(rpc, inv.merchant, inv.tag, inv.created_at - skew_s, max_blocks,
-                   untagged_min=inv.pay_raw, untagged_notes=unmatched_notes):
+                   untagged_min=inv.pay_raw, untagged_notes=unmatched_notes,
+                   untagged_skip_tags=other_busy):
         if not ob.pop("tag_match", True):
             unmatched.append(ob)
             continue
@@ -976,6 +992,19 @@ UNMATCHED_REASON = (
     "information only: no refund instruction is issued for it, a human decides")
 
 
+def _merchant_invoices(store, merchant):
+    return [Store._invoice(r) for r in store.conn.execute(
+        "SELECT * FROM invoices WHERE merchant = ?", (merchant,))]
+
+
+def _tag_busy(r, now):
+    return r.state == "open" or (r.closed_at or 0) > now - TAG_QUARANTINE_S
+
+
+def _busy_tags(store, merchant, now):
+    return {r.tag for r in _merchant_invoices(store, merchant) if _tag_busy(r, now)}
+
+
 def _unmatched_candidates(store, inv, unmatched, own, excluded, now, skew_s):
     """Untagged sends >= pay_raw that could be an overpayment of `inv`. Bound to
     nothing and informational only: no refund instruction, because the same
@@ -983,9 +1012,8 @@ def _unmatched_candidates(store, inv, unmatched, own, excluded, now, skew_s):
     acting on it would refund it more than once."""
     if not unmatched:
         return []
-    rows = [Store._invoice(r) for r in store.conn.execute(
-        "SELECT * FROM invoices WHERE merchant = ?", (inv.merchant,))]
-    busy = {r.tag for r in rows if r.state == "open" or (r.closed_at or 0) > now - TAG_QUARANTINE_S}
+    rows = _merchant_invoices(store, inv.merchant)
+    busy = {r.tag for r in rows if _tag_busy(r, now)}
     out = []
     for ob in unmatched:
         amount, ts = ob["amount_raw"], ob["block_ts"]
@@ -996,7 +1024,7 @@ def _unmatched_candidates(store, inv, unmatched, own, excluded, now, skew_s):
                 or store.payment(ob["send_block"]) is not None):
             continue
         candidates = sorted(r.id for r in rows
-                            if (r.id == inv.id or r.state == "open")
+                            if r.state == "open"   # open invoices only; a paid one is never one
                             and r.pay_raw <= amount and r.created_at - skew_s <= ts <= r.expires_at)
         view = {k: (str(v) if k == "amount_raw" else v) for k, v in ob.items() if k != "problems"}
         out.append(dict(
