@@ -238,7 +238,8 @@ def build_parser():
     rr.add_argument("--invoice", required=True)
     rr.add_argument("--duplicate-block", required=True, help="the duplicate/late transfer's send block")
     rr.add_argument("--refund-block", required=True, help="your refund's own send block")
-    rr.add_argument("--at", type=int, help="unix seconds the refund was sent (default now)")
+    rr.add_argument("--at", type=int, help="unix seconds the refund was sent (default now; with --verify-on-chain "
+                         "the refund block's local_timestamp is used, and a different --at is refused)")
     rr.add_argument("--verify-on-chain", action="store_true",
                     help="read the refund block from the node given by --rpc and refuse it unless it is "
                          "a confirmed send of the amount owed to the duplicate's sender, after the duplicate")
