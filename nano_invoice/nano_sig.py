@@ -329,6 +329,13 @@ def _text_sha256(value, name):
     return hashlib.sha256(value.encode("utf-8")).digest()
 
 
+def acceptance_rule_hash(acceptance_rule):
+    """sha256 of the acceptance-rule string alone, as 64 lowercase hex characters. It is the
+    same 32 bytes a v3 ack signs in its fourth slot, so an auditor who asks "which rule
+    version?" can compare this one field with the rule text, without re-deriving the message."""
+    return _text_sha256(acceptance_rule, "acceptance_rule").hex()
+
+
 def order_binding(order_id):
     """The 32 bytes a v3 ack binds for the order: sha256 of the invoice id as UTF-8."""
     return _text_sha256(order_id, "order_id")
@@ -426,8 +433,18 @@ def read_payer_acks(payer_address, output_commitment, payment_block_hash, acks, 
             try:
                 ack_message_v3(order_id, output_commitment, payment_block_hash, acceptance_rule,
                                verdict, at, reason)
+                # Inside the try: a rule that cannot be hashed ('' or not UTF-8 encodable) is
+                # malformed here exactly as it is for ack_message_v3, never an exception.
+                rule_hash = acceptance_rule_hash(acceptance_rule)
             except (ValueError, TypeError):
                 ignored.append({"index": i, "reason": "malformed"})
+                continue
+            # An ack may carry the rule hash as its own field. It is never trusted alone: it
+            # must equal sha256(rule), and the signature (which covers that hash) is checked below.
+            named_hash = a.get("acceptance_rule_hash")
+            if named_hash is not None and (not isinstance(named_hash, str)
+                                           or named_hash.lower() != rule_hash):
+                ignored.append({"index": i, "reason": "acceptance_rule_hash_mismatch"})
                 continue
             if not verify_delivery_ack_v3(payer_address, order_id, output_commitment,
                                           payment_block_hash, acceptance_rule, verdict, at, sig,
@@ -436,6 +453,7 @@ def read_payer_acks(payer_address, output_commitment, payment_block_hash, acks, 
                 continue
             entry = {"index": i, "version": 3, "verdict": verdict, "signed_at": at,
                      "order_id": order_id, "acceptance_rule": acceptance_rule,
+                     "acceptance_rule_hash": rule_hash,
                      "signature": sig.upper()}
             if reason:
                 entry["reason"] = reason

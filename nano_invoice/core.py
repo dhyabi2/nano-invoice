@@ -1181,8 +1181,14 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
         else:
             not_counted.append({"index": i, "reason": "not_v3: binds no order id or acceptance rule"})
 
+    try:
+        rule_hash = nano_sig.acceptance_rule_hash(acceptance_rule)
+    except ValueError:      # not UTF-8 encodable (a lone surrogate): no ack can match it
+        rule_hash = None
+
     def unknown(reason, **extra):
         return dict({"state": "unknown", "reason": reason, "acceptance_rule": acceptance_rule,
+                     "acceptance_rule_hash": rule_hash,
                      "order_id": inv.id, "not_counted": not_counted}, **extra)
 
     if inv.send_block is None:
@@ -1205,6 +1211,7 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
             acceptance = {
                 "state": r["verdict"], "payer": inv.sender, "order_id": inv.id,
                 "send_block": inv.send_block, "acceptance_rule": acceptance_rule,
+                "acceptance_rule_hash": rule_hash,
                 "current": dict(r["current"], index=remap[r["current"]["index"]]),
                 "superseded": [dict(e, index=remap[e["index"]]) for e in r["superseded"]],
                 "ignored": ignored, "not_counted": not_counted,
