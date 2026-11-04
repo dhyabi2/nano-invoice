@@ -230,3 +230,55 @@ class TestUntaggedReviewRound2(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestListedTagNessIsKept(unittest.TestCase):
+    """A send the node LISTS as untagged is never settled, even if its lookup
+    (fresh or from the untagged cache) says it ends in the tag: a tagged send is
+    always read fresh, on the tagged path. As before untagged reporting, such a
+    send is skipped."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = ni.Store(os.path.join(self.tmp.name, "inv.db"))
+        self.ledger = FakeLedger()
+        self.inv = ni.create_invoice(MERCHANT, XNO // 2, "order-1", 3600, store=self.store, now=T0)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def assert_not_settled(self, res):
+        self.assertEqual(self.store.get(self.inv).state, "open")
+        self.assertEqual(self.store.payments_for(self.inv.id), [])
+        self.assertEqual([o for o in res["observations"] if o.get("outcome") == "paid"], [])
+
+    def test_receivable_listed_untagged_but_block_info_tagged_is_not_settled(self):
+        send, _ = self.ledger.send(BUYER, MERCHANT, self.inv.pay_raw, T0 + 10, received=False)
+        self.ledger.receivable[MERCHANT][send]["amount"] = str(self.inv.pay_raw + 7)
+        res = ni.check_invoice(self.inv, rpc=self.ledger, store=self.store, now=T0 + 60)
+        self.assert_not_settled(res)
+
+    def test_a_tagged_answer_in_the_untagged_cache_is_not_settled(self):
+        send, _ = self.ledger.send(BUYER, MERCHANT, self.inv.pay_raw, T0 + 10, received=False)
+        self.ledger.receivable[MERCHANT][send]["amount"] = str(self.inv.pay_raw + 7)
+        cache = core.UntaggedLookups()
+        cache.put(("send", send.upper()), core._resolve_send(self.ledger, MERCHANT, send))
+        n = len(self.ledger.calls)
+        res = ni.check_invoice(self.inv, rpc=self.ledger, store=self.store, now=T0 + 60,
+                               untagged_cache=cache)
+        self.assert_not_settled(res)
+        self.assertFalse(any(a == "block_info" for a, _ in self.ledger.calls[n:]))
+
+    def test_history_listed_untagged_but_lookup_tagged_is_not_settled(self):
+        _, rh = self.ledger.send(BUYER, MERCHANT, self.inv.pay_raw, T0 + 10)
+        for e in self.ledger.history[MERCHANT]:
+            if e["hash"] == rh:
+                e["amount"] = str(self.inv.pay_raw + 7)
+        res = ni.check_invoice(self.inv, rpc=self.ledger, store=self.store, now=T0 + 60)
+        self.assert_not_settled(res)
+
+    def test_a_consistent_tagged_send_still_settles(self):
+        self.ledger.send(BUYER, MERCHANT, self.inv.pay_raw, T0 + 10, received=False)
+        ni.check_invoice(self.inv, rpc=self.ledger, store=self.store, now=T0 + 60)
+        self.assertEqual(self.store.get(self.inv).state, "paid")

@@ -792,7 +792,10 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
     does not say) is not true - e.g. a sender that is the merchant's own or
     not income, or a send already recorded. A history entry older than `since`
     ends the walk, as for tagged sends. `untagged_cache` (an UntaggedLookups for
-    this node) answers repeated lookups without an RPC call."""
+    this node) answers repeated lookups without an RPC call. Whether a send is
+    tagged is decided by the amount the node lists (receivable or history): one
+    listed as untagged is never returned as tagged, whatever its lookup says, so a
+    tagged result is always read fresh, never served from `untagged_cache`."""
     rpc = as_rpc(rpc)
     found = {}
     budget = [UNTAGGED_LOOKUP_CAP]
@@ -863,7 +866,10 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
             if skipped(h, sender):
                 continue
             ob = untagged_lookup(("send", h.upper()), h, lambda h=h: _resolve_send(rpc, merchant, h))
-            if ob is None:
+            # Tag-ness is decided by the node's list: a send listed as untagged is never
+            # settled, even if block_info (or the untagged cache) says it ends in the tag.
+            # A tagged send is always read fresh, below; this one is skipped, as before.
+            if ob is None or tagged(ob["amount_raw"]):
                 continue
         else:
             ob = _resolve_send(rpc, merchant, h)
@@ -897,10 +903,13 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
                 ob["confirmed"] = ob["confirmed"] and str(rinfo.get("confirmed")).lower() == "true"
                 return ob
 
-            ob = (resolve() if tagged(int(e["amount"]))
+            listed_tagged = tagged(int(e["amount"]))
+            ob = (resolve() if listed_tagged
                   else untagged_lookup(("receive", str(e["hash"]).upper()), e["hash"], resolve))
             if ob is None or not wanted(ob["amount_raw"]):
                 continue
+            if not listed_tagged and tagged(ob["amount_raw"]):
+                continue  # listed as untagged: never settled from the untagged path or its cache
             ob["tag_match"] = tagged(ob["amount_raw"])
             found.setdefault(ob["send_block"], ob)
         nxt = data.get("previous")
