@@ -1095,8 +1095,8 @@ def _verify_refund_block(store, inv, dup, ref, rpc, now):
     try:
         info = as_rpc(rpc).call("block_info", json_block="true", hash=ref)
         problems = _refund_block_problems(info, inv, owed, _payment(row)["block_ts"])
-        ts = None if problems else int(info["local_timestamp"])
-    except (RpcError, KeyError, TypeError, ValueError, AttributeError) as e:
+        ts = None if problems else _node_int(info["local_timestamp"])
+    except (RpcError, KeyError, TypeError, ValueError, AttributeError, OverflowError) as e:
         raise InvoiceError(f"refund_block_unverified: {ref} could not be read from the ledger "
                            f"({type(e).__name__}: {e}); nothing recorded") from e
     if problems:
@@ -1110,6 +1110,17 @@ def _verify_refund_block(store, inv, dup, ref, rpc, now):
     return ts
 
 
+def _node_int(value):
+    """An integer field of a node answer: an int or a string of ASCII decimal digits.
+    Anything else (a float such as 1e400, inf, nan or 1800000100.5, a bool, a signed or
+    padded string) raises ValueError rather than being truncated or overflowing."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        return int(value)
+    raise ValueError(f"not an integer: {value!r}")
+
+
 def _refund_block_problems(info, inv, owed, dup_ts):
     contents = info.get("contents") or {}
     dest = contents.get("link_as_account") or contents.get("destination")
@@ -1120,11 +1131,12 @@ def _refund_block_problems(info, inv, owed, dup_ts):
         problems.append("not sent from the merchant's account")
     if not dest or acct.normalise(dest) != owed["to"]:
         problems.append("not sent to the account the refund is owed to")
-    if int(info.get("amount", -1)) != owed["amount_raw"]:
+    if _node_int(info.get("amount", -1)) != owed["amount_raw"]:
         problems.append(f"amount {info.get('amount')} is not the {owed['amount_raw']} raw owed")
     if str(info.get("confirmed")).lower() != "true":
         problems.append("not confirmed yet")
-    ts = int(info.get("local_timestamp") or 0)
+    ts = info.get("local_timestamp")
+    ts = 0 if ts is None or ts == "" else _node_int(ts)
     if not ts:
         problems.append("the node gives no local_timestamp for it, so it cannot be shown to "
                         "come after the duplicate (refused, not assumed)")

@@ -226,6 +226,23 @@ class RefundTimestampBounds(_Setup):
             self.assertIn("refund_block_unverified", str(cm.exception))
             self.assertEqual(self.refunded(), [])
 
+    def test_a_non_integer_timestamp_or_amount_is_unverified_not_overflow_or_truncated(self):
+        # A JSON answer of 1e400 reads as float('inf'): int() of it raised a bare
+        # OverflowError. A float time was truncated and accepted. Only an int or a
+        # string of decimal digits is read; anything else records nothing.
+        bad = (float("1e400"), float("inf"), float("nan"), 1800000100.5, float(T0 + 100), True)
+        for field in ("local_timestamp", "amount"):
+            for value in bad:
+                with self.subTest(field=field, value=value):
+                    back, _ = self.ledger.send(MERCHANT, PAYER, self.inv.pay_raw, T0 + 100, received=False)
+                    self.ledger.blocks[back][field] = value
+                    self.assert_unverified(back)
+
+    def test_an_integer_timestamp_and_amount_are_still_read(self):
+        back, _ = self.ledger.send(MERCHANT, PAYER, self.inv.pay_raw, T0 + 100, received=False)
+        self.ledger.blocks[back].update(local_timestamp=T0 + 100, amount=self.inv.pay_raw)
+        self.assertEqual(self.rec(back)["recorded_at"], T0 + 100)
+
     def test_a_timestamp_far_in_the_future_is_refused(self):
         self.assert_unverified(self.refund_at(str(2 ** 62)))
         self.assert_unverified(self.refund_at(str(CLOCK + ni.core.REFUND_TS_MAX_AHEAD_S + 1)))
