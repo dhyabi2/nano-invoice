@@ -306,7 +306,7 @@ def _finish(store, delivery_id, now, error, max_attempts, interval, attempts):
 def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_settle=None,
                  webhook=None, max_attempts=DEFAULT_MAX_ATTEMPTS, interval=DEFAULT_INTERVAL_S,
                  catch_up=False, release_timeout=DEFAULT_RELEASE_TIMEOUT_S, max_blocks=1000,
-                 own_accounts=(), not_income=None):
+                 own_accounts=(), not_income=None, untagged_cache=None):
     """One pass: read the ledger for every open invoice of `merchant`, then
     release every settlement this store owes a release on.
 
@@ -342,10 +342,18 @@ def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_se
     open_ids = [r["id"] for r in store.conn.execute(
         "SELECT id FROM invoices WHERE merchant = ? AND state = 'open' ORDER BY created_at, id",
         (merchant,)).fetchall()]
+    # Untagged sends (reported only, never settled) are looked up once per pass for
+    # all open invoices, not once per invoice, and the busy tags are read once.
+    if untagged_cache is None:
+        untagged_cache = core.UntaggedLookups()
+    untagged_cache.new_pass()
+    busy_tags = core._lazy_busy_tags(store, merchant, now)
     for inv_id in open_ids:
         try:
             core.check_invoice(inv_id, rpc=rpc, store=store, own_accounts=own_accounts,
-                               not_income=not_income, now=now, max_blocks=max_blocks)
+                               not_income=not_income, now=now, max_blocks=max_blocks,
+                               untagged_cache=untagged_cache, busy_tags=busy_tags,
+                               _report_unmatched=False)
         except RpcError as e:
             errors.append({"invoice_id": inv_id, "error": str(e), "effect": "nothing: not settled"})
         except core.InvoiceError as e:
@@ -415,6 +423,8 @@ def observe(store=None, merchant=None, interval=DEFAULT_INTERVAL_S, once=False, 
     is refused before the first pass.
     """
     n = 0
+    # One cache for the whole watch: a confirmed untagged send is looked up once.
+    kw.setdefault("untagged_cache", core.UntaggedLookups())
     while True:
         now = None if clock is None else int(clock())
         yield observe_once(store=store, merchant=merchant, interval=interval, now=now, **kw)
