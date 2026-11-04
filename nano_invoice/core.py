@@ -1099,18 +1099,22 @@ def _verify_refund_block(store, inv, dup, ref, rpc, now):
         return None     # already refunded: the checks below raise refund_already_recorded
     try:
         info = as_rpc(rpc).call("block_info", json_block="true", hash=ref)
-        problems = _refund_block_problems(info, inv, owed, _payment(row)["block_ts"])
-        ts = None if problems else _node_int(info["local_timestamp"])
+        raw_ts = info.get("local_timestamp")
+        ts = None if raw_ts is None or raw_ts == "" else _node_int(raw_ts)
+        # The range is checked before the order: an int -5 is unverified, as "-5" is.
+        in_range = ts is None or 0 <= ts < 2 ** 63
+        problems = _refund_block_problems(info, inv, owed, _payment(row)["block_ts"]) if in_range else []
     except (RpcError, KeyError, TypeError, ValueError, AttributeError, OverflowError,
-            OSError, http.client.HTTPException) as e:
+            RecursionError, OSError, http.client.HTTPException) as e:
         # OSError / HTTPException: the connection broke while the answer was being read.
+        # RecursionError: a deeply nested JSON answer.
         raise InvoiceError(f"refund_block_unverified: {ref} could not be read from the ledger "
                            f"({type(e).__name__}: {e}); nothing recorded") from e
-    if problems:
-        raise InvoiceError(f"refund_block_mismatch: {ref} is not the refund for {dup}: " + "; ".join(problems))
-    if not 0 <= ts < 2 ** 63:
+    if not in_range:
         raise InvoiceError(f"refund_block_unverified: {ref} has local_timestamp {ts}, not epoch "
                            f"seconds in 0..2**63-1; nothing recorded")
+    if problems:
+        raise InvoiceError(f"refund_block_mismatch: {ref} is not the refund for {dup}: " + "; ".join(problems))
     if ts > now + REFUND_TS_MAX_AHEAD_S:
         raise InvoiceError(f"refund_block_unverified: {ref} has local_timestamp {ts}, more than "
                            f"{REFUND_TS_MAX_AHEAD_S} s ahead of now ({now}); nothing recorded")
@@ -1145,7 +1149,7 @@ def _refund_block_problems(info, inv, owed, dup_ts):
     dest = contents.get("link_as_account") or contents.get("destination")
     problems = []
     if _subtype(info) != "send":
-        problems.append(f"block is a {_subtype(info)}, not a send")
+        problems.append(f"block is a {_node_text(_subtype(info))}, not a send")
     if not info.get("block_account") or acct.normalise(info["block_account"]) != inv.merchant:
         problems.append("not sent from the merchant's account")
     if not dest or acct.normalise(dest) != owed["to"]:

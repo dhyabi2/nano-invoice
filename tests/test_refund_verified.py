@@ -405,3 +405,59 @@ class NodeValuesInErrorText(_Setup):
         self.assertIn("is not the", text)
         self.assertNotIn("0" * 41, text)
         self.assertIn("201 chars", text)
+
+
+class RefundReviewRound3(_Setup):
+    """A deeply nested node answer, a long subtype, and an out-of-range int timestamp."""
+
+    def serve(self, body):
+        import http.server
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        self.addCleanup(t.join, 5)
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return f"http://127.0.0.1:{srv.server_address[1]}"
+
+    def test_a_deeply_nested_answer_is_unverified_not_recursion_error(self):
+        url = self.serve(b"[" * 100000 + b"]" * 100000)
+        env = {k: v for k, v in os.environ.items() if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
+        env.update(no_proxy="*", NO_PROXY="*")
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(ni.InvoiceError) as cm:
+                ni.record_refund(self.inv.id, self.retry, "AB" * 32, store=self.store, rpc=url, now=CLOCK)
+        self.assertIn("refund_block_unverified", str(cm.exception))
+        self.assertEqual(self.refunded(), [])
+
+    def test_a_long_subtype_is_truncated_in_the_mismatch(self):
+        back, _ = self.ledger.send(MERCHANT, PAYER, self.inv.pay_raw, T0 + 100, received=False)
+        self.ledger.blocks[back]["subtype"] = "s" * 5000
+        with self.assertRaises(ni.InvoiceError) as cm:
+            self.rec(back)
+        msg = str(cm.exception)
+        self.assertIn("refund_block_mismatch", msg)
+        self.assertNotIn("s" * 41, msg)
+        self.assertIn("5002 chars", msg)
+        self.assertEqual(self.refunded(), [])
+
+    def test_a_negative_int_timestamp_is_unverified_like_its_string(self):
+        for ts in (-5, "-5"):
+            with self.subTest(ts=ts):
+                back, _ = self.ledger.send(MERCHANT, PAYER, self.inv.pay_raw, T0 + 100, received=False)
+                self.ledger.blocks[back]["local_timestamp"] = ts
+                with self.assertRaises(ni.InvoiceError) as cm:
+                    self.rec(back)
+                self.assertIn("refund_block_unverified", str(cm.exception))
+                self.assertEqual(self.refunded(), [])
