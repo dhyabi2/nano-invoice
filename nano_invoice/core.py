@@ -17,6 +17,7 @@ import contextlib
 import dataclasses
 import decimal
 import hashlib
+import http.client
 import json
 import secrets
 import sqlite3
@@ -1014,8 +1015,12 @@ def record_refund(invoice, duplicate_send_block, refund_send_block, store=None, 
     be passed off as its refund); anything else raises `refund_block_mismatch` and records
     nothing. That includes a node that gives no `local_timestamp`, or a duplicate with no
     recorded block time: order cannot be proven, so it is refused (fail closed). A node
-    error or an unreadable block_info raises `refund_block_unverified` (an InvoiceError),
-    and records nothing. A block this ledger received is still `refund_block_is_incoming`.
+    error, a connection that breaks while the answer is read, or an unreadable
+    block_info raises `refund_block_unverified` (an InvoiceError), and records nothing.
+    So does an answer whose `amount` or `local_timestamp` is not a plain integer (an
+    int, or a string of at most NODE_INT_MAX_DIGITS ASCII decimal digits: a float, a
+    bool, a signed or padded string, non-ASCII digits or a longer string is refused);
+    a well-formed but wrong value is `refund_block_mismatch`. A block this ledger received is still `refund_block_is_incoming`.
     The result then carries `verified_on_chain: True`, and the refund's recorded time
     (`recorded_at`, which `refunded_late` is computed from) is the verified block's
     `local_timestamp`, not `at`: a given `at` that differs from it is refused as
@@ -1096,7 +1101,9 @@ def _verify_refund_block(store, inv, dup, ref, rpc, now):
         info = as_rpc(rpc).call("block_info", json_block="true", hash=ref)
         problems = _refund_block_problems(info, inv, owed, _payment(row)["block_ts"])
         ts = None if problems else _node_int(info["local_timestamp"])
-    except (RpcError, KeyError, TypeError, ValueError, AttributeError, OverflowError) as e:
+    except (RpcError, KeyError, TypeError, ValueError, AttributeError, OverflowError,
+            OSError, http.client.HTTPException) as e:
+        # OSError / HTTPException: the connection broke while the answer was being read.
         raise InvoiceError(f"refund_block_unverified: {ref} could not be read from the ledger "
                            f"({type(e).__name__}: {e}); nothing recorded") from e
     if problems:
@@ -1110,15 +1117,27 @@ def _verify_refund_block(store, inv, dup, ref, rpc, now):
     return ts
 
 
+# No raw amount (max supply is under 2**128, 39 digits) or unix time needs more digits.
+NODE_INT_MAX_DIGITS = 40
+
+
+def _node_text(value, limit=40):
+    """repr of a node-supplied value for error text, cut to `limit` chars plus its length."""
+    r = repr(value)
+    return r if len(r) <= limit else f"{r[:limit]}... ({len(r)} chars)"
+
+
 def _node_int(value):
     """An integer field of a node answer: an int or a string of ASCII decimal digits.
     Anything else (a float such as 1e400, inf, nan or 1800000100.5, a bool, a signed or
-    padded string) raises ValueError rather than being truncated or overflowing."""
+    padded string, non-ASCII digits, more than NODE_INT_MAX_DIGITS digits) raises
+    ValueError rather than being truncated, overflowing or parsed at length."""
     if isinstance(value, int) and not isinstance(value, bool):
         return value
-    if isinstance(value, str) and value.isascii() and value.isdigit():
+    if (isinstance(value, str) and value.isascii() and value.isdigit()
+            and len(value) <= NODE_INT_MAX_DIGITS):
         return int(value)
-    raise ValueError(f"not an integer: {value!r}")
+    raise ValueError(f"not an integer of at most {NODE_INT_MAX_DIGITS} digits: {_node_text(value)}")
 
 
 def _refund_block_problems(info, inv, owed, dup_ts):
@@ -1132,7 +1151,7 @@ def _refund_block_problems(info, inv, owed, dup_ts):
     if not dest or acct.normalise(dest) != owed["to"]:
         problems.append("not sent to the account the refund is owed to")
     if _node_int(info.get("amount", -1)) != owed["amount_raw"]:
-        problems.append(f"amount {info.get('amount')} is not the {owed['amount_raw']} raw owed")
+        problems.append(f"amount {_node_text(info.get('amount'))} is not the {owed['amount_raw']} raw owed")
     if str(info.get("confirmed")).lower() != "true":
         problems.append("not confirmed yet")
     ts = info.get("local_timestamp")

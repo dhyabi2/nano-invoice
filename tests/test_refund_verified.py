@@ -2,6 +2,10 @@
 merchant's word: a confirmed send from the merchant to the duplicate's sender for exactly
 the amount owed, or nothing is recorded. Without rpc= the behaviour is unchanged. FakeLedger, no network."""
 import io
+import os
+import socket
+import threading
+from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 
 import nano_invoice as ni
@@ -290,3 +294,114 @@ class RefundTimestampBounds(_Setup):
         self.assertNotEqual(code, 0)
         self.assertIn("refund_block_unverified", buf.getvalue())
         self.assertEqual(self.refunded(), [])
+
+
+class RefundReadBreaks(_Setup):
+    """A connection that breaks while the node's answer is being read (here: a 200 that
+    promises 1000 bytes, sends one and closes) is refund_block_unverified, an
+    InvoiceError, never a bare http.client / OSError; nothing is recorded."""
+
+    def serve_truncated(self, count):
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(count)
+        self.addCleanup(srv.close)
+
+        def run():
+            for _ in range(count):
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                with conn:
+                    conn.settimeout(5)
+                    data = b""
+                    try:
+                        while b"\r\n\r\n" not in data:
+                            chunk = conn.recv(65536)
+                            if not chunk:
+                                break
+                            data += chunk
+                        head, _, body = data.partition(b"\r\n\r\n")
+                        length = 0
+                        for line in head.split(b"\r\n"):
+                            if line.lower().startswith(b"content-length:"):
+                                length = int(line.split(b":", 1)[1])
+                        while len(body) < length:
+                            chunk = conn.recv(65536)
+                            if not chunk:
+                                break
+                            body += chunk
+                        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n{")
+                    except OSError:
+                        pass
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        self.addCleanup(t.join, 5)
+        return f"http://127.0.0.1:{srv.getsockname()[1]}"
+
+    def test_a_truncated_answer_is_unverified_and_records_nothing(self):
+        url = self.serve_truncated(1)
+        env = {k: v for k, v in os.environ.items() if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
+        env.update(no_proxy="*", NO_PROXY="*")
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(ni.InvoiceError) as cm:
+                ni.record_refund(self.inv.id, self.retry, "AB" * 32, store=self.store, rpc=url, now=CLOCK)
+        self.assertIn("refund_block_unverified", str(cm.exception))
+        self.assertEqual(self.refunded(), [])
+
+    def test_an_oserror_or_http_exception_from_the_node_is_unverified(self):
+        import http.client
+        for exc in (ConnectionResetError("reset"), OSError("broken"), http.client.IncompleteRead(b"{", 999)):
+            class Node:
+                def call(self, action, **p):
+                    raise exc
+            with self.subTest(exc=type(exc).__name__):
+                with self.assertRaises(ni.InvoiceError) as cm:
+                    ni.record_refund(self.inv.id, self.retry, "AB" * 32, store=self.store, rpc=Node(), now=CLOCK)
+                self.assertIn("refund_block_unverified", str(cm.exception))
+                self.assertEqual(self.refunded(), [])
+
+
+class NodeValuesInErrorText(_Setup):
+    """A node-supplied value is cut short in error text, and a digit string longer than
+    any raw amount or unix time is refused before int() reads it."""
+
+    def test_a_long_digit_string_is_refused_before_int(self):
+        from nano_invoice import core
+        self.assertEqual(core._node_int("9" * 40), int("9" * 40))
+        with self.assertRaises(ValueError) as cm:
+            core._node_int("9" * 41)
+        self.assertIn("at most 40 digits", str(cm.exception))
+        for field in ("local_timestamp", "amount"):
+            with self.subTest(field=field):
+                back, _ = self.ledger.send(MERCHANT, PAYER, self.inv.pay_raw, T0 + 100, received=False)
+                self.ledger.blocks[back][field] = "1" * 5000
+                with self.assertRaises(ni.InvoiceError) as cm:
+                    self.rec(back)
+                msg = str(cm.exception)
+                self.assertIn("refund_block_unverified", msg)
+                self.assertNotIn("1" * 41, msg)
+                self.assertIn("5002 chars", msg)
+                self.assertEqual(self.refunded(), [])
+
+    def test_a_long_non_integer_value_is_truncated_in_the_error(self):
+        back, _ = self.ledger.send(MERCHANT, PAYER, self.inv.pay_raw, T0 + 100, received=False)
+        self.ledger.blocks[back]["local_timestamp"] = "x" * 5000
+        with self.assertRaises(ni.InvoiceError) as cm:
+            self.rec(back)
+        self.assertNotIn("x" * 41, str(cm.exception))
+        self.assertIn("refund_block_unverified", str(cm.exception))
+
+    def test_a_long_wrong_amount_is_truncated_in_the_mismatch(self):
+        from nano_invoice import core
+        problems = core._refund_block_problems(
+            {"amount": 10 ** 200, "subtype": "send", "confirmed": "true",
+             "block_account": MERCHANT, "local_timestamp": T0 + 100,
+             "contents": {"link_as_account": PAYER}},
+            self.store.get(self.inv.id), {"to": PAYER, "amount_raw": self.inv.pay_raw}, T0 + 20)
+        text = "; ".join(problems)
+        self.assertIn("is not the", text)
+        self.assertNotIn("0" * 41, text)
+        self.assertIn("201 chars", text)
