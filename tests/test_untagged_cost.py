@@ -106,6 +106,25 @@ class UntaggedCost(unittest.TestCase):
             core._busy_tags = orig
         self.assertEqual(len(reads), 1)
 
+    def test_a_watch_pass_reads_the_merchant_invoices_a_fixed_number_of_times(self):
+        # The pass discards unmatched_candidates, so it must not build them: doing so
+        # read every invoice of the merchant once per open invoice (O(open x all)).
+        def reads_per_pass(k):
+            self.store.conn.execute("DELETE FROM invoices")
+            self.invoices(k)
+            reads = []
+            orig = core._merchant_invoices
+            core._merchant_invoices = lambda store, merchant: reads.append(1) or orig(store, merchant)
+            try:
+                self.observe()
+            finally:
+                core._merchant_invoices = orig
+            return len(reads)
+        self.unrelated(1)
+        small, large = reads_per_pass(5), reads_per_pass(40)
+        self.assertEqual(small, large)
+        self.assertLessEqual(large, 1)
+
     def test_own_and_not_income_sends_do_not_starve_a_real_overpayment(self):
         inv = self.invoices(1)[0]
         real, _ = self.ledger.send(BUYER, MERCHANT, inv.pay_raw + 10 ** 27 + 5, T0 + 5)

@@ -352,7 +352,8 @@ def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_se
         try:
             core.check_invoice(inv_id, rpc=rpc, store=store, own_accounts=own_accounts,
                                not_income=not_income, now=now, max_blocks=max_blocks,
-                               untagged_cache=untagged_cache, busy_tags=busy_tags)
+                               untagged_cache=untagged_cache, busy_tags=busy_tags,
+                               _report_unmatched=False)
         except RpcError as e:
             errors.append({"invoice_id": inv_id, "error": str(e), "effect": "nothing: not settled"})
         except core.InvoiceError as e:

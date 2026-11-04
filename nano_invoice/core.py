@@ -917,7 +917,8 @@ def _accounts(values):
 
 
 def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=None, now=None,
-                  max_blocks=1000, skew_s=CLOCK_SKEW_S, untagged_cache=None, busy_tags=None):
+                  max_blocks=1000, skew_s=CLOCK_SKEW_S, untagged_cache=None, busy_tags=None,
+                  _report_unmatched=True):
     """Read the merchant's account from the public ledger and settle the invoice.
 
     A block pays only if: it is a confirmed send to the merchant, it was sent
@@ -1077,7 +1078,11 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
         "checked_at": now,
         "observations": observations,
         "refunds": refund_hints(store, inv.id),
-        "unmatched_candidates": _unmatched_candidates(store, inv, unmatched, own, excluded, now, skew_s),
+        # A watch pass discards this report (`_report_unmatched=False`): building it
+        # reads every invoice of the merchant, which once per open invoice made a
+        # pass O(open x all).
+        "unmatched_candidates": (_unmatched_candidates(store, inv, unmatched, own, excluded, now, skew_s)
+                                 if _report_unmatched else []),
         "unmatched_notes": unmatched_notes,
     }
 
