@@ -39,7 +39,7 @@ The gate does not have one status. It reports separate fields (`nano-invoice acc
 - A refund can only be recorded against a block the ledger bound to the invoice as a duplicate or late transfer (`test_record_refused_for_a_non_duplicate_block`); an incoming payment or our own receive block is refused (`test_an_incoming_payment_is_not_a_refund_block`, `test_our_receive_block_is_not_a_refund_block`).
 - A second record for the same duplicate is refused (`test_second_record_for_the_same_duplicate_is_refused`).
 - The duplicate's hash is never evidence of work: it appears under `duplicates` and nowhere else.
-- `refund_block` is the merchant's own statement. It is not checked on chain by this tool: check it on two nodes yourself (`TWO-NODE-CHECK.md` in nano-settlement-verify).
+- `refund_block` is the merchant's own statement, not checked on chain, unless it is recorded with `record_refund(..., rpc=...)` (CLI `record-refund ... --verify-on-chain`): then it is read from that node and must be a confirmed send from the merchant to the duplicate's sender for exactly the amount owed, later than the duplicate (`refund_block_mismatch` otherwise; `refund_block_unverified` for an unreadable answer); the result carries `verified_on_chain: true`. One node is one node's view: for more, check it on a second node yourself (`TWO-NODE-CHECK.md` in nano-settlement-verify).
 
 ## One line to see it
 

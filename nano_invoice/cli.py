@@ -238,7 +238,13 @@ def build_parser():
     rr.add_argument("--invoice", required=True)
     rr.add_argument("--duplicate-block", required=True, help="the duplicate/late transfer's send block")
     rr.add_argument("--refund-block", required=True, help="your refund's own send block")
-    rr.add_argument("--at", type=int, help="unix seconds the refund was sent (default now)")
+    rr.add_argument("--at", type=int, help="unix seconds the refund was sent (default now; with --verify-on-chain "
+                         "the refund block's local_timestamp is used, and a different --at is refused)")
+    rr.add_argument("--verify-on-chain", action="store_true",
+                    help="read the refund block from the node given by --rpc and refuse it unless it is "
+                         "a confirmed send of the amount owed to the duplicate's sender, after the duplicate")
+    rr.add_argument("--now", type=int, help="injected clock, unix seconds (for tests): with --verify-on-chain a "
+                         "refund block timestamped more than a day after it is refused")
 
     s = sub.add_parser("show", help="print the stored invoice and its recorded blocks")
     s.add_argument("--invoice", required=True)
@@ -448,7 +454,8 @@ def main(argv=None):
                                         refund_window_s=args.refund_window_s))
         elif args.cmd == "record-refund":
             _out(core.record_refund(args.invoice, args.duplicate_block, args.refund_block,
-                                    store=store, at=args.at))
+                                    store=store, at=args.at,
+                                    rpc=rpc if args.verify_on_chain else None, now=args.now))
         elif args.cmd == "show":
             inv = store.get(args.invoice)
             _out({"invoice": inv.to_dict(),

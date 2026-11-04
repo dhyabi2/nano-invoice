@@ -17,6 +17,7 @@ import contextlib
 import dataclasses
 import decimal
 import hashlib
+import http.client
 import json
 import secrets
 import sqlite3
@@ -25,7 +26,7 @@ import time
 from . import account as acct
 from . import nano_sig
 from . import receipt_v2 as v2
-from .rpc import as_rpc
+from .rpc import RpcError, as_rpc
 
 RAW_PER_XNO = 10 ** 30
 TAG_MODULUS = 10 ** 6
@@ -1267,26 +1268,64 @@ def _epoch_s(value, name):
     return value
 
 
-def record_refund(invoice, duplicate_send_block, refund_send_block, store=None, at=None):
+# A verified refund block's local_timestamp more than this far ahead of the local clock is
+# refused as refund_block_unverified: a node that reports a time in the future cannot be
+# used to decide whether the refund was late.
+REFUND_TS_MAX_AHEAD_S = 86400
+
+
+def record_refund(invoice, duplicate_send_block, refund_send_block, store=None, at=None, rpc=None,
+                  now=None):
     """Record that the merchant sent the refund owed for one duplicate/late transfer of
     this invoice, as the refund's own send block. Refused for a block that is not a
     duplicate/late transfer of this invoice, and for a second record of the same one.
     The refund block is the merchant's statement: it is not checked on chain, but a block
     the ledger already holds as an incoming send, a short send, or one of our receive
-    blocks is refused (it cannot be our refund)."""
+    blocks is refused (it cannot be our refund).
+
+    With `rpc=` the statement is checked instead of taken on trust: the refund block is
+    read from the ledger and must be a confirmed send from the merchant to the duplicate's
+    sender for exactly the amount owed, whose node `local_timestamp` is strictly later than
+    the duplicate's recorded block time (so a send made before the duplicate existed cannot
+    be passed off as its refund); anything else raises `refund_block_mismatch` and records
+    nothing. That includes a node that gives no `local_timestamp`, or a duplicate with no
+    recorded block time: order cannot be proven, so it is refused (fail closed). A node
+    error, a connection that breaks while the answer is read, or an unreadable
+    block_info raises `refund_block_unverified` (an InvoiceError), and records nothing.
+    So does an answer whose `amount` or `local_timestamp` is not a plain integer (an
+    int, or a string of at most NODE_INT_MAX_DIGITS ASCII decimal digits: a float, a
+    bool, a signed or padded string, non-ASCII digits or a longer string is refused);
+    a well-formed but wrong value is `refund_block_mismatch`. A block this ledger received is still `refund_block_is_incoming`.
+    The result then carries `verified_on_chain: True`, and the refund's recorded time
+    (`recorded_at`, which `refunded_late` is computed from) is the verified block's
+    `local_timestamp`, not `at`: a given `at` that differs from it is refused as
+    `refund_block_mismatch`. The verified `local_timestamp` must be epoch seconds that
+    fit SQLite's INTEGER (0 <= t < 2**63, as `at`) and be no more than
+    REFUND_TS_MAX_AHEAD_S (one day) ahead of `now` (default: the local clock); otherwise
+    `refund_block_unverified` is raised and nothing is recorded."""
     store = _require_store(store)
     inv = store.get(invoice)
     dup = _block_hash(duplicate_send_block, "duplicate_send_block")
     ref = _block_hash(refund_send_block, "refund_send_block")
-    at = int(time.time()) if at is None else _epoch_s(at, "at")
+    stated_at = None if at is None else _epoch_s(at, "at")
+    at = int(time.time()) if stated_at is None else stated_at
+    verified_ts = None
+    if rpc is not None:
+        # The more specific refusal first, then the ledger read (outside the write lock).
+        _refuse_incoming_refund_block(store.conn, ref)
+        clock = int(time.time()) if now is None else _epoch_s(now, "now")
+        verified_ts = _verify_refund_block(store, inv, dup, ref, rpc, clock)
+        if verified_ts is not None:
+            # Verified on chain: the refund's time is the block's, never the merchant's word,
+            # so refunded_late is computed from the ledger. A stated `at` that disagrees is
+            # refused rather than silently replaced.
+            if stated_at is not None and stated_at != verified_ts:
+                raise InvoiceError(f"refund_block_mismatch: at={stated_at} disagrees with the "
+                                   f"refund block's local_timestamp {verified_ts}; omit at, or "
+                                   f"pass the block time; nothing recorded")
+            at = verified_ts
     with store.tx() as c:
-        # UPPER(): a block stored in lower case through Store.record is still the same block.
-        if c.execute("SELECT 1 FROM payments WHERE ? IN (UPPER(send_block), UPPER(receive_block))"
-                     " UNION ALL SELECT 1 FROM short_sends"
-                     " WHERE ? IN (UPPER(send_block), UPPER(receive_block))",
-                     (ref, ref)).fetchone():
-            raise InvoiceError(f"refund_block_is_incoming: {ref} is a payment this ledger "
-                               f"received, not a refund sent")
+        _refuse_incoming_refund_block(c, ref)
         p = c.execute("SELECT invoice_id, kind, send_block FROM payments"
                       " WHERE UPPER(send_block) = ? AND invoice_id = ?", (dup, inv.id)).fetchone()
         if p is None or p["invoice_id"] != inv.id or p["kind"] not in DUPLICATE_KINDS:
@@ -1297,12 +1336,115 @@ def record_refund(invoice, duplicate_send_block, refund_send_block, store=None, 
         if prior is not None:
             raise InvoiceError(f"refund_already_recorded: {dup} was refunded by "
                                f"{prior['refund_block']}")
+        if rpc is not None and verified_ts is None:
+            # Never record verified_on_chain without a verified block time (fail closed).
+            raise InvoiceError(f"refund_block_unverified: {ref} could not be checked against "
+                               f"{dup}; nothing recorded")
         try:
             c.execute("INSERT INTO refunds_sent(send_block, invoice_id, refund_block, recorded_at)"
                       " VALUES (?,?,?,?)", (p["send_block"], inv.id, ref, at))
         except sqlite3.IntegrityError as e:
             raise InvoiceError(f"refund_block_reused: {ref} already recorded: {e}") from e
-    return {"invoice_id": inv.id, "send_block": dup, "refund_block": ref, "recorded_at": at}
+    out = {"invoice_id": inv.id, "send_block": dup, "refund_block": ref, "recorded_at": at}
+    if rpc is not None:
+        out["verified_on_chain"] = True
+    return out
+
+
+def _refuse_incoming_refund_block(c, ref):
+    # UPPER(): a block stored in lower case through Store.record is still the same block.
+    if c.execute("SELECT 1 FROM payments WHERE ? IN (UPPER(send_block), UPPER(receive_block))"
+                 " UNION ALL SELECT 1 FROM short_sends"
+                 " WHERE ? IN (UPPER(send_block), UPPER(receive_block))",
+                 (ref, ref)).fetchone():
+        raise InvoiceError(f"refund_block_is_incoming: {ref} is a payment this ledger "
+                           f"received, not a refund sent")
+
+
+def _verify_refund_block(store, inv, dup, ref, rpc, now):
+    """Read `ref` from the ledger; raise unless it is the refund owed for `dup` of `inv`.
+    Returns the block's verified `local_timestamp` (None only when the checks in
+    record_refund will refuse the record anyway)."""
+    row = store.conn.execute("SELECT * FROM payments WHERE UPPER(send_block) = ? AND invoice_id = ?",
+                             (dup, inv.id)).fetchone()
+    if row is None or _payment(row)["kind"] not in DUPLICATE_KINDS:
+        return None     # the ordinary checks below name the real problem (not_a_duplicate)
+    owed = refund_instruction(_payment(row), store=store)
+    if owed is None:
+        return None     # already refunded: the checks below raise refund_already_recorded
+    try:
+        info = as_rpc(rpc).call("block_info", json_block="true", hash=ref)
+        raw_ts = info.get("local_timestamp")
+        ts = None if raw_ts is None or raw_ts == "" else _node_int(raw_ts)
+        # The range is checked before the order: an int -5 is unverified, as "-5" is.
+        in_range = ts is None or 0 <= ts < 2 ** 63
+        problems = _refund_block_problems(info, inv, owed, _payment(row)["block_ts"]) if in_range else []
+    except (RpcError, KeyError, TypeError, ValueError, AttributeError, OverflowError,
+            RecursionError, OSError, http.client.HTTPException) as e:
+        # OSError / HTTPException: the connection broke while the answer was being read.
+        # RecursionError: a deeply nested JSON answer.
+        raise InvoiceError(f"refund_block_unverified: {ref} could not be read from the ledger "
+                           f"({type(e).__name__}: {e}); nothing recorded") from e
+    if not in_range:
+        raise InvoiceError(f"refund_block_unverified: {ref} has local_timestamp {ts}, not epoch "
+                           f"seconds in 0..2**63-1; nothing recorded")
+    if problems:
+        raise InvoiceError(f"refund_block_mismatch: {ref} is not the refund for {dup}: " + "; ".join(problems))
+    if ts > now + REFUND_TS_MAX_AHEAD_S:
+        raise InvoiceError(f"refund_block_unverified: {ref} has local_timestamp {ts}, more than "
+                           f"{REFUND_TS_MAX_AHEAD_S} s ahead of now ({now}); nothing recorded")
+    return ts
+
+
+# No raw amount (max supply is under 2**128, 39 digits) or unix time needs more digits.
+NODE_INT_MAX_DIGITS = 40
+
+
+def _node_text(value, limit=40):
+    """repr of a node-supplied value for error text, cut to `limit` chars plus its length."""
+    r = repr(value)
+    return r if len(r) <= limit else f"{r[:limit]}... ({len(r)} chars)"
+
+
+def _node_int(value):
+    """An integer field of a node answer: an int or a string of ASCII decimal digits.
+    Anything else (a float such as 1e400, inf, nan or 1800000100.5, a bool, a signed or
+    padded string, non-ASCII digits, more than NODE_INT_MAX_DIGITS digits) raises
+    ValueError rather than being truncated, overflowing or parsed at length."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    if (isinstance(value, str) and value.isascii() and value.isdigit()
+            and len(value) <= NODE_INT_MAX_DIGITS):
+        return int(value)
+    raise ValueError(f"not an integer of at most {NODE_INT_MAX_DIGITS} digits: {_node_text(value)}")
+
+
+def _refund_block_problems(info, inv, owed, dup_ts):
+    contents = info.get("contents") or {}
+    dest = contents.get("link_as_account") or contents.get("destination")
+    problems = []
+    if _subtype(info) != "send":
+        problems.append(f"block is a {_node_text(_subtype(info))}, not a send")
+    if not info.get("block_account") or acct.normalise(info["block_account"]) != inv.merchant:
+        problems.append("not sent from the merchant's account")
+    if not dest or acct.normalise(dest) != owed["to"]:
+        problems.append("not sent to the account the refund is owed to")
+    if _node_int(info.get("amount", -1)) != owed["amount_raw"]:
+        problems.append(f"amount {_node_text(info.get('amount'))} is not the {owed['amount_raw']} raw owed")
+    if str(info.get("confirmed")).lower() != "true":
+        problems.append("not confirmed yet")
+    ts = info.get("local_timestamp")
+    ts = 0 if ts is None or ts == "" else _node_int(ts)
+    if not ts:
+        problems.append("the node gives no local_timestamp for it, so it cannot be shown to "
+                        "come after the duplicate (refused, not assumed)")
+    elif dup_ts is None or int(dup_ts) <= 0:
+        problems.append("the duplicate has no recorded block time, so the refund cannot be "
+                        "shown to come after it (refused, not assumed)")
+    elif ts <= int(dup_ts):
+        problems.append(f"sent at {ts}, not after the duplicate it would refund (block time {dup_ts}): "
+                        "a send made before the duplicate existed is not its refund")
+    return problems
 
 
 def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
