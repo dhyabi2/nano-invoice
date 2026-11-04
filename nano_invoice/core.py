@@ -795,7 +795,14 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
     this node) answers repeated lookups without an RPC call. Whether a send is
     tagged is decided by the amount the node lists (receivable or history): one
     listed as untagged is never returned as tagged, whatever its lookup says, so a
-    tagged result is always read fresh, never served from `untagged_cache`."""
+    tagged result is always read fresh, never served from `untagged_cache`. Both
+    directions of a disagreement between the list and the block are left unbound:
+    a send listed as untagged whose block amount ends in the tag is skipped; a send
+    listed as tagged whose block amount does not (e.g. listed pay_raw, block
+    pay_raw + 7) is returned with `tag_match` False, so it is never bound or settled
+    by the listed amount and at most reported as an untagged candidate.
+    `untagged_cache` entries are keyed by (merchant, block hash), so a cache shared
+    across merchants never serves one merchant's answer to another."""
     rpc = as_rpc(rpc)
     found = {}
     budget = [UNTAGGED_LOOKUP_CAP]
@@ -865,7 +872,7 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
             sender = info.get("source") if isinstance(info, dict) else None
             if skipped(h, sender):
                 continue
-            ob = untagged_lookup(("send", h.upper()), h, lambda h=h: _resolve_send(rpc, merchant, h))
+            ob = untagged_lookup(("send", merchant, h.upper()), h, lambda h=h: _resolve_send(rpc, merchant, h))
             # Tag-ness is decided by the node's list: a send listed as untagged is never
             # settled, even if block_info (or the untagged cache) says it ends in the tag.
             # A tagged send is always read fresh, below; this one is skipped, as before.
@@ -905,7 +912,7 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
 
             listed_tagged = tagged(int(e["amount"]))
             ob = (resolve() if listed_tagged
-                  else untagged_lookup(("receive", str(e["hash"]).upper()), e["hash"], resolve))
+                  else untagged_lookup(("receive", merchant, str(e["hash"]).upper()), e["hash"], resolve))
             if ob is None or not wanted(ob["amount_raw"]):
                 continue
             if not listed_tagged and tagged(ob["amount_raw"]):

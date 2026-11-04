@@ -263,7 +263,7 @@ class TestListedTagNessIsKept(unittest.TestCase):
         send, _ = self.ledger.send(BUYER, MERCHANT, self.inv.pay_raw, T0 + 10, received=False)
         self.ledger.receivable[MERCHANT][send]["amount"] = str(self.inv.pay_raw + 7)
         cache = core.UntaggedLookups()
-        cache.put(("send", send.upper()), core._resolve_send(self.ledger, MERCHANT, send))
+        cache.put(("send", MERCHANT, send.upper()), core._resolve_send(self.ledger, MERCHANT, send))
         n = len(self.ledger.calls)
         res = ni.check_invoice(self.inv, rpc=self.ledger, store=self.store, now=T0 + 60,
                                untagged_cache=cache)
@@ -277,6 +277,37 @@ class TestListedTagNessIsKept(unittest.TestCase):
                 e["amount"] = str(self.inv.pay_raw + 7)
         res = ni.check_invoice(self.inv, rpc=self.ledger, store=self.store, now=T0 + 60)
         self.assert_not_settled(res)
+
+    def test_history_listed_tagged_but_block_untagged_is_not_bound(self):
+        # The list says exactly pay_raw (tagged); the block says pay_raw + 7. It is
+        # not bound by the listed amount: the invoice stays open and the send is at
+        # most an unmatched candidate.
+        send, rh = self.ledger.send(BUYER, MERCHANT, self.inv.pay_raw + 7, T0 + 10)
+        for e in self.ledger.history[MERCHANT]:
+            if e["hash"] == rh:
+                e["amount"] = str(self.inv.pay_raw)
+        res = ni.check_invoice(self.inv, rpc=self.ledger, store=self.store, now=T0 + 60)
+        self.assert_not_settled(res)
+        self.assertEqual([(u["send_block"], u["excess_raw"]) for u in res["unmatched_candidates"]],
+                         [(send, "7")])
+
+    def test_a_cache_shared_across_merchants_is_keyed_by_merchant(self):
+        other = account("merchant-2")
+        inv2 = ni.create_invoice(other, XNO // 2, "order-2", 3600, store=self.store, now=T0)
+        send, _ = self.ledger.send(BUYER, MERCHANT, self.inv.pay_raw + 7, T0 + 10, received=False)
+        # A node that also lists the same send as receivable for the other merchant.
+        self.ledger.receivable[other] = {send: {"amount": str(inv2.pay_raw + 7), "source": BUYER}}
+        cache = core.UntaggedLookups()
+        res1 = ni.check_invoice(self.inv, rpc=self.ledger, store=self.store, now=T0 + 60,
+                                untagged_cache=cache)
+        self.assertEqual([u["send_block"] for u in res1["unmatched_candidates"]], [send])
+        n = len(self.ledger.calls)
+        res2 = ni.check_invoice(inv2, rpc=self.ledger, store=self.store, now=T0 + 60,
+                                untagged_cache=cache)
+        # Looked up afresh for the other merchant, not served MERCHANT's answer.
+        self.assertTrue(any(a == "block_info" and p["hash"].upper() == send
+                            for a, p in self.ledger.calls[n:]))
+        self.assertEqual(res2.get("unmatched_candidates") or [], [])
 
     def test_a_consistent_tagged_send_still_settles(self):
         self.ledger.send(BUYER, MERCHANT, self.inv.pay_raw, T0 + 10, received=False)
