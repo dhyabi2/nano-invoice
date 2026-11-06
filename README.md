@@ -420,6 +420,13 @@ and a node that cannot be read changes nothing at all: no invoice settled, no st
 event emitted. `observe` with neither `--on-settle` nor `--webhook` exits 64 — an observer with
 nowhere to release to is a silent loop.
 
+**An unreadable node is not unpaid.** A read that raises (an RPC error, or an answer too malformed to
+interpret) leaves the invoice open and is counted, per invoice, in the store table `observe_unknowns`;
+a clean read resets the count. Each `errors` entry carries `consecutive_unknowns`, and once that
+reaches `unknown_limit` (default 3, a keyword to `observe_once`/`observe`) it is marked `raised: true`
+and listed in `detail["unknown_raised"]`, so a node that keeps failing is reported, not silently
+treated as "no payment yet".
+
 ### What `observe` does NOT claim
 
 It does not prove the goods were any good, that the payer is anyone in particular (an address is not

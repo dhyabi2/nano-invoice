@@ -64,6 +64,7 @@ MAX_BACKOFF_S = 300
 DEFAULT_INTERVAL_S = 5
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_RELEASE_TIMEOUT_S = 30
+DEFAULT_UNKNOWN_LIMIT = 3
 USER_AGENT = "nano-invoice-observer/1 (+https://github.com/dhyabi2/nano-invoice)"
 
 # `delivery_id` and not `send_block`, which is what the spec called it, because
@@ -84,6 +85,20 @@ CREATE TABLE IF NOT EXISTS fulfillment(
     CHECK (state IN ('pending','released','release_failed','backfill_skipped'))
 );
 CREATE INDEX IF NOT EXISTS fulfillment_owed ON fulfillment(state, next_attempt_at);
+"""
+
+# An unreadable node is not unpaid. One row per open invoice whose last read(s)
+# failed: how many passes in a row it could not be observed. The row is deleted
+# on the first clean read, so "no row" means zero. Its own table rather than a
+# column on `invoices`, so an observer pass never rewrites an invoice row
+# because of an unknown, and an existing database file gains it additively.
+UNKNOWN_SCHEMA = """
+CREATE TABLE IF NOT EXISTS observe_unknowns(
+  invoice_id  TEXT PRIMARY KEY REFERENCES invoices(id),
+  consecutive INTEGER NOT NULL,
+  last_error  TEXT,
+  last_at     INTEGER NOT NULL
+);
 """
 
 
@@ -158,7 +173,29 @@ def _ensure_schema(store):
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fulfillment'").fetchone()
     first = row is None
     store.conn.executescript(FULFILLMENT_SCHEMA)
+    store.conn.executescript(UNKNOWN_SCHEMA)
     return first
+
+
+def _note_unknown(store, inv_id, error, now):
+    """One more pass in a row on which this invoice could not be read."""
+    with store.tx() as c:
+        c.execute(
+            "INSERT INTO observe_unknowns(invoice_id, consecutive, last_error, last_at)"
+            " VALUES (?,1,?,?) ON CONFLICT(invoice_id) DO UPDATE SET"
+            " consecutive = consecutive + 1, last_error = excluded.last_error,"
+            " last_at = excluded.last_at", (inv_id, error, now))
+    return store.conn.execute("SELECT consecutive FROM observe_unknowns WHERE invoice_id = ?",
+                              (inv_id,)).fetchone()["consecutive"]
+
+
+def _clear_unknown(store, inv_id):
+    # Only write when there is a streak to end, so a clean pass over a store
+    # with no unknowns leaves its bytes alone.
+    if store.conn.execute("SELECT 1 FROM observe_unknowns WHERE invoice_id = ?",
+                          (inv_id,)).fetchone():
+        with store.tx() as c:
+            c.execute("DELETE FROM observe_unknowns WHERE invoice_id = ?", (inv_id,))
 
 
 def _backoff(interval, attempts):
@@ -306,7 +343,8 @@ def _finish(store, delivery_id, now, error, max_attempts, interval, attempts):
 def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_settle=None,
                  webhook=None, max_attempts=DEFAULT_MAX_ATTEMPTS, interval=DEFAULT_INTERVAL_S,
                  catch_up=False, release_timeout=DEFAULT_RELEASE_TIMEOUT_S, max_blocks=1000,
-                 own_accounts=(), not_income=None, untagged_cache=None):
+                 own_accounts=(), not_income=None, untagged_cache=None,
+                 unknown_limit=DEFAULT_UNKNOWN_LIMIT):
     """One pass: read the ledger for every open invoice of `merchant`, then
     release every settlement this store owes a release on.
 
@@ -320,6 +358,12 @@ def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_se
     list of `Event` so the ordinary caller can iterate it, and it carries the
     pass's own account of itself on `.detail` and the unreadable invoices on
     `.errors`.
+
+    An unreadable node is not unpaid. Each `.errors` entry carries
+    `consecutive_unknowns`, the number of passes in a row that invoice could not
+    be read (persisted in the store), and `raised`, true once that reaches
+    `unknown_limit`; `.detail["unknown_raised"]` lists those invoices. The
+    invoice itself stays open either way: an unknown never moves state.
     """
     store = core._require_store(store)
     if merchant is None:
@@ -354,10 +398,12 @@ def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_se
                                not_income=not_income, now=now, max_blocks=max_blocks,
                                untagged_cache=untagged_cache, busy_tags=busy_tags,
                                _report_unmatched=False)
-        except RpcError as e:
-            errors.append({"invoice_id": inv_id, "error": str(e), "effect": "nothing: not settled"})
-        except core.InvoiceError as e:
-            errors.append({"invoice_id": inv_id, "error": str(e), "effect": "nothing: not settled"})
+        except (RpcError, core.InvoiceError) as e:
+            n = _note_unknown(store, inv_id, str(e), now)
+            errors.append({"invoice_id": inv_id, "error": str(e), "effect": "nothing: not settled",
+                           "consecutive_unknowns": n, "raised": n >= unknown_limit})
+        else:
+            _clear_unknown(store, inv_id)
 
     # 2. Record what is owed. The PRIMARY KEY is the exactly-once key, so two
     #    observers racing one settling block insert one row between them.
@@ -400,7 +446,8 @@ def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_se
                   "owed": len(owed), "released": sum(1 for e in events if e.released),
                   "release_failed": sum(1 for e in events if e.state == "release_failed"),
                   "pending": sum(1 for e in events if e.state == "pending"),
-                  "backfill_skipped": backfilled, "first_pass": first_pass, "errors": errors}
+                  "backfill_skipped": backfilled, "first_pass": first_pass, "errors": errors,
+                  "unknown_raised": [e["invoice_id"] for e in errors if e["raised"]]}
     out.errors = errors
     return out
 

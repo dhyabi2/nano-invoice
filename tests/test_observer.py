@@ -213,16 +213,18 @@ class TestReleaseExactlyOnce(Harness):
 
         # The first pass creates the fulfillment table, so compare across two
         # dead passes: the question is whether an unread node moves anything.
+        # The one table allowed to change is observe_unknowns, which counts the
+        # unread passes themselves (tests/test_unknown_streak.py).
+        def dump():
+            return [line for line in self.store.conn.iterdump()
+                    if "observe_unknowns" not in line]
+
         self.observe(on_settle=self.writer(), now=NOW + 60, rpc=Dead())
-        self.store.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        with open(self.path, "rb") as fh:
-            before = fh.read()
+        before = dump()
         events = self.observe(on_settle=self.writer(), now=NOW + 120, rpc=Dead())
-        self.store.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
         self.assertEqual(list(events), [])
-        with open(self.path, "rb") as fh:
-            self.assertEqual(fh.read(), before, "an unread node moved the store")
+        self.assertEqual(dump(), before, "an unread node moved the store")
         self.assertEqual(self.store.get(inv.id).state, "open")
         self.assertEqual(self.rows(), [])
         self.assertEqual(self.released(), [])
