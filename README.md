@@ -421,11 +421,15 @@ event emitted. `observe` with neither `--on-settle` nor `--webhook` exits 64 —
 nowhere to release to is a silent loop.
 
 **An unreadable node is not unpaid.** A read that raises (an RPC error, or an answer too malformed to
-interpret) leaves the invoice open and is counted, per invoice, in the store table `observe_unknowns`;
-a clean read resets the count. Each `errors` entry carries `consecutive_unknowns`, and once that
-reaches `unknown_limit` (default 3, a keyword to `observe_once`/`observe`) it is marked `raised: true`
-and listed in `detail["unknown_raised"]`, so a node that keeps failing is reported, not silently
-treated as "no payment yet".
+interpret: one that is not a JSON object, a `receivable` answer with no `blocks`, an `account_history`
+answer with no `history`, or a `block_info` answer with no `block_account` - so a bare `{}` counts as
+unknown, never as an empty, unpaid read) leaves the invoice open and is counted, per invoice, in the
+store table `observe_unknowns`; a clean read resets the count. Each `errors` entry carries
+`consecutive_unknowns`, and once that reaches `unknown_limit` (default 3, a keyword to
+`observe_once`/`observe`) it is marked `raised: true` and listed in `detail["unknown_streak_raised"]`,
+so a node that keeps failing is reported, not silently treated as "no payment yet".
+`detail["unknown_raised"]` is wider than its name: it lists every raised invoice, whichever trigger
+raised it (the unknown streak here, or the silence below).
 
 That pass count is the secondary trigger. The primary one is time since the last good read, because
 a count drifts with the polling interval (three failures thirty seconds apart and three six hours
@@ -452,6 +456,17 @@ new), and `detail["raise_new"]` lists those invoices - page on `raise_new`, not 
 `settle_slack` (default 0 seconds): the tightening is taken against `honour_by` = `expires_at` minus
 `settle_slack`, the last moment a payment can still be honoured when settlement is slow; each entry
 reports `honour_by`.
+
+These knobs are checked before the first pass and a bad one raises `InvalidObserverOption` (a
+`ValueError`), never mid-loop: `unknown_limit` must be an `int` of at least 1 (not a `bool`, not
+`"3"`); `stale_after` and `stale_floor` must be finite numbers of seconds of at least 1;
+`min_reaction`, `raise_every` and `settle_slack` finite numbers of at least 0.
+
+The streak, the last good read and the raise ceiling are the observer's own notes, so a clean pass
+does write to the store (`observe_reads` on every good read). A store that refuses one of these writes
+(read-only, locked) does not abort the pass: the write is listed in `detail["bookkeeping_errors"]`, the
+pass's values are still reported from memory, and a raise whose ceiling could not be recorded is
+reported as new. None of the three tables references `invoices`, so they never block deleting one.
 
 ### What `observe` does NOT claim
 

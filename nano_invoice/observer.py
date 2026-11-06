@@ -47,6 +47,8 @@ seen. The only thing you take from us is a hint to go and look.
    is passed. This is an added error case, not a loosened one.
 """
 import json
+import math
+import sqlite3
 import subprocess
 import time
 import urllib.error
@@ -106,9 +108,12 @@ CREATE INDEX IF NOT EXISTS fulfillment_owed ON fulfillment(state, next_attempt_a
 # on the first clean read, so "no row" means zero. Its own table rather than a
 # column on `invoices`, so an observer pass never rewrites an invoice row
 # because of an unknown, and an existing database file gains it additively.
+# No REFERENCES clause, for the same reason as observe_reads below: with
+# foreign_keys on, a streak row must not stop an operator deleting an invoice.
+# A file created while it had one is rebuilt without it (_ensure_schema).
 UNKNOWN_SCHEMA = """
 CREATE TABLE IF NOT EXISTS observe_unknowns(
-  invoice_id  TEXT PRIMARY KEY REFERENCES invoices(id),
+  invoice_id  TEXT PRIMARY KEY,
   consecutive INTEGER NOT NULL,
   last_error  TEXT,
   last_at     INTEGER NOT NULL
@@ -153,6 +158,72 @@ class AddressChecksumInvalid(ObserverError):
 class ReleaseNotConfigured(ObserverError):
     """Neither a command nor a webhook was given, so there is nothing to release
     to. Emitting events nobody receives is not an observer; it is a silent loop."""
+
+
+class InvalidObserverOption(ObserverError, ValueError):
+    """An observer knob that is not usable. Refused before the first pass, so a
+    bad value can never make every invoice raise, or kill the loop on a later
+    pass with a TypeError."""
+
+
+# (name, minimum). Counts must be real ints (not bool, not "3"); durations may be
+# int or float but must be finite. A minimum of 0 is where 0 has a documented
+# meaning (raise_every=0: every raise is new; settle_slack=0: honour_by is
+# expires_at; min_reaction=0: tighten all the way to the floor).
+_COUNT_OPTIONS = (("unknown_limit", 1),)
+_DURATION_OPTIONS = (("stale_after", 1), ("stale_floor", 1), ("min_reaction", 0),
+                     ("raise_every", 0), ("settle_slack", 0))
+
+
+def validate_options(**options):
+    """Check the observer's silence/raise knobs; raise InvalidObserverOption on
+    the first bad one. Names not listed here are ignored."""
+    for name, minimum in _COUNT_OPTIONS:
+        if name not in options:
+            continue
+        v = options[name]
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise InvalidObserverOption(f"{name} must be an int >= {minimum}, got {v!r}")
+        if v < minimum:
+            raise InvalidObserverOption(f"{name} must be >= {minimum}, got {v!r}")
+    for name, minimum in _DURATION_OPTIONS:
+        if name not in options:
+            continue
+        v = options[name]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or (
+                isinstance(v, float) and not math.isfinite(v)):
+            raise InvalidObserverOption(
+                f"{name} must be a finite number of seconds >= {minimum}, got {v!r}")
+        if v < minimum:
+            raise InvalidObserverOption(f"{name} must be >= {minimum} seconds, got {v!r}")
+
+
+class _ShapeCheckedRpc:
+    """Pass reads through, but turn an answer too malformed to interpret into an
+    RpcError, so the observer counts it as an unknown instead of a good read.
+    An answer of `{}` to `receivable` or `account_history` would otherwise read
+    as "no blocks, no history": a clean, empty, unpaid read. Well-formed answers
+    are returned unchanged, so matching sees exactly what it saw before."""
+
+    def __init__(self, rpc):
+        self._rpc = rpc
+
+    def call(self, action, **params):
+        data = self._rpc.call(action, **params)
+        if not isinstance(data, dict):
+            raise RpcError(f"{action}: malformed answer (not an object)")
+        if action == "receivable":
+            blocks = data.get("blocks", None)
+            if "blocks" not in data or not (blocks == "" or isinstance(blocks, (dict, list))):
+                raise RpcError(f"{action}: malformed answer (no usable 'blocks')")
+        elif action == "account_history":
+            hist = data.get("history", None)
+            if "history" not in data or not (hist == "" or isinstance(hist, list)):
+                raise RpcError(f"{action}: malformed answer (no usable 'history')")
+        elif action == "block_info":
+            if "block_account" not in data:
+                raise RpcError(f"{action}: malformed answer (no 'block_account')")
+        return data
 
 
 class Event:
@@ -211,9 +282,36 @@ def _ensure_schema(store):
     first = row is None
     store.conn.executescript(FULFILLMENT_SCHEMA)
     store.conn.executescript(UNKNOWN_SCHEMA)
+    _drop_unknowns_fk(store)
     store.conn.executescript(READS_SCHEMA)
     store.conn.executescript(RAISES_SCHEMA)
     return first
+
+
+def _drop_unknowns_fk(store):
+    """Rebuild an observe_unknowns table that was created with a foreign key to
+    invoices, keeping its rows. A no-op (and no write) once it has none."""
+    if not store.conn.execute("PRAGMA foreign_key_list(observe_unknowns)").fetchall():
+        return
+    with store.tx() as c:
+        c.execute("CREATE TABLE observe_unknowns_new(invoice_id TEXT PRIMARY KEY,"
+                  " consecutive INTEGER NOT NULL, last_error TEXT, last_at INTEGER NOT NULL)")
+        c.execute("INSERT INTO observe_unknowns_new SELECT invoice_id, consecutive,"
+                  " last_error, last_at FROM observe_unknowns")
+        c.execute("DROP TABLE observe_unknowns")
+        c.execute("ALTER TABLE observe_unknowns_new RENAME TO observe_unknowns")
+
+
+def _bookkeep(notes, what, fn, *args, fallback=None):
+    """Run one write to the observer's own note tables (observe_unknowns,
+    observe_reads, observe_raises). These are notes about reads, not invoice
+    state, so a store that cannot take the write (read-only, locked) must not
+    abort the pass: the failure is listed in `notes` and `fallback` is used."""
+    try:
+        return fn(*args)
+    except sqlite3.OperationalError as e:
+        notes.append({"write": what, "invoice_id": args[1], "error": str(e)})
+        return fallback() if callable(fallback) else fallback
 
 
 def _note_good_read(store, inv_id, now):
@@ -273,8 +371,9 @@ def _note_unknown(store, inv_id, error, now):
 
 
 def _clear_unknown(store, inv_id):
-    # Only write when there is a streak to end, so a clean pass over a store
-    # with no unknowns leaves its bytes alone.
+    # Only write when there is a streak to end. (A clean pass still writes
+    # observe_reads, the time of each good read, so it does not leave the file
+    # untouched; those writes go through _bookkeep and cannot abort a pass.)
     if store.conn.execute("SELECT 1 FROM observe_unknowns WHERE invoice_id = ?",
                           (inv_id,)).fetchone():
         with store.tx() as c:
@@ -447,8 +546,12 @@ def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_se
     An unreadable node is not unpaid. Each `.errors` entry carries
     `consecutive_unknowns`, the number of passes in a row that invoice could not
     be read (persisted in the store), and `raised`, true once that reaches
-    `unknown_limit`; `.detail["unknown_raised"]` lists those invoices. The
-    invoice itself stays open either way: an unknown never moves state.
+    `unknown_limit`; `.detail["unknown_streak_raised"]` lists those invoices,
+    and `.detail["unknown_raised"]` lists every raised invoice, whichever
+    trigger raised it. A malformed answer (`{}` included) counts as unknown.
+    The invoice itself stays open either way: an unknown never moves state.
+    Bad knobs raise InvalidObserverOption before any read; note-table writes
+    the store refuses are listed in `.detail["bookkeeping_errors"]`.
 
     The primary trigger is time, not pass count. Per open invoice the store
     keeps `last_good_read`, the time of the last pass whose read succeeded (its
@@ -473,6 +576,9 @@ def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_se
     0 makes every raised pass new). `.detail["raise_new"]` lists those
     invoices; a caller that pages on alerts should page on `raise_new`.
     """
+    validate_options(unknown_limit=unknown_limit, stale_after=stale_after,
+                     stale_floor=stale_floor, min_reaction=min_reaction,
+                     raise_every=raise_every, settle_slack=settle_slack)
     store = core._require_store(store)
     if merchant is None:
         raise ObserverError("merchant is required")
@@ -483,10 +589,11 @@ def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_se
     if not on_settle and not webhook:
         raise ReleaseNotConfigured("pass on_settle (argv) or webhook (url), or both")
     now = int(time.time()) if now is None else int(now)
-    rpc = as_rpc(node if rpc is None else rpc)
+    rpc = _ShapeCheckedRpc(as_rpc(node if rpc is None else rpc))
 
     first_pass = _ensure_schema(store)
     errors = []
+    notes = []  # observer note-table writes the store refused (see _bookkeep)
 
     # 1. Read the ledger. One unreadable node must not be allowed to expire an
     #    invoice or settle another: check_invoice raises out of `scan` before it
@@ -510,19 +617,25 @@ def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_se
                                untagged_cache=untagged_cache, busy_tags=busy_tags,
                                _report_unmatched=False)
         except (RpcError, core.InvoiceError) as e:
-            n = _note_unknown(store, inv_id, str(e), now)
+            prev = store.conn.execute("SELECT consecutive FROM observe_unknowns"
+                                      " WHERE invoice_id = ?", (inv_id,)).fetchone()
+            n = _bookkeep(notes, "observe_unknowns", _note_unknown, store, inv_id, str(e), now,
+                          fallback=(prev["consecutive"] if prev else 0) + 1)
             last = _last_good_read(store, inv_id, r["created_at"])
             err = {"invoice_id": inv_id, "error": str(e), "effect": "nothing: not settled",
                    "consecutive_unknowns": n}
         else:
-            _clear_unknown(store, inv_id)
-            _note_good_read(store, inv_id, now)
+            _bookkeep(notes, "observe_unknowns", _clear_unknown, store, inv_id)
+            _bookkeep(notes, "observe_reads", _note_good_read, store, inv_id, now)
             n, last, err = 0, now, None
         silent = max(0, now - last)
         honour_by = int(r["expires_at"]) - int(settle_slack)
         threshold = stale_threshold(stale_after, honour_by, now, stale_floor, min_reaction)
         raised = silent > threshold or n >= unknown_limit
-        new = raised and _raise_is_new(store, inv_id, now, raise_every)
+        # A raise whose ceiling cannot be recorded is reported as new: better a
+        # repeated page than a suppressed one.
+        new = raised and _bookkeep(notes, "observe_raises", _raise_is_new, store, inv_id, now,
+                                   raise_every, fallback=True)
         entry = {"invoice_id": inv_id, "last_good_read": last, "silent_seconds": silent,
                  "stale_after": threshold, "honour_by": honour_by, "consecutive_unknowns": n,
                  "raised": raised, "raise_new": new}
@@ -576,7 +689,10 @@ def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_se
                   "backfill_skipped": backfilled, "first_pass": first_pass, "errors": errors,
                   "silence": silence,
                   "unknown_raised": [e["invoice_id"] for e in silence if e["raised"]],
-                  "raise_new": [e["invoice_id"] for e in silence if e["raise_new"]]}
+                  "unknown_streak_raised": [e["invoice_id"] for e in silence
+                                            if e["consecutive_unknowns"] >= unknown_limit],
+                  "raise_new": [e["invoice_id"] for e in silence if e["raise_new"]],
+                  "bookkeeping_errors": notes}
     out.errors = errors
     return out
 
@@ -598,6 +714,9 @@ def observe(store=None, merchant=None, interval=DEFAULT_INTERVAL_S, once=False, 
     the merchant keeps serving. Only a bad merchant address stops it, and that
     is refused before the first pass.
     """
+    # Refuse a bad knob before the first pass, never on a later one. (This is a
+    # generator, so the refusal surfaces on the first next(), before any read.)
+    validate_options(**kw)
     n = 0
     # One cache for the whole watch: a confirmed untagged send is looked up once.
     kw.setdefault("untagged_cache", core.UntaggedLookups())
