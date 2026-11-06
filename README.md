@@ -427,6 +427,21 @@ reaches `unknown_limit` (default 3, a keyword to `observe_once`/`observe`) it is
 and listed in `detail["unknown_raised"]`, so a node that keeps failing is reported, not silently
 treated as "no payment yet".
 
+That pass count is the secondary trigger. The primary one is time since the last good read, because
+a count drifts with the polling interval (three failures thirty seconds apart and three six hours
+apart are very different silences) and stops advancing when the loop itself stalls. For every open
+invoice the store keeps `last_good_read`, the time of the last pass whose read succeeded, in the table
+`observe_reads`. An invoice that was never read successfully counts from its creation time, so an
+observer that never ran shows up as silence instead of as zero. Each pass lists every open invoice in
+`detail["silence"]` with `last_good_read`, `silent_seconds` (now minus `last_good_read`, 0 after a good
+read this pass), `consecutive_unknowns`, the threshold it was judged against, and `raised`; the
+`errors` entries carry the same fields. An invoice is raised when `silent_seconds` is greater than the
+threshold, or when `consecutive_unknowns` reaches `unknown_limit`. The threshold is `stale_after`
+(default 900 seconds, a keyword to `observe_once`/`observe`), tightened as the invoice's `expires_at`
+approaches: it is a quarter of the time left before expiry when that is smaller, but never less than
+`stale_floor` (default 60 seconds). All of this is computed from the pass's `now`, and a raised
+invoice still stays open.
+
 ### What `observe` does NOT claim
 
 It does not prove the goods were any good, that the payer is anyone in particular (an address is not

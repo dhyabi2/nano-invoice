@@ -65,6 +65,12 @@ DEFAULT_INTERVAL_S = 5
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_RELEASE_TIMEOUT_S = 30
 DEFAULT_UNKNOWN_LIMIT = 3
+# Silence, not pass count, is the primary trigger: a pass count drifts with the
+# polling interval and stops advancing when the loop itself stalls. Raise once
+# this many seconds have passed since an invoice's last good read.
+DEFAULT_STALE_AFTER_S = 900
+# The tightened threshold near expiry never drops below this.
+DEFAULT_STALE_FLOOR_S = 60
 USER_AGENT = "nano-invoice-observer/1 (+https://github.com/dhyabi2/nano-invoice)"
 
 # `delivery_id` and not `send_block`, which is what the spec called it, because
@@ -98,6 +104,19 @@ CREATE TABLE IF NOT EXISTS observe_unknowns(
   consecutive INTEGER NOT NULL,
   last_error  TEXT,
   last_at     INTEGER NOT NULL
+);
+"""
+
+# The time of the last pass on which an open invoice's node read succeeded. One
+# row per invoice, written only by a clean read. An invoice with no row has
+# never been read successfully, and its silence is counted from created_at, so
+# an observer that never ran is visible rather than reading as zero.
+# No REFERENCES clause: the row is a note about a read, not part of the invoice,
+# and it must not stop an operator deleting an invoice.
+READS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS observe_reads(
+  invoice_id     TEXT PRIMARY KEY,
+  last_good_read INTEGER NOT NULL
 );
 """
 
@@ -174,7 +193,31 @@ def _ensure_schema(store):
     first = row is None
     store.conn.executescript(FULFILLMENT_SCHEMA)
     store.conn.executescript(UNKNOWN_SCHEMA)
+    store.conn.executescript(READS_SCHEMA)
     return first
+
+
+def _note_good_read(store, inv_id, now):
+    with store.tx() as c:
+        c.execute(
+            "INSERT INTO observe_reads(invoice_id, last_good_read) VALUES (?,?)"
+            " ON CONFLICT(invoice_id) DO UPDATE SET last_good_read = excluded.last_good_read",
+            (inv_id, now))
+
+
+def _last_good_read(store, inv_id, created_at):
+    row = store.conn.execute("SELECT last_good_read FROM observe_reads WHERE invoice_id = ?",
+                             (inv_id,)).fetchone()
+    return created_at if row is None else row["last_good_read"]
+
+
+def stale_threshold(stale_after, expires_at, now, floor=DEFAULT_STALE_FLOOR_S):
+    """The silence allowed before an open invoice is raised. Tightens as the
+    invoice's expiry approaches: a quarter of the time left, but never more
+    than `stale_after` and never less than `floor` (or `stale_after`, if that
+    is smaller). Past expiry it is the floor."""
+    floor = min(int(floor), int(stale_after))
+    return min(int(stale_after), max(floor, (int(expires_at) - int(now)) // 4))
 
 
 def _note_unknown(store, inv_id, error, now):
@@ -344,7 +387,8 @@ def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_se
                  webhook=None, max_attempts=DEFAULT_MAX_ATTEMPTS, interval=DEFAULT_INTERVAL_S,
                  catch_up=False, release_timeout=DEFAULT_RELEASE_TIMEOUT_S, max_blocks=1000,
                  own_accounts=(), not_income=None, untagged_cache=None,
-                 unknown_limit=DEFAULT_UNKNOWN_LIMIT):
+                 unknown_limit=DEFAULT_UNKNOWN_LIMIT, stale_after=DEFAULT_STALE_AFTER_S,
+                 stale_floor=DEFAULT_STALE_FLOOR_S):
     """One pass: read the ledger for every open invoice of `merchant`, then
     release every settlement this store owes a release on.
 
@@ -364,6 +408,17 @@ def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_se
     be read (persisted in the store), and `raised`, true once that reaches
     `unknown_limit`; `.detail["unknown_raised"]` lists those invoices. The
     invoice itself stays open either way: an unknown never moves state.
+
+    The primary trigger is time, not pass count. Per open invoice the store
+    keeps `last_good_read`, the time of the last pass whose read succeeded (its
+    creation time if it was never read). Every open invoice is reported in
+    `.detail["silence"]` with `last_good_read`, `silent_seconds` (now minus
+    that), the effective `stale_after` and `raised`. `raised` is true when
+    `silent_seconds` exceeds the threshold, or (secondary) when
+    `consecutive_unknowns` reaches `unknown_limit`. The threshold is
+    `stale_threshold(stale_after, expires_at, now, stale_floor)`: `stale_after`
+    seconds, shrinking to a quarter of the time left before the invoice expires,
+    never below `stale_floor`. A good read this pass makes `silent_seconds` 0.
     """
     store = core._require_store(store)
     if merchant is None:
@@ -383,16 +438,19 @@ def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_se
     # 1. Read the ledger. One unreadable node must not be allowed to expire an
     #    invoice or settle another: check_invoice raises out of `scan` before it
     #    touches any state, so catching per invoice leaves the store as it was.
-    open_ids = [r["id"] for r in store.conn.execute(
-        "SELECT id FROM invoices WHERE merchant = ? AND state = 'open' ORDER BY created_at, id",
-        (merchant,)).fetchall()]
+    open_rows = store.conn.execute(
+        "SELECT id, created_at, expires_at FROM invoices WHERE merchant = ? AND state = 'open'"
+        " ORDER BY created_at, id", (merchant,)).fetchall()
+    open_ids = [r["id"] for r in open_rows]
+    silence = []
     # Untagged sends (reported only, never settled) are looked up once per pass for
     # all open invoices, not once per invoice, and the busy tags are read once.
     if untagged_cache is None:
         untagged_cache = core.UntaggedLookups()
     untagged_cache.new_pass()
     busy_tags = core._lazy_busy_tags(store, merchant, now)
-    for inv_id in open_ids:
+    for r in open_rows:
+        inv_id = r["id"]
         try:
             core.check_invoice(inv_id, rpc=rpc, store=store, own_accounts=own_accounts,
                                not_income=not_income, now=now, max_blocks=max_blocks,
@@ -400,10 +458,23 @@ def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_se
                                _report_unmatched=False)
         except (RpcError, core.InvoiceError) as e:
             n = _note_unknown(store, inv_id, str(e), now)
-            errors.append({"invoice_id": inv_id, "error": str(e), "effect": "nothing: not settled",
-                           "consecutive_unknowns": n, "raised": n >= unknown_limit})
+            last = _last_good_read(store, inv_id, r["created_at"])
+            err = {"invoice_id": inv_id, "error": str(e), "effect": "nothing: not settled",
+                   "consecutive_unknowns": n}
         else:
             _clear_unknown(store, inv_id)
+            _note_good_read(store, inv_id, now)
+            n, last, err = 0, now, None
+        silent = max(0, now - last)
+        threshold = stale_threshold(stale_after, r["expires_at"], now, stale_floor)
+        raised = silent > threshold or n >= unknown_limit
+        entry = {"invoice_id": inv_id, "last_good_read": last, "silent_seconds": silent,
+                 "stale_after": threshold, "consecutive_unknowns": n, "raised": raised}
+        silence.append(entry)
+        if err is not None:
+            err.update(last_good_read=last, silent_seconds=silent, stale_after=threshold,
+                       raised=raised)
+            errors.append(err)
 
     # 2. Record what is owed. The PRIMARY KEY is the exactly-once key, so two
     #    observers racing one settling block insert one row between them.
@@ -447,7 +518,8 @@ def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_se
                   "release_failed": sum(1 for e in events if e.state == "release_failed"),
                   "pending": sum(1 for e in events if e.state == "pending"),
                   "backfill_skipped": backfilled, "first_pass": first_pass, "errors": errors,
-                  "unknown_raised": [e["invoice_id"] for e in errors if e["raised"]]}
+                  "silence": silence,
+                  "unknown_raised": [e["invoice_id"] for e in silence if e["raised"]]}
     out.errors = errors
     return out
 
