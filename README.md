@@ -442,6 +442,17 @@ approaches: it is a quarter of the time left before expiry when that is smaller,
 `stale_floor` (default 60 seconds). All of this is computed from the pass's `now`, and a raised
 invoice still stays open.
 
+Near the deadline a quarter of the time left collapses fast, so three keywords keep the last minutes
+from turning into a stream of alerts. `min_reaction` (default 120 seconds): once less than that is
+left, the threshold stops tightening and keeps the value it had at that point, or the floor (with the
+defaults this is the floor, so nothing changes unless you raise it). `raise_every` (default 300
+seconds): `raised` stays true on every pass that is raised, but `raise_new` is true at most once per
+that many seconds per invoice (kept in the store table `observe_raises`; 0 makes every raised pass
+new), and `detail["raise_new"]` lists those invoices - page on `raise_new`, not on `raised`.
+`settle_slack` (default 0 seconds): the tightening is taken against `honour_by` = `expires_at` minus
+`settle_slack`, the last moment a payment can still be honoured when settlement is slow; each entry
+reports `honour_by`.
+
 ### What `observe` does NOT claim
 
 It does not prove the goods were any good, that the payer is anyone in particular (an address is not

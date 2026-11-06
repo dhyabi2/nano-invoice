@@ -71,6 +71,14 @@ DEFAULT_UNKNOWN_LIMIT = 3
 DEFAULT_STALE_AFTER_S = 900
 # The tightened threshold near expiry never drops below this.
 DEFAULT_STALE_FLOOR_S = 60
+# Once less than this many seconds are left before the deadline the threshold
+# stops tightening: inside the shortest useful reaction a sharper threshold only
+# produces more raises nobody can act on. At 120 s a quarter is 30 s, under the
+# default floor, so the defaults give the same threshold as before.
+DEFAULT_MIN_REACTION_S = 120
+# A raise is reported as new (`raise_new`) at most once per this many seconds
+# per invoice; 0 reports every raised pass as new.
+DEFAULT_RAISE_EVERY_S = 300
 USER_AGENT = "nano-invoice-observer/1 (+https://github.com/dhyabi2/nano-invoice)"
 
 # `delivery_id` and not `send_block`, which is what the spec called it, because
@@ -117,6 +125,16 @@ READS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS observe_reads(
   invoice_id     TEXT PRIMARY KEY,
   last_good_read INTEGER NOT NULL
+);
+"""
+
+# The time a raise was last reported as new for an invoice, so the per-invoice
+# ceiling (`raise_every`) holds across passes and restarts. Same reasoning as
+# observe_reads for leaving out REFERENCES.
+RAISES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS observe_raises(
+  invoice_id     TEXT PRIMARY KEY,
+  last_raised_at INTEGER NOT NULL
 );
 """
 
@@ -194,6 +212,7 @@ def _ensure_schema(store):
     store.conn.executescript(FULFILLMENT_SCHEMA)
     store.conn.executescript(UNKNOWN_SCHEMA)
     store.conn.executescript(READS_SCHEMA)
+    store.conn.executescript(RAISES_SCHEMA)
     return first
 
 
@@ -211,13 +230,34 @@ def _last_good_read(store, inv_id, created_at):
     return created_at if row is None else row["last_good_read"]
 
 
-def stale_threshold(stale_after, expires_at, now, floor=DEFAULT_STALE_FLOOR_S):
+def stale_threshold(stale_after, deadline, now, floor=DEFAULT_STALE_FLOOR_S,
+                    min_reaction=DEFAULT_MIN_REACTION_S):
     """The silence allowed before an open invoice is raised. Tightens as the
-    invoice's expiry approaches: a quarter of the time left, but never more
-    than `stale_after` and never less than `floor` (or `stale_after`, if that
-    is smaller). Past expiry it is the floor."""
+    deadline approaches: a quarter of the time left, but never more than
+    `stale_after` and never less than `floor` (or `stale_after`, if that is
+    smaller). The time left is counted as at least `min_reaction`, so once less
+    than that remains (and past the deadline) the threshold stops tightening and
+    keeps the value it had at that point, or the floor. `deadline` is the
+    invoice's `honour_by` (see `observe_once`), which is `expires_at` when no
+    settlement slack is given."""
     floor = min(int(floor), int(stale_after))
-    return min(int(stale_after), max(floor, (int(expires_at) - int(now)) // 4))
+    left = max(int(deadline) - int(now), int(min_reaction))
+    return min(int(stale_after), max(floor, left // 4))
+
+
+def _raise_is_new(store, inv_id, now, raise_every):
+    """True, and noted, when a raise for this invoice was never reported or was
+    last reported at least `raise_every` seconds ago."""
+    row = store.conn.execute("SELECT last_raised_at FROM observe_raises WHERE invoice_id = ?",
+                             (inv_id,)).fetchone()
+    if row is not None and now - row["last_raised_at"] < int(raise_every):
+        return False
+    with store.tx() as c:
+        c.execute(
+            "INSERT INTO observe_raises(invoice_id, last_raised_at) VALUES (?,?)"
+            " ON CONFLICT(invoice_id) DO UPDATE SET last_raised_at = excluded.last_raised_at",
+            (inv_id, now))
+    return True
 
 
 def _note_unknown(store, inv_id, error, now):
@@ -388,7 +428,8 @@ def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_se
                  catch_up=False, release_timeout=DEFAULT_RELEASE_TIMEOUT_S, max_blocks=1000,
                  own_accounts=(), not_income=None, untagged_cache=None,
                  unknown_limit=DEFAULT_UNKNOWN_LIMIT, stale_after=DEFAULT_STALE_AFTER_S,
-                 stale_floor=DEFAULT_STALE_FLOOR_S):
+                 stale_floor=DEFAULT_STALE_FLOOR_S, min_reaction=DEFAULT_MIN_REACTION_S,
+                 raise_every=DEFAULT_RAISE_EVERY_S, settle_slack=0):
     """One pass: read the ledger for every open invoice of `merchant`, then
     release every settlement this store owes a release on.
 
@@ -416,9 +457,21 @@ def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_se
     that), the effective `stale_after` and `raised`. `raised` is true when
     `silent_seconds` exceeds the threshold, or (secondary) when
     `consecutive_unknowns` reaches `unknown_limit`. The threshold is
-    `stale_threshold(stale_after, expires_at, now, stale_floor)`: `stale_after`
-    seconds, shrinking to a quarter of the time left before the invoice expires,
-    never below `stale_floor`. A good read this pass makes `silent_seconds` 0.
+    `stale_threshold(stale_after, honour_by, now, stale_floor, min_reaction)`:
+    `stale_after` seconds, shrinking to a quarter of the time left before
+    `honour_by`, never below `stale_floor`, and no longer shrinking once less
+    than `min_reaction` seconds are left. A good read this pass makes
+    `silent_seconds` 0.
+
+    `honour_by` is `expires_at - settle_slack`: the last moment a payment can
+    still be honoured when settlement takes `settle_slack` seconds (default 0,
+    so `honour_by` is `expires_at`). Each entry reports it.
+
+    `raised` is the honest state on every pass. `raise_new` says whether this
+    pass is a new alert: true when raised and no raise for that invoice was
+    reported as new in the last `raise_every` seconds (persisted in the store;
+    0 makes every raised pass new). `.detail["raise_new"]` lists those
+    invoices; a caller that pages on alerts should page on `raise_new`.
     """
     store = core._require_store(store)
     if merchant is None:
@@ -466,14 +519,17 @@ def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_se
             _note_good_read(store, inv_id, now)
             n, last, err = 0, now, None
         silent = max(0, now - last)
-        threshold = stale_threshold(stale_after, r["expires_at"], now, stale_floor)
+        honour_by = int(r["expires_at"]) - int(settle_slack)
+        threshold = stale_threshold(stale_after, honour_by, now, stale_floor, min_reaction)
         raised = silent > threshold or n >= unknown_limit
+        new = raised and _raise_is_new(store, inv_id, now, raise_every)
         entry = {"invoice_id": inv_id, "last_good_read": last, "silent_seconds": silent,
-                 "stale_after": threshold, "consecutive_unknowns": n, "raised": raised}
+                 "stale_after": threshold, "honour_by": honour_by, "consecutive_unknowns": n,
+                 "raised": raised, "raise_new": new}
         silence.append(entry)
         if err is not None:
             err.update(last_good_read=last, silent_seconds=silent, stale_after=threshold,
-                       raised=raised)
+                       honour_by=honour_by, raised=raised, raise_new=new)
             errors.append(err)
 
     # 2. Record what is owed. The PRIMARY KEY is the exactly-once key, so two
@@ -519,7 +575,8 @@ def observe_once(store=None, merchant=None, now=None, node=None, rpc=None, on_se
                   "pending": sum(1 for e in events if e.state == "pending"),
                   "backfill_skipped": backfilled, "first_pass": first_pass, "errors": errors,
                   "silence": silence,
-                  "unknown_raised": [e["invoice_id"] for e in silence if e["raised"]]}
+                  "unknown_raised": [e["invoice_id"] for e in silence if e["raised"]],
+                  "raise_new": [e["invoice_id"] for e in silence if e["raise_new"]]}
     out.errors = errors
     return out
 
