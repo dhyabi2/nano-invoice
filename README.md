@@ -420,6 +420,54 @@ and a node that cannot be read changes nothing at all: no invoice settled, no st
 event emitted. `observe` with neither `--on-settle` nor `--webhook` exits 64 — an observer with
 nowhere to release to is a silent loop.
 
+**An unreadable node is not unpaid.** A read that raises (an RPC error, or an answer too malformed to
+interpret: one that is not a JSON object, a `receivable` answer with no `blocks`, an `account_history`
+answer with no `history`, or a `block_info` answer with no `block_account` - so a bare `{}` counts as
+unknown, never as an empty, unpaid read) leaves the invoice open and is counted, per invoice, in the
+store table `observe_unknowns`; a clean read resets the count. Each `errors` entry carries
+`consecutive_unknowns`, and once that reaches `unknown_limit` (default 3, a keyword to
+`observe_once`/`observe`) it is marked `raised: true` and listed in `detail["unknown_streak_raised"]`,
+so a node that keeps failing is reported, not silently treated as "no payment yet".
+`detail["unknown_raised"]` is wider than its name: it lists every raised invoice, whichever trigger
+raised it (the unknown streak here, or the silence below).
+
+That pass count is the secondary trigger. The primary one is time since the last good read, because
+a count drifts with the polling interval (three failures thirty seconds apart and three six hours
+apart are very different silences) and stops advancing when the loop itself stalls. For every open
+invoice the store keeps `last_good_read`, the time of the last pass whose read succeeded, in the table
+`observe_reads`. An invoice that was never read successfully counts from its creation time, so an
+observer that never ran shows up as silence instead of as zero. Each pass lists every open invoice in
+`detail["silence"]` with `last_good_read`, `silent_seconds` (now minus `last_good_read`, 0 after a good
+read this pass), `consecutive_unknowns`, the threshold it was judged against, and `raised`; the
+`errors` entries carry the same fields. An invoice is raised when `silent_seconds` is greater than the
+threshold, or when `consecutive_unknowns` reaches `unknown_limit`. The threshold is `stale_after`
+(default 900 seconds, a keyword to `observe_once`/`observe`), tightened as the invoice's `expires_at`
+approaches: it is a quarter of the time left before expiry when that is smaller, but never less than
+`stale_floor` (default 60 seconds). All of this is computed from the pass's `now`, and a raised
+invoice still stays open.
+
+Near the deadline a quarter of the time left collapses fast, so three keywords keep the last minutes
+from turning into a stream of alerts. `min_reaction` (default 120 seconds): once less than that is
+left, the threshold stops tightening and keeps the value it had at that point, or the floor (with the
+defaults this is the floor, so nothing changes unless you raise it). `raise_every` (default 300
+seconds): `raised` stays true on every pass that is raised, but `raise_new` is true at most once per
+that many seconds per invoice (kept in the store table `observe_raises`; 0 makes every raised pass
+new), and `detail["raise_new"]` lists those invoices - page on `raise_new`, not on `raised`.
+`settle_slack` (default 0 seconds): the tightening is taken against `honour_by` = `expires_at` minus
+`settle_slack`, the last moment a payment can still be honoured when settlement is slow; each entry
+reports `honour_by`.
+
+These knobs are checked before the first pass and a bad one raises `InvalidObserverOption` (a
+`ValueError`), never mid-loop: `unknown_limit` must be an `int` of at least 1 (not a `bool`, not
+`"3"`); `stale_after` and `stale_floor` must be finite numbers of seconds of at least 1;
+`min_reaction`, `raise_every` and `settle_slack` finite numbers of at least 0.
+
+The streak, the last good read and the raise ceiling are the observer's own notes, so a clean pass
+does write to the store (`observe_reads` on every good read). A store that refuses one of these writes
+(read-only, locked) does not abort the pass: the write is listed in `detail["bookkeeping_errors"]`, the
+pass's values are still reported from memory, and a raise whose ceiling could not be recorded is
+reported as new. None of the three tables references `invoices`, so they never block deleting one.
+
 ### What `observe` does NOT claim
 
 It does not prove the goods were any good, that the payer is anyone in particular (an address is not
