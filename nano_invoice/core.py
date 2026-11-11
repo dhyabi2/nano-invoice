@@ -1472,6 +1472,15 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
       tombstone or a verdict other than "delivered", or a "delivered" verdict for a different
       output_commitment, giving one is refused (InvoiceError). A tombstone with
       superseded_by set withdraws the invoice for good: no later verdict revives it.
+    - `delivery`: the same newest verdict-or-tombstone record, as
+      {"state", "seq", "note", "asserted_by", "asserted_at"} (a tombstone adds
+      "tombstone_reason" and "superseded_by"). state is "delivered", "failed",
+      "indeterminate", "none" (no verdict logged) or "withdrawn" (newest is a tombstone,
+      or the invoice was superseded). "failed" is an explicit failure response after
+      settlement (e.g. the paid endpoint answered 404 and delivered nothing) - it is not
+      unknown; "indeterminate" is transport loss, where the buyer cannot tell whether
+      the seller accepted the request. A refund is its own field (settlement.refund,
+      duplicates[].disposition), never a delivery state.
 
     `acks` must be a list or tuple of JSON objects; anything else is refused with
     InvoiceError rather than read as "no v3 ack". `acceptance_rule` must be a non-empty
@@ -1480,7 +1489,10 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
       invoice id, the settling send block, that output_commitment and `acceptance_rule`.
       With no such ack, or none that verifies, or an invoice not `paid`/`overpaid` (an
       underpaid close can be a stranger's dust), it is "unknown" with a reason - never
-      "failed". v1/v2 acks bind no order or rule and are listed as not counted.
+      "failed". v1/v2 acks bind no order or rule and are listed as not counted. When
+      delivery.state is "failed", the reason stays "no_delivered_evidence" and
+      `reason_detail` says the delivery is logged as failed (seq N), so acceptance is
+      not asked.
     """
     store = _require_store(store)
     if acks is None:
@@ -1590,6 +1602,23 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
         evidence, source = logged if logged else (None, None)
     delivered_evidence = ({"output_commitment": evidence, "source": source}
                           if evidence else None)
+    # `delivery`: what the merchant's newest verdict-or-tombstone record says happened to
+    # the request, read from the same record as delivered_evidence. "failed" is an explicit
+    # failure response after settlement, not "unknown"; "indeterminate" is transport loss.
+    if newest is None:
+        delivery = {"state": "none", "seq": None, "note": None, "asserted_by": None,
+                    "asserted_at": None}
+    else:
+        nbody = newest.get("body") or {}
+        delivery = {
+            "state": ("withdrawn" if newest.get("kind") == "tombstone"
+                      else nbody.get("verdict")),
+            "seq": newest.get("seq"), "note": nbody.get("note"),
+            "asserted_by": newest.get("asserted_by"), "asserted_at": newest.get("asserted_at"),
+        }
+        if newest.get("kind") == "tombstone":
+            delivery["tombstone_reason"] = nbody.get("reason")
+            delivery["superseded_by"] = nbody.get("superseded_by")
 
     counted, not_counted = [], []
     for i, a in enumerate(acks):
@@ -1613,6 +1642,12 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
     elif inv.state not in ("paid", "overpaid"):
         # underpaid: the closing send can be dust from anyone, so its sender is not "the payer"
         acceptance = unknown("not_paid")
+    elif evidence is None and delivery["state"] == "failed":
+        # reason code kept for compatibility; the detail says why acceptance is not asked
+        acceptance = unknown("no_delivered_evidence",
+                             reason_detail=f"delivery_failed: the merchant's log records the "
+                                           f"delivery as failed (seq {delivery['seq']}); "
+                                           f"acceptance is not asked")
     elif evidence is None:
         acceptance = unknown("no_delivered_evidence")
     elif not counted:
@@ -1638,6 +1673,7 @@ def acceptance_fields(invoice, store=None, acks=(), output_commitment=None,
         "settlement": settlement,
         "duplicates": duplicates,
         "delivered_evidence": delivered_evidence,
+        "delivery": delivery,
         "payer_acceptance": acceptance,
         "proves": "payer_acceptance, when not unknown: the holder of the payer account's key "
                   "signed this verdict for this invoice id, settling send block, output digest "

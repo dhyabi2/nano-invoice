@@ -10,8 +10,11 @@ The gate does not have one status. It reports separate fields (`nano-invoice acc
 |---|---|---|
 | settlement (per invoice) | `open`, `paid`, `overpaid`, `underpaid`, `expired` | read from the public ledger |
 | delivered_evidence | `null`, or an output commitment (64 hex) | merchant's verdict log; withdrawn by a tombstone |
+| delivery | `{state, seq, note, asserted_by, asserted_at}`; state `delivered`, `failed`, `indeterminate`, `none`, `withdrawn` | merchant's newest verdict-or-tombstone record |
 | payer_acceptance | `unknown` (with a reason), `delivered`, `failed` | payer's signed ack, bound to invoice id + settling block + output + rule |
 | each later transfer to the same invoice | `duplicate` or `late`, with a refund disposition | read from the ledger |
+
+`delivery.state` `failed` is an explicit failure response after settlement (not "unknown"); `indeterminate` is transport loss, where the buyer cannot tell whether the seller accepted the request; a refund is its own field, never a delivery state.
 
 ## The invoice id is keyed by what the buyer holds before paying
 

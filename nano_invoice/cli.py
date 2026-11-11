@@ -142,9 +142,12 @@ def build_parser():
                                               f"(with --order-id; default "
                                               f"{nano_sig.ACCEPTANCE_RULE_V1})")
 
-    ac = sub.add_parser("acceptance", help="settlement, duplicates, delivered evidence and payer "
-                                           "acceptance for one invoice, each reported on its own "
-                                           "(offline)")
+    ac = sub.add_parser("acceptance", help="settlement, duplicates, delivered evidence, delivery "
+                                           "and payer acceptance for one invoice, each reported "
+                                           "on its own (offline); delivery.state failed = an "
+                                           "explicit failure response after settlement, "
+                                           "indeterminate = transport loss; refund is its own "
+                                           "field")
     ac.add_argument("--invoice", required=True)
     ac.add_argument("--acks", help="JSON file (or - for stdin): a list of payer acks; only "
                                    "delivery-ack/v3 counts as acceptance")
