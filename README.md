@@ -54,9 +54,8 @@ An agent that sells for XNO can see that a block settled, but a settled block on
 ## Quickstart
 
 ```bash
-pip install git+https://github.com/dhyabi2/nano-invoice
-# pinned to the tagged release (v0.2.1), no PyPI needed:
 pip install "nano-invoice @ git+https://github.com/dhyabi2/nano-invoice@v0.2.1"
+# the tagged release (v0.2.1), no PyPI needed; unpinned main: pip install git+https://github.com/dhyabi2/nano-invoice
 ```
 
 ```python
