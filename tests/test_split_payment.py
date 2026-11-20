@@ -45,6 +45,8 @@ class TestSplitPayment(Base):
         self.assertEqual(sorted((r["source_block"], r["amount_raw"], r["to"]) for r in sp["refund_if_rejected"]),
                          sorted([(s1, str(a), BUYER), (s2, str(b), BUYER)]))
         self.assertEqual(res["unmatched_candidates"], [])
+        self.assertEqual(res["unmatched_short_sends"], [])
+        self.assertFalse(sp["overlapping_splits"])
         # a guess never settles: the invoice stays open and nothing is bound
         self.assertEqual(self.store.get(inv).state, "open")
         self.assertEqual(self.store.payments_for(inv.id), [])
@@ -56,7 +58,8 @@ class TestSplitPayment(Base):
         s2, _ = self.ledger.send(OTHER, MERCHANT, b, T0 + 20)
         res = self.check(inv)
         self.assertEqual(res.get("split_candidates"), [])
-        unmatched = res.get("unmatched_candidates", [])
+        self.assertEqual(res["unmatched_candidates"], [])
+        unmatched = res.get("unmatched_short_sends", [])
         self.assertEqual(sorted(u["send_block"] for u in unmatched), sorted([s1, s2]))
         for u in unmatched:
             self.assertEqual(u["outcome"], "unmatched")
@@ -118,9 +121,8 @@ class TestSplitPayment(Base):
         for i in range(ni.core.UNTAGGED_LOOKUP_CAP + 4):   # newer than the overpayment: walked first
             self.ledger.send(account(f"small-{i}"), MERCHANT, 10 ** 20 + 1 + i, T0 + 10 + i)
         res = self.check(inv)
-        self.assertEqual([u["send_block"] for u in res["unmatched_candidates"] if "excess_raw" in u], [over])
-        self.assertEqual(len([u for u in res["unmatched_candidates"] if "short_raw" in u]),
-                         ni.core.UNTAGGED_LOOKUP_CAP)
+        self.assertEqual([u["send_block"] for u in res["unmatched_candidates"]], [over])
+        self.assertEqual(len(res["unmatched_short_sends"]), ni.core.UNTAGGED_LOOKUP_CAP)
         self.assertEqual(len(res["unmatched_notes"]), 4)
         self.assertEqual(res["split_candidates"], [])
 
@@ -133,6 +135,63 @@ class TestSplitPayment(Base):
         res = self.check(inv, _report_unmatched=False)
         self.assertFalse(any(act == "block_info" for act, _ in self.ledger.calls[n:]))
         self.assertEqual((res["split_candidates"], res["unmatched_candidates"]), ([], []))
+
+    def test_overlapping_splits_a_b_a_b_never_refund_one_send_twice(self):
+        inv = self.invoice()
+        a, b = untagged_halves(inv.pay_raw, {inv.tag})
+        self.assertNotEqual(a, b)
+        sends = [self.ledger.send(BUYER, MERCHANT, amt, T0 + 10 * (i + 1))[0]
+                 for i, amt in enumerate((a, b, a, b))]
+        res = self.check(inv)
+        splits = res["split_candidates"]
+        self.assertEqual(len(splits), 4, res)   # every a with every b
+        refunds = [r for sp in splits for r in sp["refund_if_rejected"]]
+        hashes = [r["source_block"] for r in refunds]
+        self.assertEqual(len(hashes), len(set(hashes)), refunds)
+        self.assertLessEqual(sum(int(r["amount_raw"]) for r in refunds), 2 * a + 2 * b)
+        for sp in splits:
+            self.assertTrue(sp["overlapping_splits"])
+            self.assertTrue(sp["ambiguous"])
+            self.assertFalse(sp["settled"])
+            self.assertTrue(sp["needs_merchant_confirmation"])
+        self.assertEqual(sorted({h for sp in splits for h in sp["send_blocks"]}), sorted(sends))
+        # a guess never settles or binds anything
+        self.assertEqual(self.store.get(inv).state, "open")
+        self.assertEqual(self.store.payments_for(inv.id), [])
+        self.assertEqual(res["refunds"], [])
+
+    def test_disjoint_splits_keep_one_refund_instruction_per_send(self):
+        inv = self.invoice()
+        a, b = untagged_halves(inv.pay_raw, {inv.tag})
+        s1, _ = self.ledger.send(BUYER, MERCHANT, a, T0 + 10)
+        s2, _ = self.ledger.send(BUYER, MERCHANT, b, T0 + 20)
+        s3, _ = self.ledger.send(OTHER, MERCHANT, a, T0 + 30)
+        s4, _ = self.ledger.send(OTHER, MERCHANT, b, T0 + 40)
+        res = self.check(inv)
+        splits = res["split_candidates"]
+        self.assertEqual(len(splits), 2, res)
+        hashes = [r["source_block"] for sp in splits for r in sp["refund_if_rejected"]]
+        self.assertEqual(sorted(hashes), sorted([s1, s2, s3, s4]))
+        self.assertFalse(any(sp["overlapping_splits"] for sp in splits))
+
+    def test_every_unmatched_candidate_keeps_the_old_keys(self):
+        inv = self.invoice()
+        a, b = untagged_halves(inv.pay_raw, {inv.tag})
+        self.ledger.send(BUYER, MERCHANT, inv.pay_raw + 10 ** 27 + 7, T0 + 5)
+        self.ledger.send(BUYER, MERCHANT, 10 ** 20 + 1, T0 + 10)    # dust
+        self.ledger.send(OTHER, MERCHANT, a, T0 + 20)                # half a split, never finished
+        self.ledger.send(THIRD, MERCHANT, a, T0 + 30)
+        self.ledger.send(THIRD, MERCHANT, b, T0 + 40)                # a split
+        res = self.check(inv)
+        self.assertEqual(len(res["unmatched_candidates"]), 1, res)
+        for u in res["unmatched_candidates"]:
+            for key in ("send_block", "sender", "amount_raw", "outcome", "reason",
+                        "excess_raw", "candidate_invoices", "ambiguous"):
+                self.assertIn(key, u)
+            self.assertGreaterEqual(int(u["amount_raw"]), inv.pay_raw)
+        self.assertEqual(len(res["unmatched_short_sends"]), 2)
+        self.assertEqual(len(res["split_candidates"]), 1)
+        self.assertEqual(self.store.get(inv).state, "open")
 
     def test_docs_no_longer_say_an_untagged_payment_is_not_recorded_at_all(self):
         import os

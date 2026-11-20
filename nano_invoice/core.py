@@ -1000,8 +1000,12 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
     could equally be for (`candidate_invoices`, `ambiguous`), marked
     `needs_merchant_confirmation` and `settled: false`: an exact sum is a
     strong hint, never proof of which order it pays, so the merchant decides;
-    `refund_if_rejected` says what to refund if the merchant rejects it. Every
-    other such send is listed under `unmatched_candidates`, information only
+    `refund_if_rejected` says what to refund if the merchant rejects it. A split
+    that shares a send with another exact split is `overlapping_splits`,
+    `ambiguous` and carries no refund instruction, so no send is in more than
+    one instruction. Every other such send is listed under
+    `unmatched_short_sends` (its own key: `unmatched_candidates` keeps its old
+    shape, possible overpayments only), information only
     like an untagged overpayment (no refund instruction: the same send is
     listed on every check whose window holds it). Sends from different
     accounts are never added together. A watch pass (`_report_unmatched=False`)
@@ -1131,7 +1135,8 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
         # reads every invoice of the merchant, which once per open invoice made a
         # pass O(open x all).
         **(_untagged_report(store, inv, unmatched, own, excluded, now, skew_s)
-           if _report_unmatched else {"split_candidates": [], "unmatched_candidates": []}),
+           if _report_unmatched else {"split_candidates": [], "unmatched_candidates": [],
+                                      "unmatched_short_sends": []}),
         "unmatched_notes": unmatched_notes,
     }
 
@@ -1190,8 +1195,13 @@ def _untagged_report(store, inv, unmatched, own, excluded, now, skew_s):
     over = [ob for ob in unmatched if ob["amount_raw"] >= inv.pay_raw]
     under = [ob for ob in unmatched if ob["amount_raw"] < inv.pay_raw]
     splits, rest = _split_candidates(store, inv, under, unmatched, own, excluded, now, skew_s)
+    # Sends below pay_raw get their own key: `unmatched_candidates` keeps exactly
+    # its shape and meaning from before (possible overpayments, each entry with
+    # excess_raw, candidate_invoices and ambiguous), so no caller of it meets an
+    # entry without those keys.
     return {"split_candidates": splits,
-            "unmatched_candidates": _unmatched_candidates(store, inv, over, own, excluded, now, skew_s) + rest}
+            "unmatched_candidates": _unmatched_candidates(store, inv, over, own, excluded, now, skew_s),
+            "unmatched_short_sends": rest}
 
 
 SPLIT_MAX_PARTS_SEARCHED = 12
@@ -1200,6 +1210,10 @@ SPLIT_REASON = (
     "two or more sends from one account, none carrying a tag, that sum exactly to pay_raw: probably "
     "this order paid in parts, but an untagged amount names no order, so nothing is settled; the "
     "merchant confirms it with the buyer, or refunds every part in full")
+
+SPLIT_OVERLAP_REASON = (
+    "; these sends also form other exact splits, so which of them (if any) are this payment is a "
+    "guess: no refund instruction is issued for an overlapping split, a human decides")
 
 UNMATCHED_PART_REASON = (
     "below pay_raw, no tag in its lowest six raw digits and no exact split with other sends from the "
@@ -1285,6 +1299,7 @@ def _split_candidates(store, inv, under, untagged, own, excluded, now, skew_s):
                     "parts": [view(p) for p in chosen],
                     "candidate_invoices": candidates,
                     "ambiguous": len(candidates) > 1,
+                    "overlapping_splits": False,
                     "refund_if_rejected": [_whole_refund(p, "split_rejected") for p in chosen],
                 })
                 in_split.update(ids)
@@ -1292,6 +1307,20 @@ def _split_candidates(store, inv, under, untagged, own, excluded, now, skew_s):
             if ob["send_block"] not in in_split:
                 unmatched.append(dict(view(ob), outcome="unmatched", reason=UNMATCHED_PART_REASON,
                                       short_raw=str(inv.pay_raw - ob["amount_raw"])))
+    # Several exact splits can share a send (sends a, b, a, b give four). Which of
+    # them, if any, is the payment is then a guess, and a refund instruction per
+    # split would tell the merchant to refund one send more than once. A split that
+    # shares any send with another is therefore marked ambiguous and carries no
+    # refund instruction, so each send hash is in at most one instruction of this
+    # report and the instructions never exceed what was received.
+    uses = {}
+    for sp in splits:
+        for h in sp["send_blocks"]:
+            uses[h] = uses.get(h, 0) + 1
+    for sp in splits:
+        if any(uses[h] > 1 for h in sp["send_blocks"]):
+            sp.update(overlapping_splits=True, ambiguous=True, refund_if_rejected=[],
+                      reason=SPLIT_REASON + SPLIT_OVERLAP_REASON)
     return splits, unmatched
 
 
