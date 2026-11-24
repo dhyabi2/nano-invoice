@@ -771,7 +771,8 @@ class _LookupFailed:
 
 
 def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged_notes=None,
-         untagged_skip_tags=(), untagged_skip=None, untagged_cache=None, split_min=None):
+         untagged_skip_tags=(), untagged_skip=None, untagged_cache=None, split_target=None,
+         split_notes=None):
     """Every incoming send to merchant whose amount ends in this tag, with its
     sender, amount, confirmation and timestamp read from the ledger. Each
     result carries `tag_match` (True for these).
@@ -805,18 +806,27 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
     `untagged_cache` entries are keyed by (merchant, block hash), so a cache shared
     across merchants never serves one merchant's answer to another.
 
-    With `split_min` (below `untagged_min`), also untagged sends of at least
-    `split_min` and below `untagged_min` (the possible parts of a payment split
-    over several sends), on the same terms but with their own cap of
-    UNTAGGED_LOOKUP_CAP, so small unrelated income can never use up the lookups
-    that report an untagged overpayment."""
+    With `split_target` (pay_raw), also untagged sends below `untagged_min` that
+    may be the parts of a payment split over several sends. They are only
+    looked up when the node's own list already shows one: two or more of them,
+    listed as from one account (at most SPLIT_MAX_PARTS_SEARCHED of them), whose
+    listed amounts sum exactly to `split_target`. Every other send below
+    `untagged_min` costs no lookup at all, as before splits were reported. The
+    lookups that are made run after the walk, on the same terms but with their
+    own cap of SPLIT_MAX_PARTS_SEARCHED, so they never use up the lookups that
+    report an untagged overpayment, and their skips go to `split_notes` (a
+    list), never to `untagged_notes`."""
     rpc = as_rpc(rpc)
     found = {}
-    budget = {"full": UNTAGGED_LOOKUP_CAP, "split": UNTAGGED_LOOKUP_CAP}
-    lowest = split_min if split_min is not None else untagged_min
+    budget = {"full": UNTAGGED_LOOKUP_CAP, "split": SPLIT_MAX_PARTS_SEARCHED}
+    lowest = 1 if split_target is not None else untagged_min
+    deferred = []
 
     def pool(amount):
         return "split" if untagged_min is None or amount < untagged_min else "full"
+
+    def defer(listed_amount):
+        return split_target is not None and pool(listed_amount) == "split"
 
     def tagged(amount):
         return amount % TAG_MODULUS == tag
@@ -844,23 +854,27 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
         except Exception:  # noqa: BLE001 - a malformed sender is no reason to skip the lookup
             return False
 
-    def note(msg):
-        if untagged_notes is not None:
-            untagged_notes.append(msg)
+    def note(msg, kind="full"):
+        out = untagged_notes if kind == "full" else split_notes
+        if out is not None:
+            out.append(msg)
 
     def untagged_lookup(key, h, fn, listed_amount):
         """Run fn() for an untagged send `h` within its cap; None if skipped."""
+        kind = pool(listed_amount)
         if untagged_cache is not None:
             hit, value = untagged_cache.get(key)
             if hit:
                 if isinstance(value, _LookupFailed):
-                    note(value.message)
+                    note(value.message, kind)
                     return None
                 return value
-        kind = pool(listed_amount)
         if budget[kind] <= 0:
-            what = "untagged send" if kind == "full" else "untagged send below untagged_min"
-            note(f"{h.upper()}: {what} not looked up (cap of {UNTAGGED_LOOKUP_CAP} per check reached)")
+            if kind == "full":
+                note(f"{h.upper()}: untagged send not looked up (cap of {UNTAGGED_LOOKUP_CAP} per check reached)")
+            else:
+                note(f"{h.upper()}: possible split part not looked up (cap of {SPLIT_MAX_PARTS_SEARCHED} "
+                     "per check reached)", kind)
             return None
         budget[kind] -= 1
         try:
@@ -869,7 +883,7 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
             msg = f"{h.upper()}: untagged send skipped, lookup failed: {type(e).__name__}: {e}"
             if untagged_cache is not None:
                 untagged_cache.put(key, _LookupFailed(msg))
-            note(msg)
+            note(msg, kind)
             return None
         if untagged_cache is not None:
             untagged_cache.put(key, value)
@@ -884,6 +898,10 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
         if amount is not None and not tagged(amount):
             sender = info.get("source") if isinstance(info, dict) else None
             if skipped(h, sender):
+                continue
+            if defer(amount):
+                deferred.append((("send", merchant, h.upper()), h,
+                                 lambda h=h: _resolve_send(rpc, merchant, h), amount, sender))
                 continue
             ob = untagged_lookup(("send", merchant, h.upper()), h, lambda h=h: _resolve_send(rpc, merchant, h),
                                  amount)
@@ -925,6 +943,10 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
                 return ob
 
             listed_tagged = tagged(int(e["amount"]))
+            if not listed_tagged and defer(int(e["amount"])):
+                deferred.append((("receive", merchant, str(e["hash"]).upper()), e["hash"], resolve,
+                                 int(e["amount"]), e.get("account")))
+                continue
             ob = (resolve() if listed_tagged
                   else untagged_lookup(("receive", merchant, str(e["hash"]).upper()), e["hash"], resolve,
                                        int(e["amount"])))
@@ -938,7 +960,33 @@ def scan(rpc, merchant, tag, since, max_blocks=1000, untagged_min=None, untagged
         if older or not nxt:
             break
         head = nxt
+    # Possible split parts: looked up only where the node's list already shows an
+    # exact split from one listed account, so a check with no split makes no
+    # lookup (and no note) it did not make before splits were reported.
+    groups = {}
+    for item in deferred:
+        groups.setdefault(item[4], []).append(item)
+    for items in groups.values():
+        if not 2 <= len(items) <= SPLIT_MAX_PARTS_SEARCHED:
+            continue
+        if not _has_exact_subset([it[3] for it in items], split_target):
+            continue
+        for key, h, fn, listed, _sender in items:
+            ob = untagged_lookup(key, h, fn, listed)
+            if ob is None or tagged(ob["amount_raw"]) or not wanted(ob["amount_raw"]):
+                continue
+            ob["tag_match"] = False
+            found.setdefault(ob["send_block"], ob)
     return sorted(found.values(), key=lambda o: (o["block_ts"], o["send_block"]))
+
+
+def _has_exact_subset(amounts, target):
+    """True when two or more of `amounts` sum exactly to target."""
+    n = len(amounts)
+    for mask in range(1, 1 << n):
+        if mask & (mask - 1) and sum(amounts[i] for i in range(n) if mask >> i & 1) == target:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------- checking
@@ -992,24 +1040,30 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
 
     A payment SPLIT over several sends carries the tag in none of them, so no
     part of it can pay anything: it is bound to nothing and settles nothing,
-    but it is no longer invisible. Untagged sends below pay_raw are read too
-    (with their own lookup cap, so they never crowd out the overpayment
-    report), on the same filters. Two or more of them from ONE sending account
-    whose amounts sum exactly to pay_raw are listed under `split_candidates`
-    with every block, the sender, the sum and every OPEN invoice that sum
-    could equally be for (`candidate_invoices`, `ambiguous`), marked
+    but it is no longer invisible. Untagged sends below pay_raw are looked up
+    only when the node's list already shows two or more of them from one
+    account summing exactly to pay_raw (at most SPLIT_MAX_PARTS_SEARCHED per
+    account, with their own lookup cap, so they never crowd out the
+    overpayment report); a check with no such sends makes no extra lookup, and
+    its `unmatched_notes` are what they were before splits were reported:
+    skips of these lookups go to `split_notes`. Of the sends looked up, those
+    from ONE sending account (passing the same filters as overpayments) whose
+    amounts sum exactly to pay_raw are listed under `split_candidates` with
+    every block, the sender, the sum and every OPEN invoice the same sends
+    could equally pay (`candidate_invoices`, `ambiguous`), marked
     `needs_merchant_confirmation` and `settled: false`: an exact sum is a
-    strong hint, never proof of which order it pays, so the merchant decides;
-    `refund_if_rejected` says what to refund if the merchant rejects it. A split
-    that shares a send with another exact split is `overlapping_splits`,
-    `ambiguous` and carries no refund instruction, so no send is in more than
-    one instruction. Every other such send is listed under
+    strong hint, never proof of which order it pays, so the merchant decides.
+    A split carries NO refund instruction, like an untagged overpayment: the
+    same send can be part of a split of several invoices (x + y for one, x + z
+    for another), and is listed on every check whose window holds it, so an
+    instruction per report could refund it twice. A split that shares a send
+    with another exact split of this report is `overlapping_splits` and
+    `ambiguous`. The other sends of those accounts are listed under
     `unmatched_short_sends` (its own key: `unmatched_candidates` keeps its old
-    shape, possible overpayments only), information only
-    like an untagged overpayment (no refund instruction: the same send is
-    listed on every check whose window holds it). Sends from different
-    accounts are never added together. A watch pass (`_report_unmatched=False`)
-    discards the report, so it does not look these sends up at all.
+    shape, possible overpayments only), information only too. Sends from
+    different accounts are never added together. A watch pass
+    (`_report_unmatched=False`) discards the report, so it does not look these
+    sends up at all.
     """
     store = _require_store(store)
     inv = store.get(invoice)
@@ -1020,6 +1074,7 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
     short = []
     unmatched = []
     unmatched_notes = []
+    split_notes = []
     # Other invoices' open or quarantined tags: an untagged send ending in one is that
     # invoice's, so it is filtered out before it can spend this check's lookup cap.
     # Read lazily: only once an untagged candidate is actually seen, and only once per
@@ -1039,7 +1094,7 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
 
     for ob in scan(rpc, inv.merchant, inv.tag, inv.created_at - skew_s, max_blocks,
                    untagged_min=inv.pay_raw, untagged_notes=unmatched_notes,
-                   split_min=1 if _report_unmatched else None,
+                   split_target=inv.pay_raw if _report_unmatched else None, split_notes=split_notes,
                    untagged_skip_tags=other_busy, untagged_skip=skip_untagged,
                    untagged_cache=untagged_cache if untagged_cache is not None else UntaggedLookups()):
         if not ob.pop("tag_match", True):
@@ -1138,6 +1193,7 @@ def check_invoice(invoice, rpc=None, store=None, own_accounts=(), not_income=Non
            if _report_unmatched else {"split_candidates": [], "unmatched_candidates": [],
                                       "unmatched_short_sends": []}),
         "unmatched_notes": unmatched_notes,
+        "split_notes": split_notes,
     }
 
 
@@ -1208,65 +1264,51 @@ SPLIT_MAX_PARTS_SEARCHED = 12
 
 SPLIT_REASON = (
     "two or more sends from one account, none carrying a tag, that sum exactly to pay_raw: probably "
-    "this order paid in parts, but an untagged amount names no order, so nothing is settled; the "
-    "merchant confirms it with the buyer, or refunds every part in full")
+    "this order paid in parts, but an untagged amount names no order, so nothing is settled. "
+    "Information only: no refund instruction is issued for a split (the same sends can equally be a "
+    "split of another invoice, and are listed on every check whose window holds them); the merchant "
+    "confirms it with the buyer, or refunds the parts by hand")
 
 SPLIT_OVERLAP_REASON = (
-    "; these sends also form other exact splits, so which of them (if any) are this payment is a "
-    "guess: no refund instruction is issued for an overlapping split, a human decides")
+    "; these sends also form other exact splits, so which of them (if any) are this payment is a guess")
 
 UNMATCHED_PART_REASON = (
-    "below pay_raw, no tag in its lowest six raw digits and no exact split with other sends from the "
+    "below pay_raw, no tag in its lowest six raw digits and in no exact split with other sends from the "
     "same account: it cannot be attributed to an order and settles nothing. It may be part of a split "
     "the buyer is still sending (check again later) or unrelated income; information only: no refund "
     "instruction is issued for it, a human decides")
 
 
-def _whole_refund(ob, reason):
-    return {"to": ob["sender"], "amount_raw": str(ob["amount_raw"]), "reason": reason,
-            "source_block": ob["send_block"], "invoice_id": None,
-            "note": "instruction only, and only if the merchant rejects the split: nano-invoice never "
-                    "sends; pay it from the merchant wallet"}
-
-
 def _exact_subsets(parts, target):
     """Every subset of two or more `parts` whose amounts sum exactly to target."""
+    return [chosen for total, chosen in _subset_sums(parts) if total == target]
+
+
+def _subset_sums(parts):
+    """(sum, subset) for every subset of two or more `parts`."""
     out = []
     n = len(parts)
     for mask in range(1, 1 << n):
         if mask & (mask - 1) == 0:
             continue  # a single send: it would carry the tag if it were exact
         chosen = [parts[i] for i in range(n) if mask >> i & 1]
-        if sum(p["amount_raw"] for p in chosen) == target:
-            out.append(chosen)
+        out.append((sum(p["amount_raw"] for p in chosen), chosen))
     return out
-
-
-def _split_fits(r, chosen, ids, parts, inv, skew_s):
-    """Could these sends just as well be invoice r's split? Yes when they sum to
-    r.pay_raw inside r's window, or when some other exact split of r, from the
-    same sender, uses any of the same blocks."""
-    def in_window(p):
-        return r.created_at - skew_s <= p["block_ts"] <= r.expires_at
-    if r.pay_raw == inv.pay_raw and all(in_window(p) for p in chosen):
-        return True
-    if r.id == inv.id:
-        return False
-    mine = [p for p in parts if in_window(p) and p["amount_raw"] < r.pay_raw]
-    if len(mine) > SPLIT_MAX_PARTS_SEARCHED:
-        return False
-    return any(ids & {p["send_block"] for p in other} for other in _exact_subsets(mine, r.pay_raw))
 
 
 def _split_candidates(store, inv, under, untagged, own, excluded, now, skew_s):
     """(split_candidates, unmatched) for untagged sends below pay_raw. `untagged`
     (every untagged send of the check, `under` included) is searched too when
     asking whether the same blocks could be another invoice's split: a send of at
-    least this pay_raw can still be part of a larger invoice's."""
+    least this pay_raw can still be part of a larger invoice's. The subsets of a
+    sender's sends are enumerated once (at most 2**SPLIT_MAX_PARTS_SEARCHED) and
+    looked up by sum per open invoice, so the cost does not grow with the
+    subsets times the open invoices."""
     if not under:
         return [], []
     rows = _merchant_invoices(store, inv.merchant)
     busy = {r.tag for r in rows if _tag_busy(r, now)}
+    open_rows = [r for r in rows if r.state == "open"]   # open invoices only, as for overpayments
 
     def by_sender_of(obs):
         out = {}
@@ -1279,14 +1321,31 @@ def _split_candidates(store, inv, under, untagged, own, excluded, now, skew_s):
     def view(ob):
         return {k: (str(v) if k == "amount_raw" else v) for k, v in ob.items() if k != "problems"}
 
+    def in_window(r, p):
+        return r.created_at - skew_s <= p["block_ts"] <= r.expires_at
+
     splits, in_split, unmatched = [], set(), []
     for sender, parts in by_sender.items():
         if 2 <= len(parts) <= SPLIT_MAX_PARTS_SEARCHED:
-            for chosen in _exact_subsets(parts, inv.pay_raw):
+            exact = _exact_subsets(parts, inv.pay_raw)
+            others = None
+            if exact:
+                ctx = context[sender]
+                complete = len(ctx) <= SPLIT_MAX_PARTS_SEARCHED
+                others = {}
+                for total, chosen in (_subset_sums(ctx) if complete else ()):
+                    others.setdefault(total, []).append(chosen)
+            for chosen in exact:
                 ids = {p["send_block"] for p in chosen}
-                candidates = sorted(r.id for r in rows
-                                    if r.state == "open"   # open invoices only, as for overpayments
-                                    and _split_fits(r, chosen, ids, context[sender], inv, skew_s))
+                candidates = []
+                for r in open_rows:
+                    if r.pay_raw == inv.pay_raw and all(in_window(r, p) for p in chosen):
+                        candidates.append(r.id)
+                    elif r.id != inv.id and any(ids & {p["send_block"] for p in other}
+                                                and all(in_window(r, p) for p in other)
+                                                for other in others.get(r.pay_raw, ())):
+                        candidates.append(r.id)
+                candidates.sort()
                 splits.append({
                     "outcome": "split_candidate",
                     "needs_merchant_confirmation": True,
@@ -1298,9 +1357,10 @@ def _split_candidates(store, inv, under, untagged, own, excluded, now, skew_s):
                     "receive_blocks": [p["receive_block"] for p in chosen],
                     "parts": [view(p) for p in chosen],
                     "candidate_invoices": candidates,
-                    "ambiguous": len(candidates) > 1,
+                    # Too many sends from this account to search them all for
+                    # another invoice's split: then no one can say it is unambiguous.
+                    "ambiguous": len(candidates) > 1 or not complete,
                     "overlapping_splits": False,
-                    "refund_if_rejected": [_whole_refund(p, "split_rejected") for p in chosen],
                 })
                 in_split.update(ids)
         for ob in parts:
@@ -1308,19 +1368,14 @@ def _split_candidates(store, inv, under, untagged, own, excluded, now, skew_s):
                 unmatched.append(dict(view(ob), outcome="unmatched", reason=UNMATCHED_PART_REASON,
                                       short_raw=str(inv.pay_raw - ob["amount_raw"])))
     # Several exact splits can share a send (sends a, b, a, b give four). Which of
-    # them, if any, is the payment is then a guess, and a refund instruction per
-    # split would tell the merchant to refund one send more than once. A split that
-    # shares any send with another is therefore marked ambiguous and carries no
-    # refund instruction, so each send hash is in at most one instruction of this
-    # report and the instructions never exceed what was received.
+    # them, if any, is the payment is then a guess: each is marked so.
     uses = {}
     for sp in splits:
         for h in sp["send_blocks"]:
             uses[h] = uses.get(h, 0) + 1
     for sp in splits:
         if any(uses[h] > 1 for h in sp["send_blocks"]):
-            sp.update(overlapping_splits=True, ambiguous=True, refund_if_rejected=[],
-                      reason=SPLIT_REASON + SPLIT_OVERLAP_REASON)
+            sp.update(overlapping_splits=True, ambiguous=True, reason=SPLIT_REASON + SPLIT_OVERLAP_REASON)
     return splits, unmatched
 
 
