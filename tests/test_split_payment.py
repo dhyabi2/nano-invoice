@@ -55,6 +55,21 @@ class TestSplitPayment(Base):
         self.assertEqual(self.store.get(inv).state, "open")
         self.assertEqual(self.store.payments_for(inv.id), [])
 
+    def test_short_send_of_an_account_with_no_split_is_not_listed(self):
+        # The node's list shows an exact split, so both parts are looked up, but one
+        # is unconfirmed: no split is left, so the confirmed part is not listed under
+        # unmatched_short_sends (only sends beside a split are, as the README says).
+        inv = self.invoice()
+        a, b = untagged_halves(inv.pay_raw, {inv.tag})
+        self.ledger.send(BUYER, MERCHANT, a, T0 + 10)
+        self.ledger.send(BUYER, MERCHANT, b, T0 + 20, confirmed=False)
+        res = self.check(inv)
+        self.assertEqual(res["split_candidates"], [])
+        self.assertEqual(res["unmatched_short_sends"], [])
+        self.assertEqual(res["unmatched_candidates"], [])
+        self.assertEqual(res["refunds"], [])
+        self.assertEqual(self.store.get(inv).state, "open")
+
     def test_split_from_two_different_senders_is_not_combined_and_costs_no_lookup(self):
         inv = self.invoice()
         a, b = untagged_halves(inv.pay_raw, {inv.tag})
@@ -116,6 +131,31 @@ class TestSplitPayment(Base):
         self.assertEqual(self.store.get(inv1).state, "open")
         self.assertEqual(self.store.get(inv2).state, "open")
         self.assertEqual(self.store.payments_for(inv1.id) + self.store.payments_for(inv2.id), [])
+
+    def test_split_ambiguity_sees_another_invoices_split_outside_this_window(self):
+        # inv1 expires after 100 s, inv2 after 3600 s, both open. x + y pays inv1
+        # inside inv1's window; x + z pays inv2, but z lands after inv1 expired.
+        # x is in both splits, so inv1's report must call its split ambiguous too,
+        # exactly as inv2's does: the ambiguity search is not cut to inv1's window.
+        inv1 = self.invoice("order-1", amount=XNO // 2, expires_s=100)
+        inv2 = self.invoice("order-2", amount=XNO // 4, expires_s=3600)
+        busy = {inv1.tag, inv2.tag}
+        x = next(c for c in range(XNO // 8 + 1, XNO // 8 + 10_000)
+                 if all(v % ni.core.TAG_MODULUS not in busy
+                        for v in (c, inv1.pay_raw - c, inv2.pay_raw - c)))
+        sx, _ = self.ledger.send(BUYER, MERCHANT, x, T0 + 10)
+        sy, _ = self.ledger.send(BUYER, MERCHANT, inv1.pay_raw - x, T0 + 20)
+        sz, _ = self.ledger.send(BUYER, MERCHANT, inv2.pay_raw - x, T0 + 500)
+        for inv, mine in ((inv1, sy), (inv2, sz)):
+            res = self.check(inv)
+            splits = res["split_candidates"]
+            self.assertEqual(len(splits), 1, res)
+            self.assertEqual(sorted(splits[0]["send_blocks"]), sorted([sx, mine]))
+            self.assertEqual(splits[0]["candidate_invoices"], sorted([inv1.id, inv2.id]), inv.id)
+            self.assertTrue(splits[0]["ambiguous"], inv.id)
+            self.assertFalse(splits[0]["settled"])
+        self.assertEqual(self.store.get(inv1).state, "open")
+        self.assertEqual(self.store.get(inv2).state, "open")
 
     def test_a_tagged_exact_payment_still_pays_and_reports_no_split(self):
         inv = self.invoice()

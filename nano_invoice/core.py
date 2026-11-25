@@ -1231,13 +1231,15 @@ def _lazy_busy_tags(store, merchant, now):
     return tags
 
 
-def _untagged_eligible(store, inv, ob, busy, own, excluded, skew_s):
+def _untagged_eligible(store, inv, ob, busy, own, excluded, skew_s, window=True):
     """The filters every reported untagged send passes: no problems, confirmed,
     inside inv's window, not another open or quarantined tag (that invoice's
-    check decides it), not the merchant's own or not income, not recorded."""
+    check decides it), not the merchant's own or not income, not recorded.
+    With window=False inv's window is not tested (the split ambiguity search,
+    which tests each other invoice's own window per row)."""
     ts = ob["block_ts"]
     return not (ob["problems"] or not ob["confirmed"] or not ts
-                or not (inv.created_at - skew_s <= ts <= inv.expires_at)
+                or (window and not (inv.created_at - skew_s <= ts <= inv.expires_at))
                 or ob["amount_raw"] % TAG_MODULUS in busy
                 or ob["sender"] in own or ob["sender"] in excluded
                 or store.payment(ob["send_block"]) is not None)
@@ -1310,13 +1312,17 @@ def _split_candidates(store, inv, under, untagged, own, excluded, now, skew_s):
     busy = {r.tag for r in rows if _tag_busy(r, now)}
     open_rows = [r for r in rows if r.state == "open"]   # open invoices only, as for overpayments
 
-    def by_sender_of(obs):
+    def by_sender_of(obs, window=True):
         out = {}
-        for ob in sorted((o for o in obs if _untagged_eligible(store, inv, o, busy, own, excluded, skew_s)),
+        for ob in sorted((o for o in obs
+                          if _untagged_eligible(store, inv, o, busy, own, excluded, skew_s, window)),
                          key=lambda o: (o["block_ts"], o["send_block"])):
             out.setdefault(ob["sender"], []).append(ob)
         return out
-    by_sender, context = by_sender_of(under), by_sender_of(untagged)
+    # The ambiguity context is not cut to inv's window: another open invoice's
+    # split may use a send after inv expired (or before it was created), and
+    # `in_window` below already tests each invoice's own window per row.
+    by_sender, context = by_sender_of(under), by_sender_of(untagged, window=False)
 
     def view(ob):
         return {k: (str(v) if k == "amount_raw" else v) for k, v in ob.items() if k != "problems"}
@@ -1326,6 +1332,7 @@ def _split_candidates(store, inv, under, untagged, own, excluded, now, skew_s):
 
     splits, in_split, unmatched = [], set(), []
     for sender, parts in by_sender.items():
+        exact = []
         if 2 <= len(parts) <= SPLIT_MAX_PARTS_SEARCHED:
             exact = _exact_subsets(parts, inv.pay_raw)
             others = None
@@ -1363,7 +1370,9 @@ def _split_candidates(store, inv, under, untagged, own, excluded, now, skew_s):
                     "overlapping_splits": False,
                 })
                 in_split.update(ids)
-        for ob in parts:
+        # Leftovers are listed only beside a split of the same account: an account
+        # with no exact split (e.g. its other part unconfirmed) lists nothing.
+        for ob in (parts if exact else ()):
             if ob["send_block"] not in in_split:
                 unmatched.append(dict(view(ob), outcome="unmatched", reason=UNMATCHED_PART_REASON,
                                       short_raw=str(inv.pay_raw - ob["amount_raw"])))
